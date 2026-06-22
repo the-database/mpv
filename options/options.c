@@ -355,6 +355,10 @@ const struct m_sub_options mp_subtitle_sub_opts = {
         {"sub-bitmap-max-size", OPT_INT(sub_bitmap_max_size)},
         {"sub-ass-render-threads", OPT_INT(sub_ass_render_threads), M_RANGE(0, 64),
             .flags = UPDATE_SUB_HARD},
+        {"sub-render-ahead-frames", OPT_INT(sub_render_ahead_frames), M_RANGE(0, 240),
+            .flags = UPDATE_SUB_HARD},
+        {"sub-render-ahead-threads", OPT_INT(sub_render_ahead_threads), M_RANGE(0, 64),
+            .flags = UPDATE_SUB_HARD},
         {"sub-gpu-blur", OPT_BOOL(sub_gpu_blur), .flags = UPDATE_SUB_HARD},
         {0}
     },
@@ -376,6 +380,9 @@ const struct m_sub_options mp_subtitle_sub_opts = {
         .sub_shaper = 1,
         .use_embedded_fonts = true,
         .sub_ass_render_threads = 0,  // 0 = auto (CPU count), 1 = single-threaded
+        .sub_render_ahead_frames = 0, // 0 = off (render on the display thread)
+        .sub_render_ahead_threads = 2, // worker libass threads (capped, leaves
+                                       // cores for the VO + video filters)
     },
     .change_flags = UPDATE_OSD,
 };
