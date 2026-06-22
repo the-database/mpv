@@ -26,6 +26,7 @@
 #include "demux/packet_pool.h"
 #include "sd.h"
 #include "dec_sub.h"
+#include "sub_ahead.h"
 #include "options/m_config.h"
 #include "options/options.h"
 #include "common/global.h"
@@ -79,6 +80,8 @@ struct dec_sub {
 
     double last_vo_pts;
     struct sd *sd;
+
+    struct sub_ahead *ahead;    // render-ahead worker (NULL = off / non-ass)
 
     struct demux_packet *new_segment;
     struct demux_packet **cached_pkts;
@@ -149,6 +152,8 @@ void sub_destroy(struct dec_sub *sub)
     if (!sub)
         return;
     demux_set_stream_wakeup_cb(sub->sh, NULL, NULL);
+    sub_ahead_destroy(sub->ahead);   // join the worker before touching the decoder
+    sub->ahead = NULL;
     if (sub->sd) {
         sub_reset(sub);
         sub->sd->driver->uninit(sub->sd);
@@ -158,7 +163,7 @@ void sub_destroy(struct dec_sub *sub)
     talloc_free(sub);
 }
 
-static struct sd *init_decoder(struct dec_sub *sub)
+static struct sd *init_decoder(struct dec_sub *sub, int ass_thread_override)
 {
     for (int n = 0; sd_list[n]; n++) {
         const struct sd_functions *driver = sd_list[n];
@@ -173,6 +178,7 @@ static struct sd *init_decoder(struct dec_sub *sub)
             .attachments = sub->attachments,
             .codec = sub->codec,
             .lang = sub->lang,
+            .ass_render_thread_count_override = ass_thread_override,
             .preload_ok = true,
         };
 
@@ -185,6 +191,41 @@ static struct sd *init_decoder(struct dec_sub *sub)
     MP_ERR(sub, "Could not find subtitle decoder for format '%s'.\n",
            sub->codec->codec);
     return NULL;
+}
+
+// Spawn the render-ahead worker for an ASS sub, if enabled. Builds a SECOND,
+// independent sd_ass sd (own libass instance) with a capped thread count, so the
+// worker never takes sub->lock or touches the decoder's track. Called locked or
+// during single-threaded setup.
+static void maybe_spawn_ahead(struct dec_sub *sub)
+{
+    int depth = sub->opts->sub_render_ahead_frames;
+    if (depth <= 0 || sub->ahead || sub->sd->driver != &sd_ass || sub->play_dir < 0)
+        return;
+    int threads = sub->opts->sub_render_ahead_threads;
+    struct sd *worker_sd = init_decoder(sub, threads > 0 ? threads : 1);
+    if (!worker_sd)
+        return;
+    sub->ahead = sub_ahead_create(sub, worker_sd, depth, sub->order);
+    if (!sub->ahead) {
+        worker_sd->driver->uninit(worker_sd);
+        talloc_free(worker_sd);
+        return;
+    }
+    float delay = sub->order < 0 ? 0.0f : sub->shared_opts->sub_delay[sub->order];
+    sub_ahead_set_timing(sub->ahead, sub->sub_speed, delay, sub->play_dir,
+                         sub->video_fps);
+}
+
+// Push the current pts mapping (speed/delay/dir/fps) to the worker. Called
+// locked, after any of them may have changed.
+static void ahead_update_timing(struct dec_sub *sub)
+{
+    if (!sub->ahead)
+        return;
+    float delay = sub->order < 0 ? 0.0f : sub->shared_opts->sub_delay[sub->order];
+    sub_ahead_set_timing(sub->ahead, sub->sub_speed, delay, sub->play_dir,
+                         sub->video_fps);
 }
 
 // Thread-safety of the returned object: all functions are thread-safe,
@@ -219,9 +260,10 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
     sub->shared_opts = sub->shared_opts_cache->opts;
     mp_mutex_init(&sub->lock);
 
-    sub->sd = init_decoder(sub);
+    sub->sd = init_decoder(sub, 0);
     if (sub->sd) {
         update_subtitle_speed(sub);
+        maybe_spawn_ahead(sub);
         return sub;
     }
 
@@ -241,7 +283,7 @@ static void update_segment(struct dec_sub *sub)
         sub->codec = sub->new_segment->codec;
         sub->start = sub->new_segment->start;
         sub->end = sub->new_segment->end;
-        struct sd *new = init_decoder(sub);
+        struct sd *new = init_decoder(sub, 0);
         if (new) {
             sub->sd->driver->uninit(sub->sd);
             talloc_free(sub->sd);
@@ -386,6 +428,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
 
         sub->last_pkt_pts = pkt->pts;
         MP_TARRAY_APPEND(sub, sub->cached_pkts, sub->num_cached_pkts, pkt);
+        sub_ahead_enqueue(sub->ahead, pkt);   // feed the worker's own track
 
         if (is_new_segment(sub, pkt)) {
             sub->new_segment = demux_copy_packet(sub->packet_pool, pkt);
@@ -422,6 +465,15 @@ void sub_redecode_cached_packets(struct dec_sub *sub)
 struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
                                     int format, double pts)
 {
+    // Render-ahead fast path: serve a worker-rendered frame (keyed on the raw
+    // video pts) without taking sub->lock, so a render never blocks the decode
+    // path. A miss falls through to the inline render below.
+    if (sub->ahead) {
+        struct sub_bitmaps *res = sub_ahead_get_bitmaps(sub->ahead, dim, format, pts);
+        if (res)
+            return res;
+    }
+
     mp_mutex_lock(&sub->lock);
 
     pts = pts_to_subtitle(sub, pts);
@@ -497,6 +549,7 @@ void sub_reset(struct dec_sub *sub)
     destroy_cached_pkts(sub);
     demux_packet_pool_push(sub->packet_pool, sub->new_segment);
     sub->new_segment = NULL;
+    sub_ahead_flush(sub->ahead);   // drop queue+ring, reset the worker track
     mp_mutex_unlock(&sub->lock);
 }
 
@@ -517,6 +570,7 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
     case SD_CTRL_SET_VIDEO_DEF_FPS:
         sub->video_fps = *(double *)arg;
         update_subtitle_speed(sub);
+        ahead_update_timing(sub);
         break;
     case SD_CTRL_SUB_STEP: {
         double *a = arg;
@@ -533,6 +587,7 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
         if (m_config_cache_update(sub->opts_cache))
             update_subtitle_speed(sub);
         m_config_cache_update(sub->shared_opts_cache);
+        ahead_update_timing(sub);   // delay/speed may have changed
         propagate = true;
         if (flags & UPDATE_SUB_HARD) {
             // forget about the previous preload because
@@ -547,6 +602,8 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
     }
     if (propagate && sub->sd->driver->control)
         r = sub->sd->driver->control(sub->sd, cmd, arg);
+    if (cmd == SD_CTRL_SET_VIDEO_PARAMS && sub->ahead)
+        sub_ahead_set_video_params(sub->ahead, arg);
     mp_mutex_unlock(&sub->lock);
     return r;
 }
@@ -562,6 +619,8 @@ void sub_set_play_dir(struct dec_sub *sub, int dir)
 {
     mp_mutex_lock(&sub->lock);
     sub->play_dir = dir;
+    ahead_update_timing(sub);   // worker flushes; in reverse it just misses ->
+                                // inline fallback (Phase 1 degraded behavior)
     mp_mutex_unlock(&sub->lock);
 }
 
