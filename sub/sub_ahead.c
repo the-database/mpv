@@ -85,6 +85,7 @@ struct sub_ahead {
 
     // pending controls to apply to worker_sd on the worker thread.
     bool params_pending;
+    bool params_set;             // pending_params holds a real value to compare
     struct mp_image_params pending_params;
     bool reset_pending;
 
@@ -94,7 +95,7 @@ struct sub_ahead {
     uint64_t last_served_content;
     bool have_last_served;
 
-    long dbg_hits, dbg_miss;     // TEMP: validate serving
+    long dbg_hits, dbg_miss, dbg_clears;     // TEMP
 };
 
 static double ahead_pts_to_subtitle(struct sub_ahead *a, double pts)
@@ -107,6 +108,7 @@ static double ahead_pts_to_subtitle(struct sub_ahead *a, double pts)
 
 static void ahead_clear(struct sub_ahead *a)
 {
+    a->dbg_clears++;
     for (int n = 0; n < a->ring_len; n++) {
         if (a->ring[n].valid) {
             talloc_free(a->ring[n].bmp);
@@ -292,8 +294,7 @@ void sub_ahead_destroy(struct sub_ahead *a)
         mp_mutex_unlock(&a->lock);
         mp_thread_join(a->thread);
     }
-    MP_WARN(a, "render-ahead: %ld served, %ld inline-fallback\n",
-            a->dbg_hits, a->dbg_miss);
+    MP_WARN(a, "render-ahead: %ld served, %ld inline-fallback, %ld ring-clears\n", a->dbg_hits, a->dbg_miss, a->dbg_clears);
     queue_flush(a);
     ahead_clear(a);
     if (a->worker_sd) {
@@ -358,11 +359,16 @@ void sub_ahead_set_video_params(struct sub_ahead *a,
     if (!a || !params)
         return;
     mp_mutex_lock(&a->lock);
-    a->pending_params = *params;
-    a->params_pending = true;
-    ahead_clear(a);              // colorspace may change -> drop stale entries
-    a->gen++;
-    mp_cond_signal(&a->wakeup);
+    // This is sent every frame; only invalidate when the params actually change
+    // (otherwise the ring is wiped every frame and the worker never gets ahead).
+    if (!a->params_set || !mp_image_params_equal(&a->pending_params, params)) {
+        a->pending_params = *params;
+        a->params_pending = true;
+        a->params_set = true;
+        ahead_clear(a);          // colorspace may change -> drop stale entries
+        a->gen++;
+        mp_cond_signal(&a->wakeup);
+    }
     mp_mutex_unlock(&a->lock);
 }
 
