@@ -788,8 +788,14 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
         fill_plaintext(sd, pts);
 
     int changed;
+    int64_t t_r0 = mp_time_ns();
     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
+    int64_t t_r1 = mp_time_ns();
     mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
+    int64_t t_r2 = mp_time_ns();
+    MP_STATS(sd, "value %f ass-render-ms", (t_r1 - t_r0) / 1e6);
+    MP_STATS(sd, "value %f ass-pack-ms",   (t_r2 - t_r1) / 1e6);
+    MP_STATS(sd, "value %f ass-changed",   (double) changed);
 
 done:
     // mangle_colors() modifies the color field, so copy the thing _before_.
