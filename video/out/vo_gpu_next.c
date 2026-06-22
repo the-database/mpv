@@ -141,6 +141,8 @@ struct priv {
     int num_sub_tex;
     pl_buf overlay_bufs[NUM_OVERLAY_BUFS]; // ring; see NUM_OVERLAY_BUFS
     unsigned overlay_buf_idx;
+    pl_tex *sub_scratch;       // recycled blur scratch textures (blur_tex/tmp_tex)
+    int num_sub_scratch;
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -512,6 +514,10 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 struct pl_tex_params bp = { .format=tex_fmt, .w=tw, .h=th,
                                             .sampleable=true, .storable=true };
                 int64_t dbg_b0 = mp_time_ns();
+                if (!entry->blur_tex)
+                    MP_TARRAY_POP(p->sub_scratch, p->num_sub_scratch, &entry->blur_tex);
+                if (!entry->tmp_tex)
+                    MP_TARRAY_POP(p->sub_scratch, p->num_sub_scratch, &entry->tmp_tex);
                 if (pl_tex_recreate(p->gpu, &entry->blur_tex, &bp) &&
                     pl_tex_recreate(p->gpu, &entry->tmp_tex, &bp))
                 {
@@ -1015,8 +1021,12 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
         pl_tex tex = fp->subs.entries[i].tex;
         if (tex)
             MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, tex);
-        pl_tex_destroy(p->gpu, &fp->subs.entries[i].blur_tex);
-        pl_tex_destroy(p->gpu, &fp->subs.entries[i].tmp_tex);
+        pl_tex bl = fp->subs.entries[i].blur_tex;
+        if (bl)
+            MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, bl);
+        pl_tex tm = fp->subs.entries[i].tmp_tex;
+        if (tm)
+            MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, tm);
     }
     talloc_free(mpi);
 }
@@ -2344,6 +2354,8 @@ static void uninit(struct vo *vo)
     }
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
+    for (int i = 0; i < p->num_sub_scratch; i++)
+        pl_tex_destroy(p->gpu, &p->sub_scratch[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
         pl_buf_destroy(p->gpu, &p->overlay_bufs[i]);
     for (int i = 0; i < p->num_user_hooks; i++)
