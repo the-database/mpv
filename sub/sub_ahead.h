@@ -51,4 +51,10 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
                                           struct mp_osd_res dim, int format,
                                           double raw_video_pts);
 
+// Bracket the VO's inline fallback render: while inline rendering is active the
+// worker pauses, so the two heavy parallel renders never fight for the cores
+// (which turned one miss into a multi-frame stall).
+void sub_ahead_inline_begin(struct sub_ahead *a);
+void sub_ahead_inline_end(struct sub_ahead *a);
+
 #endif
