@@ -273,7 +273,8 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
                         int preferred_osd_format, struct sub_bitmaps *out)
 {
     int format = preferred_osd_format == SUBBITMAP_BGRA ? SUBBITMAP_BGRA
-                                                        : SUBBITMAP_LIBASS;
+               : preferred_osd_format == SUBBITMAP_LIBASS_GLYPHS ? SUBBITMAP_LIBASS_GLYPHS
+               : SUBBITMAP_LIBASS;
 
     if (p->cached_subs_valid && !image_lists_changed &&
         p->cached_subs.format == format)
@@ -304,6 +305,9 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->libass.color = img->color;
             b->libass.blur_x = img->blur_x;
             b->libass.blur_y = img->blur_y;
+            b->libass.glyph_id = img->glyph_id;
+            b->libass.run_id = img->run_id;
+            b->libass.run_flags = img->run_flags;
             b->dw = b->w = img->w;
             b->dh = b->h = img->h;
             b->x = img->dst_x;
@@ -313,7 +317,15 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
     }
 
     bool r = false;
-    if (format == SUBBITMAP_BGRA) {
+    if (format == SUBBITMAP_LIBASS_GLYPHS) {
+        // Deferred composite. Stage A: still pack the per-glyph coverage into the
+        // Y8 atlas so the sub_bitmaps lifecycle (refcounted `packed`) holds; the
+        // GPU does the combine + fix_outline + blur + composite from the atlas
+        // using each part's src rect, run_id and run_flags. (Stage B replaces the
+        // per-frame pack with a persistent GPU glyph cache keyed by glyph_id.)
+        r = pack_libass(p, &res);
+        res.format = SUBBITMAP_LIBASS_GLYPHS;
+    } else if (format == SUBBITMAP_BGRA) {
         r = pack_rgba(p, &res);
     } else {
         r = pack_libass(p, &res);

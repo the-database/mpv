@@ -753,9 +753,17 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
         goto done;
 
     // Opt in to libass emitting unblurred coverage + a per-image gaussian
-    // std-dev, so vo_gpu_next can do the (expensive) blur on the GPU. No-op
-    // after the first call unless the option toggles (which empties the cache).
-    ass_set_blur_deferred(renderer, opts->sub_gpu_blur);
+    // std-dev, so vo_gpu_next can do the (expensive) blur on the GPU. With
+    // --sub-gpu-composite, go further: emit uncombined per-glyph coverage so
+    // the GPU does the whole combine + composite (implies deferred blur).
+    // The VO advertises SUBBITMAP_LIBASS_GLYPHS when it has the GPU compositor;
+    // honor it only when --sub-gpu-composite is set, else fall back to combined
+    // LIBASS so a VO that requested glyphs still gets drawable output.
+    bool comp = format == SUBBITMAP_LIBASS_GLYPHS && opts->sub_gpu_composite;
+    if (format == SUBBITMAP_LIBASS_GLYPHS && !comp)
+        format = SUBBITMAP_LIBASS;
+    ass_set_blur_deferred(renderer, opts->sub_gpu_blur || comp);
+    ass_set_composite_deferred(renderer, comp);
 
     // Currently no supported text sub formats support a distinction between forced
     // and unforced lines, so we just assume everything's unforced and discard everything.
