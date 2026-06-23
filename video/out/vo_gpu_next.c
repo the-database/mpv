@@ -350,15 +350,20 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
 // Separable gaussian over one atlas sub-region [ox,oy,rw,rh], clamped to that
 // region (so a blurred part can't read/write its atlas neighbours). sigma == 0
 // degenerates to a copy. Validated against a CPU reference via lavapipe.
+// Separable gaussian with strided sampling: taps are spaced `stride` px apart
+// so the work is O(1) in the radius (bounded tap count), not O(radius). For wide
+// blurs the gaussian is smooth enough that ~stride<=sigma/2 spacing reconstructs
+// it accurately; small blurs use stride==1 (exact).
 static const char *const osd_blur_body_h =
     "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
     "if (g.x < rw && g.y < rh) {\n"
     "    int px = g.x + ox, py = g.y + oy;\n"
     "    float acc = 0.0, wsum = 0.0;\n"
-    "    for (int t = -radius; t <= radius; t++) {\n"
-    "        int q = px + t;\n"
+    "    for (int t = -ntaps; t <= ntaps; t++) {\n"
+    "        int d = t * stride;\n"
+    "        int q = px + d;\n"
     "        if (q >= ox && q < ox+rw) {\n"
-    "            float w = sigma > 0.0 ? exp(-0.5*float(t*t)/(sigma*sigma)) : float(t==0);\n"
+    "            float w = sigma > 0.0 ? exp(-0.5*float(d*d)/(sigma*sigma)) : float(d==0);\n"
     "            acc += w * texelFetch(src, ivec2(q, py), 0).r; wsum += w;\n"
     "        }\n"
     "    }\n"
@@ -369,10 +374,11 @@ static const char *const osd_blur_body_v =
     "if (g.x < rw && g.y < rh) {\n"
     "    int px = g.x + ox, py = g.y + oy;\n"
     "    float acc = 0.0, wsum = 0.0;\n"
-    "    for (int t = -radius; t <= radius; t++) {\n"
-    "        int q = py + t;\n"
+    "    for (int t = -ntaps; t <= ntaps; t++) {\n"
+    "        int d = t * stride;\n"
+    "        int q = py + d;\n"
     "        if (q >= oy && q < oy+rh) {\n"
-    "            float w = sigma > 0.0 ? exp(-0.5*float(t*t)/(sigma*sigma)) : float(t==0);\n"
+    "            float w = sigma > 0.0 ? exp(-0.5*float(d*d)/(sigma*sigma)) : float(d==0);\n"
     "            acc += w * texelFetch(src, ivec2(px, q), 0).r; wsum += w;\n"
     "        }\n"
     "    }\n"
@@ -384,6 +390,12 @@ static void osd_blur_part(struct priv *p, pl_tex src, pl_tex dst,
                           const char *body)
 {
     int radius = (int)(3.0f * sigma + 0.999f); // ~ceil(3*sigma); 0 when sigma==0
+    // Bound the tap count (~17 max) by striding wide kernels; this makes the
+    // blur O(1) in radius. Spacing stays <= sigma/2 so the gaussian is well
+    // sampled. Small kernels keep stride 1 (identical to a dense gaussian).
+    int stride = (radius + 7) / 8;
+    if (stride < 1) stride = 1;
+    int ntaps = (radius + stride - 1) / stride;
     pl_shader sh = pl_dispatch_begin(p->osd_dp);
     struct pl_shader_desc descs[] = {
         { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 },
@@ -397,14 +409,15 @@ static void osd_blur_part(struct priv *p, pl_tex src, pl_tex dst,
         { .var = pl_var_int("oy"),     .data=&oy },
         { .var = pl_var_int("rw"),     .data=&rw },
         { .var = pl_var_int("rh"),     .data=&rh },
-        { .var = pl_var_int("radius"), .data=&radius },
+        { .var = pl_var_int("stride"), .data=&stride },
+        { .var = pl_var_int("ntaps"),  .data=&ntaps },
         { .var = pl_var_float("sigma"),.data=&sigma },
     };
     struct pl_custom_shader cs = {
         .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE,
         .compute = true, .compute_group_size = {16, 16},
         .descriptors = descs, .num_descriptors = 2,
-        .variables = vars, .num_variables = 6,
+        .variables = vars, .num_variables = 7,
         .body = body,
     };
     if (pl_shader_custom(sh, &cs)) {
