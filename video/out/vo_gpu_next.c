@@ -70,6 +70,9 @@ struct osd_entry {
     pl_tex inter_tex; // capped-resolution composite target (see update_overlays)
     struct pl_overlay_part *parts;
     int num_parts;
+    pl_tex result_tex;        // deferred-composite result atlas (compose_glyph_runs)
+    struct pl_overlay_part *run_parts;
+    int num_run_parts;
 };
 
 // Ring of streaming upload buffers cycled across uploads, so a buffer is never
@@ -665,15 +668,8 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
         struct gc_region *r;
-        if (b->libass.glyph_id == 0) {              // fallback singleton
-            MP_TARRAY_GROW(tmp, regs, nregs);
-            r = &regs[nregs++];
-            *r = (struct gc_region){ .x0 = b->x, .y0 = b->y,
-                .x1 = b->x + b->dw, .y1 = b->y + b->dh, .blur_f = b->libass.blur_x,
-                .fill_color = b->libass.color, .single_layer = b->libass.layer };
-            MP_TARRAY_APPEND(tmp, r->fill, r->nfill, i);
-            continue;
-        }
+        if (b->libass.glyph_id == 0)
+            continue;   // already-combined fallback parts go via the legacy path
         int ri = idx[b->libass.run_id];
         if (ri < 0) {
             MP_TARRAY_GROW(tmp, regs, nregs);
@@ -696,6 +692,8 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         }
     }
 
+    if (!nregs) { talloc_free(tmp); return; }   // no deferred runs in this item
+
     const int AW = 4096;
     int shelf_x = 0, shelf_y = 0, shelf_h = 0, max_w = 0;
     int run_acc_w = 0, run_acc_h = 0;
@@ -708,17 +706,15 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     for (int i = 0; i < nregs; i++) {
         struct gc_region *r = &regs[i];
         // Deferred runs are raw (unexpanded) per-glyph coverage, so they need
-        // the blur halo padding. Fallback singletons are already libass-expanded
-        // combined coverage (blur pending) -- blur them over their own bounds.
-        r->margin = (r->single_layer != 0xff) ? 0
-                  : blur_expand_pad(MPMAX(r->blur_f, r->blur_b));
+        // the blur halo padding (libass's exact expand amount).
+        r->margin = blur_expand_pad(MPMAX(r->blur_f, r->blur_b));
         int rw = r->x1 - r->x0 + 2 * r->margin, rh = r->y1 - r->y0 + 2 * r->margin;
         if (r->nfill) ALLOC_REGION(r->fill_ax, r->fill_ay, rw, rh);
         if (r->nbord) ALLOC_REGION(r->bord_ax, r->bord_ay, rw, rh);
     }
     int atlas_w = MPMAX(max_w, 1), atlas_h = MPMAX(shelf_y + shelf_h, 1);
 
-    if (!gc_ensure(gpu, &entry->tex, r8, atlas_w, atlas_h, true, true, false, false, false) ||
+    if (!gc_ensure(gpu, &entry->result_tex, r8, atlas_w, atlas_h, true, true, false, false, false) ||
         !gc_ensure(gpu, &p->run_acc, p->osd_acc_fmt, run_acc_w, run_acc_h, true, false, false, false, false) ||
         !gc_ensure(gpu, &p->run_tmp, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
         !gc_ensure(gpu, &p->run_cov_f, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
@@ -739,33 +735,28 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                     osd_unop(p, p->run_cov_f, p->run_cov_b, bw, bh,
                              "fill", true, "bord", osd_fixoutline_body);
                 gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
-                osd_copy(p, p->run_cov_b, entry->tex, r->bord_ax, r->bord_ay, bw, bh);
+                osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
             }
             gc_blur(p, p->run_cov_f, bw, bh, r->blur_f);  // σ may be 0 (bordered fill)
-            osd_copy(p, p->run_cov_f, entry->tex, r->fill_ax, r->fill_ay, bw, bh);
+            osd_copy(p, p->run_cov_f, entry->result_tex, r->fill_ax, r->fill_ay, bw, bh);
         } else if (r->nbord) {
             gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh);
             gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
-            osd_copy(p, p->run_cov_b, entry->tex, r->bord_ax, r->bord_ay, bw, bh);
+            osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
         }
     }
 
-    // Emit one monochrome overlay; parts in z-order: shadow(2), border(1), fill(0).
-    entry->num_parts = 0;
-    for (int pass = 2; pass >= 0; pass--) {
+    // Emit one monochrome overlay; parts in z-order: border (1) then fill (0)
+    // across all runs (deferred runs never carry a shadow).
+    entry->num_run_parts = 0;
+    for (int pass = 1; pass >= 0; pass--) {
         for (int i = 0; i < nregs; i++) {
             struct gc_region *r = &regs[i];
             int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
             int ax, ay; uint32_t c;
-            if (r->single_layer == 0xff) {            // deferred run
-                if (pass == 1 && r->nbord) { ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
-                else if (pass == 0 && r->nfill) { ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
-                else continue;
-            } else if (r->single_layer == pass) {     // fallback singleton
-                ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color;
-            } else {
-                continue;
-            }
+            if (pass == 1 && r->nbord) { ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
+            else if (pass == 0 && r->nfill) { ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
+            else continue;
             struct pl_overlay_part part = {
                 .src = { ax, ay, ax + bw, ay + bh },
                 .dst = { r->x0 - r->margin, r->y0 - r->margin,
@@ -773,14 +764,15 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                 .color = { (c >> 24) / 255.0f, ((c >> 16) & 0xFF) / 255.0f,
                            ((c >> 8) & 0xFF) / 255.0f, (255 - (c & 0xFF)) / 255.0f },
             };
-            MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, part);
+            MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
         }
     }
     talloc_free(tmp);
 
     struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
     *ol = (struct pl_overlay){
-        .tex = entry->tex, .parts = entry->parts, .num_parts = entry->num_parts,
+        .tex = entry->result_tex, .parts = entry->run_parts,
+        .num_parts = entry->num_run_parts,
         .mode = PL_OVERLAY_MONOCHROME, .coords = coords,
         .color = pl_color_space_srgb, .repr.alpha = PL_ALPHA_INDEPENDENT,
     };
@@ -817,7 +809,13 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         struct osd_entry *entry = &state->entries[item->render_index];
         if (item->format == SUBBITMAP_LIBASS_GLYPHS) {
             compose_glyph_runs(p, item, entry, frame, state, coords, src);
-            continue;
+            // Already-combined fallback parts (shadow/karaoke runs, glyph_id 0)
+            // go through the legacy path below; skip it if there are none.
+            bool has_fallback = false;
+            for (int i = 0; i < item->num_parts; i++)
+                if (item->parts[i].libass.glyph_id == 0) { has_fallback = true; break; }
+            if (!has_fallback)
+                continue;
         }
         pl_fmt tex_fmt = p->osd_fmt[item->format];
         if (!entry->tex)
@@ -884,6 +882,8 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             const struct sub_bitmap *b = &item->parts[i];
             if (b->dw == 0 || b->dh == 0)
                 continue;
+            if (item->format == SUBBITMAP_LIBASS_GLYPHS && b->libass.glyph_id)
+                continue;   // deferred runs are handled by compose_glyph_runs
             uint32_t c = b->libass.color;
             struct pl_overlay_part part = {
                 .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
@@ -902,9 +902,12 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         // coverage in pre-expanded bounds plus a per-part gaussian std-dev; do
         // the blur here on the GPU instead of on the CPU display path.
         pl_tex overlay_tex = entry->tex;
-        if (item->format == SUBBITMAP_LIBASS) {
+        if (item->format == SUBBITMAP_LIBASS ||
+            item->format == SUBBITMAP_LIBASS_GLYPHS) {
             bool any_blur = false;
             for (int i = 0; i < item->num_parts; i++) {
+                if (item->format == SUBBITMAP_LIBASS_GLYPHS && item->parts[i].libass.glyph_id)
+                    continue;   // deferred parts blurred by compose_glyph_runs
                 if (item->parts[i].libass.blur_x > 0 || item->parts[i].libass.blur_y > 0) {
                     any_blur = true;
                     break;
@@ -932,6 +935,8 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                     for (int i = 0; i < item->num_parts; i++) {
                         const struct sub_bitmap *b = &item->parts[i];
                         if (b->w < 1 || b->h < 1)
+                            continue;
+                        if (item->format == SUBBITMAP_LIBASS_GLYPHS && b->libass.glyph_id)
                             continue;
                         // separable: H with blur_x (atlas->tmp), V with blur_y (tmp->blur)
                         osd_blur_part(p, entry->tex, entry->tmp_tex,
@@ -983,6 +988,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 }
             }
             break;
+        case SUBBITMAP_LIBASS_GLYPHS:   // the fallback singletons, same as LIBASS
         case SUBBITMAP_LIBASS:
             if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
                 ol->color = src->params.color;
@@ -2865,6 +2871,7 @@ static void uninit(struct vo *vo)
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].blur_tex);
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tmp_tex);
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].inter_tex);
+        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].result_tex);
     }
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
