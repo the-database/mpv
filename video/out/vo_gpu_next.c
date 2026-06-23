@@ -708,6 +708,69 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
     osd_blur_part(p, p->run_tmp, cov, 0, 0, bw, bh, sigma, osd_blur_body_v);
 }
 
+// --- GPU glyph rasterizer (SUBBITMAP_LIBASS_OUTLINES) -----------------------
+// Exact-area analytic coverage from a glyph's line segments, written into the
+// glyph atlas slot. Matches libass's CPU raster to <=9/255 (validated, edge-AA
+// only). Antiderivative of clamp(t,0,1) for the exact clamped-ramp integral.
+#define MAX_RASTER_EDGES 2048
+static const char *const osd_raster_prelude =
+    "float Hc(float t){ if (t<=0.0) return 0.0; if (t>=1.0) return t-0.5; return 0.5*t*t; }\n";
+static const char *const osd_raster_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x >= rw || g.y >= rh) return;\n"
+    "float px = float(g.x), py = float(g.y);\n"
+    "float acc = 0.0;\n"
+    "for (int i = 0; i < nedges; i++) {\n"
+    "    vec4 e = edges[i];\n"
+    "    float ya = e.y, yb = e.w;\n"
+    "    if (ya == yb) continue;\n"
+    "    float dir = yb > ya ? 1.0 : -1.0;\n"
+    "    float y0 = max(py, min(ya, yb)), y1 = min(py + 1.0, max(ya, yb));\n"
+    "    if (y1 <= y0) continue;\n"
+    "    float xa = e.x, xb = e.z, inv = 1.0 / (yb - ya);\n"
+    "    float X0 = xa + (xb - xa) * (y0 - ya) * inv;\n"
+    "    float X1 = xa + (xb - xa) * (y1 - ya) * inv;\n"
+    "    float f0 = px + 1.0 - X0, f1 = px + 1.0 - X1, L = y1 - y0, area;\n"
+    "    if (abs(f1 - f0) < 1e-6) area = L * clamp(0.5 * (f0 + f1), 0.0, 1.0);\n"
+    "    else area = L * (Hc(f1) - Hc(f0)) / (f1 - f0);\n"
+    "    acc += dir * area;\n"
+    "}\n"
+    "imageStore(dst, ivec2(ox + g.x, oy + g.y), vec4(clamp(abs(acc), 0.0, 1.0), 0.0, 0.0, 0.0));\n";
+
+// Rasterize one glyph's segments (4*int32 each, 1/64px relative to glyph origin)
+// into the glyph atlas at (ax,ay), covering rw x rh.
+static void gc_raster_outline(struct priv *p, const int32_t *segs, int n,
+                              int ax, int ay, int rw, int rh)
+{
+    static float edges[MAX_RASTER_EDGES * 4];
+    if (n > MAX_RASTER_EDGES) n = MAX_RASTER_EDGES;   // truncate huge glyphs (rare)
+    for (int i = 0; i < n * 4; i++)
+        edges[i] = segs[i] / 64.0f;                   // 1/64px -> pixel coords
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name = "dst", .type = PL_DESC_STORAGE_IMG, .binding = 0,
+                    .access = PL_DESC_ACCESS_WRITEONLY }, .binding = { .object = p->glyph_atlas } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("rw"), .data = &rw }, { .var = pl_var_int("rh"), .data = &rh },
+        { .var = pl_var_int("ox"), .data = &ax }, { .var = pl_var_int("oy"), .data = &ay },
+        { .var = pl_var_int("nedges"), .data = &n },
+        { .var = { .name = "edges", .type = PL_VAR_FLOAT, .dim_v = 4, .dim_m = 1,
+                   .dim_a = MAX_RASTER_EDGES }, .data = edges },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = { 16, 16 },
+        .descriptors = descs, .num_descriptors = 1,
+        .variables = vars, .num_variables = 6,
+        .prelude = osd_raster_prelude, .body = osd_raster_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw + 15) / 16, (rh + 15) / 16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
 // Composite a SUBBITMAP_LIBASS_GLYPHS item: reproduce libass's per-run combine
 // + blur + fix_outline on the GPU into entry->tex (a result atlas), then emit a
 // single monochrome overlay whose parts reference each run's coverage region.
@@ -726,8 +789,9 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // upload only the cache-miss glyphs (the per-frame bandwidth win).
     if (!p->glyph_atlas) {
         p->gatlas_w = p->gatlas_h = 4096;
+        // storable too: the GPU rasterizer (outline mode) writes coverage here.
         if (!gc_ensure(gpu, &p->glyph_atlas, r8, p->gatlas_w, p->gatlas_h,
-                       false, true, false, false, true))
+                       true, true, false, false, true))
             return;
         p->gcache_cap = 1 << 15;
         p->gcache = talloc_zero_array(p, struct gcache_slot, p->gcache_cap);
@@ -740,12 +804,13 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // Resolve every deferred glyph to its atlas position, collecting cache
     // misses to upload in one async batch (a synchronous per-glyph .ptr upload
     // stalls the VO thread on d3d11; see the staging-buffer note below).
+    bool is_outline = item->format == SUBBITMAP_LIBASS_OUTLINES;
     struct gpos *cpos = talloc_array(tmp, struct gpos, item->num_parts);
     struct gmiss { int ax, ay, w, h; const uint8_t *src; };
     struct gmiss *miss = NULL;
     int nmiss = 0;
     size_t miss_bytes = 0;
-    ptrdiff_t pstride = item->packed->stride[0];
+    ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
         cpos[i] = (struct gpos){0, 0};
@@ -754,7 +819,11 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         bool up;
         if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up))
             continue;
-        if (up) {
+        if (up && is_outline) {
+            // Rasterize the glyph's outline directly into its atlas slot.
+            gc_raster_outline(p, b->libass.outline, b->libass.n_outline,
+                              cpos[i].ax, cpos[i].ay, b->w, b->h);
+        } else if (up) {
             const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
                                 + (ptrdiff_t) b->src_y * pstride + b->src_x;
             MP_TARRAY_APPEND(tmp, miss, nmiss,
@@ -943,7 +1012,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     // --sub-gpu-composite is set, otherwise it falls back to plain LIBASS.
     static const bool gpu_sub_formats[SUBBITMAP_COUNT] = {
         [SUBBITMAP_LIBASS] = true, [SUBBITMAP_BGRA] = true,
-        [SUBBITMAP_LIBASS_GLYPHS] = true,
+        [SUBBITMAP_LIBASS_GLYPHS] = true, [SUBBITMAP_LIBASS_OUTLINES] = true,
     };
     struct sub_bitmap_list *subs = osd_render(vo->osd, res, pts, flags, gpu_sub_formats);
 
@@ -957,9 +1026,15 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
 
     for (int n = 0; n < subs->num_items; n++) {
         const struct sub_bitmaps *item = subs->items[n];
-        if (!item->num_parts || !item->packed)
+        // Outline mode has no packed atlas (the GPU rasterizes from segments).
+        if (!item->num_parts ||
+            (!item->packed && item->format != SUBBITMAP_LIBASS_OUTLINES))
             continue;
         struct osd_entry *entry = &state->entries[item->render_index];
+        if (item->format == SUBBITMAP_LIBASS_OUTLINES) {
+            compose_glyph_runs(p, item, entry, frame, state, coords, src);
+            continue;   // no legacy fallback path (would need a packed atlas)
+        }
         if (item->format == SUBBITMAP_LIBASS_GLYPHS) {
             compose_glyph_runs(p, item, entry, frame, state, coords, src);
             // Already-combined fallback parts (shadow/karaoke runs, glyph_id 0)
@@ -3031,6 +3106,7 @@ static int preinit(struct vo *vo)
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
     p->osd_fmt[SUBBITMAP_LIBASS_GLYPHS] = p->osd_fmt[SUBBITMAP_LIBASS];
+    p->osd_fmt[SUBBITMAP_LIBASS_OUTLINES] = p->osd_fmt[SUBBITMAP_LIBASS];
     p->osd_acc_fmt = pl_find_named_fmt(p->gpu, "r32f");
     p->osd_sync = 1;
 

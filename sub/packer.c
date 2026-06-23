@@ -45,6 +45,7 @@ struct mp_sub_packer {
     bool cached_subs_valid;
     struct sub_bitmap rgba_imgs[MP_SUB_BB_LIST_MAX];
     struct bitmap_packer *packer;
+    void *seg_ctx;  // owns copied outline segments for SUBBITMAP_LIBASS_OUTLINES
 };
 
 // Free with talloc_free().
@@ -274,6 +275,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
 {
     int format = preferred_osd_format == SUBBITMAP_BGRA ? SUBBITMAP_BGRA
                : preferred_osd_format == SUBBITMAP_LIBASS_GLYPHS ? SUBBITMAP_LIBASS_GLYPHS
+               : preferred_osd_format == SUBBITMAP_LIBASS_OUTLINES ? SUBBITMAP_LIBASS_OUTLINES
                : SUBBITMAP_LIBASS;
 
     if (p->cached_subs_valid && !image_lists_changed &&
@@ -285,6 +287,13 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
 
     *out = (struct sub_bitmaps){.change_id = 1};
     p->cached_subs_valid = false;
+
+    // Fresh outline-segment storage for this pack (the previous cached parts'
+    // segment pointers are now stale).
+    if (format == SUBBITMAP_LIBASS_OUTLINES) {
+        talloc_free(p->seg_ctx);
+        p->seg_ctx = talloc_new(NULL);
+    }
 
     struct sub_bitmaps res = {
         .change_id = image_lists_changed,
@@ -309,6 +318,15 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->libass.run_id = img->run_id;
             b->libass.run_flags = img->run_flags;
             b->libass.layer = img->type;   // 0=character/fill, 1=outline, 2=shadow
+            b->libass.outline = NULL;
+            b->libass.n_outline = 0;
+            if (format == SUBBITMAP_LIBASS_OUTLINES && img->n_outline > 0) {
+                // Own a copy: the libass segment data is only valid for this frame.
+                b->libass.outline = ta_memdup(p->seg_ctx, (void *) img->outline,
+                                              (size_t) img->n_outline * 4 * sizeof(int32_t));
+                b->libass.n_outline = img->n_outline;
+                b->bitmap = NULL;
+            }
             b->dw = b->w = img->w;
             b->dh = b->h = img->h;
             b->x = img->dst_x;
@@ -326,6 +344,12 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
         // per-frame pack with a persistent GPU glyph cache keyed by glyph_id.)
         r = pack_libass(p, &res);
         res.format = SUBBITMAP_LIBASS_GLYPHS;
+    } else if (format == SUBBITMAP_LIBASS_OUTLINES) {
+        // No atlas: each part carries its coverage outline; the GPU rasterizes it.
+        res.format = SUBBITMAP_LIBASS_OUTLINES;
+        res.packed = NULL;
+        res.packed_w = res.packed_h = 0;
+        r = true;
     } else if (format == SUBBITMAP_BGRA) {
         r = pack_rgba(p, &res);
     } else {

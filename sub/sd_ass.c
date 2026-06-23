@@ -759,11 +759,18 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     // The VO advertises SUBBITMAP_LIBASS_GLYPHS when it has the GPU compositor;
     // honor it only when --sub-gpu-composite is set, else fall back to combined
     // LIBASS so a VO that requested glyphs still gets drawable output.
-    bool comp = format == SUBBITMAP_LIBASS_GLYPHS && opts->sub_gpu_composite;
+    // --sub-gpu-raster: emit glyph outlines for GPU rasterization (implies the
+    // GPU composite). The VO advertises OUTLINES/GLYPHS; honor each only when the
+    // matching option is set, else fall back to combined LIBASS.
+    bool raster = format == SUBBITMAP_LIBASS_OUTLINES && opts->sub_gpu_raster;
+    bool comp = (format == SUBBITMAP_LIBASS_GLYPHS && opts->sub_gpu_composite) || raster;
     if (format == SUBBITMAP_LIBASS_GLYPHS && !comp)
+        format = SUBBITMAP_LIBASS;
+    if (format == SUBBITMAP_LIBASS_OUTLINES && !raster)
         format = SUBBITMAP_LIBASS;
     ass_set_blur_deferred(renderer, opts->sub_gpu_blur || comp);
     ass_set_composite_deferred(renderer, comp);
+    ass_set_outline_deferred(renderer, raster);
 
     // Currently no supported text sub formats support a distinction between forced
     // and unforced lines, so we just assume everything's unforced and discard everything.
