@@ -149,12 +149,19 @@ struct priv {
 
     // Deferred composite (SUBBITMAP_LIBASS_GLYPHS): r32f combine accumulator
     // format + reusable scratch. The composited per-run coverage goes into the
-    // per-entry result atlas (entry->tex); glyph_src holds the uploaded glyphs.
+    // per-entry result atlas (entry->result_tex).
     pl_fmt osd_acc_fmt;        // r32f (storable) for the combine accumulator
-    pl_tex glyph_src;          // uploaded per-glyph coverage atlas (source)
     pl_tex run_acc;            // r32f combine accumulator (sized to max run)
     pl_tex run_tmp;            // r8 blur temp
     pl_tex run_cov_f, run_cov_b; // r8 per-run fill/border coverage (pre-copy)
+
+    // Persistent GPU glyph cache (Stage B): each unique glyph (keyed by libass
+    // cache_id) is uploaded once into glyph_atlas, so the per-frame upload is
+    // just the cache misses instead of the whole packed atlas.
+    pl_tex glyph_atlas;
+    struct gcache_slot { uint64_t id; int ax, ay, w, h; } *gcache;
+    int gcache_cap, gcache_count;            // open-addressed table (cap = pow2)
+    int gatlas_w, gatlas_h, gsx, gsy, growh; // skyline allocator cursor
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -593,6 +600,56 @@ static int blur_expand_pad(float sigma)
     return ((radius + 4) << level) - 4;
 }
 
+struct gpos { int ax, ay; };   // a glyph's position in the persistent atlas
+
+static struct gcache_slot *gcache_find(struct priv *p, uint64_t id)
+{
+    if (!p->gcache_cap)
+        return NULL;
+    uint64_t h = id & (p->gcache_cap - 1);
+    while (p->gcache[h].id) {
+        if (p->gcache[h].id == id)
+            return &p->gcache[h];
+        h = (h + 1) & (p->gcache_cap - 1);
+    }
+    return NULL;
+}
+
+static void gcache_reset(struct priv *p)
+{
+    if (p->gcache)
+        memset(p->gcache, 0, p->gcache_cap * sizeof(p->gcache[0]));
+    p->gcache_count = 0;
+    p->gsx = p->gsy = p->growh = 0;
+}
+
+// Locate a glyph in the persistent atlas, uploading it from `src` on a miss
+// (skyline-packed, 1px pad). Returns false if it can't be placed this frame.
+static bool gcache_locate(struct priv *p, uint64_t id, int w, int h,
+                          const void *src, ptrdiff_t row_pitch, struct gpos *out)
+{
+    struct gcache_slot *s = gcache_find(p, id);
+    if (s && s->w == w && s->h == h) {
+        out->ax = s->ax; out->ay = s->ay;
+        return true;
+    }
+    int nw = w + 1, nh = h + 1;     // 1px pad against bilinear bleed
+    if (p->gsx + nw > p->gatlas_w) { p->gsy += p->growh; p->gsx = 0; p->growh = 0; }
+    if (p->gsy + nh > p->gatlas_h)
+        return false;               // atlas full this frame (reset happens at frame start)
+    int gx = p->gsx, gy = p->gsy;
+    p->gsx += nw;
+    if (nh > p->growh) p->growh = nh;
+    pl_tex_upload(p->gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
+        .rc = { .x0 = gx, .y0 = gy, .x1 = gx + w, .y1 = gy + h }, .row_pitch = row_pitch, .ptr = src));
+    uint64_t hh = id & (p->gcache_cap - 1);
+    while (p->gcache[hh].id) hh = (hh + 1) & (p->gcache_cap - 1);
+    p->gcache[hh] = (struct gcache_slot){ id, gx, gy, w, h };
+    p->gcache_count++;
+    out->ax = gx; out->ay = gy;
+    return true;
+}
+
 // One grouped composite unit: a deferred run (run_id != 0) carries its fill and
 // border glyph lists separately and gets combine+blur+fix_outline; a fallback
 // singleton (glyph_id == 0) is already-combined coverage that only needs blur.
@@ -613,14 +670,14 @@ struct gc_region {
 // match libass's combine -> expand -> fix_outline -> blur order.)
 static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
                          struct gc_region *r, int *parts, int n,
-                         pl_tex cov, int bw, int bh)
+                         pl_tex cov, int bw, int bh, struct gpos *cpos)
 {
     osd_clear(p, p->run_acc, bw, bh);
     for (int k = 0; k < n; k++) {
         const struct sub_bitmap *b = &item->parts[parts[k]];
         int dx = b->x - r->x0 + r->margin, dy = b->y - r->y0 + r->margin;
-        osd_combine_part(p, p->glyph_src, p->run_acc, b->src_x, b->src_y,
-                         dx, dy, b->w, b->h);
+        osd_combine_part(p, p->glyph_atlas, p->run_acc, cpos[parts[k]].ax,
+                         cpos[parts[k]].ay, dx, dy, b->w, b->h);
     }
     osd_unop(p, p->run_acc, cov, bw, bh, "acc", false, "dst", osd_resolve_body);
 }
@@ -645,14 +702,34 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         !(r8->caps & PL_FMT_CAP_STORABLE))
         return;
 
-    int aw = item->packed_w, ah = item->packed_h;
-    if (!gc_ensure(gpu, &p->glyph_src, r8, aw, ah, false, true, false, false, true))
-        return;
-    pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_src,
-        .rc = { .x1 = aw, .y1 = ah }, .row_pitch = item->packed->stride[0],
-        .ptr = item->packed->planes[0]));
+    // Persistent glyph cache: ensure the atlas + map, reset if near-full, then
+    // upload only the cache-miss glyphs (the per-frame bandwidth win).
+    if (!p->glyph_atlas) {
+        p->gatlas_w = p->gatlas_h = 4096;
+        if (!gc_ensure(gpu, &p->glyph_atlas, r8, p->gatlas_w, p->gatlas_h,
+                       false, true, false, false, true))
+            return;
+        p->gcache_cap = 1 << 15;
+        p->gcache = talloc_zero_array(p, struct gcache_slot, p->gcache_cap);
+    }
+    if (p->gsy > p->gatlas_h - 256 || p->gcache_count * 10 > p->gcache_cap * 7)
+        gcache_reset(p);
 
     void *tmp = talloc_new(NULL);
+
+    // Resolve every deferred glyph to its atlas position (uploading misses).
+    struct gpos *cpos = talloc_array(tmp, struct gpos, item->num_parts);
+    ptrdiff_t pstride = item->packed->stride[0];
+    for (int i = 0; i < item->num_parts; i++) {
+        const struct sub_bitmap *b = &item->parts[i];
+        cpos[i] = (struct gpos){0, 0};
+        if (b->libass.glyph_id == 0)
+            continue;
+        const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
+                            + (ptrdiff_t) b->src_y * pstride + b->src_x;
+            gcache_locate(p, b->libass.glyph_id, b->w, b->h, gsrc, pstride, &cpos[i]);
+    }
+
     int max_run = 0;
     for (int i = 0; i < item->num_parts; i++)
         max_run = MPMAX(max_run, (int) item->parts[i].libass.run_id);
@@ -723,9 +800,9 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         struct gc_region *r = &regs[i];
         int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
         if (r->nfill) {
-            gc_build_cov(p, item, r, r->fill, r->nfill, p->run_cov_f, bw, bh);
+            gc_build_cov(p, item, r, r->fill, r->nfill, p->run_cov_f, bw, bh, cpos);
             if (r->nbord) {
-                gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh);
+                gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos);
                 // fix_outline on the unblurred coverage (libass order), then blur.
                 if (r->run_flags & 1)   // bit 0 = apply fix_outline (see libass)
                     osd_unop(p, p->run_cov_f, p->run_cov_b, bw, bh,
@@ -736,7 +813,7 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             gc_blur(p, p->run_cov_f, bw, bh, r->blur_f);  // σ may be 0 (bordered fill)
             osd_copy(p, p->run_cov_f, entry->result_tex, r->fill_ax, r->fill_ay, bw, bh);
         } else if (r->nbord) {
-            gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh);
+            gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos);
             gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
             osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
         }
@@ -2778,11 +2855,11 @@ static void uninit(struct vo *vo)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
     for (int i = 0; i < p->num_sub_scratch; i++)
         pl_tex_destroy(p->gpu, &p->sub_scratch[i]);
-    pl_tex_destroy(p->gpu, &p->glyph_src);
     pl_tex_destroy(p->gpu, &p->run_acc);
     pl_tex_destroy(p->gpu, &p->run_tmp);
     pl_tex_destroy(p->gpu, &p->run_cov_f);
     pl_tex_destroy(p->gpu, &p->run_cov_b);
+    pl_tex_destroy(p->gpu, &p->glyph_atlas);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
         pl_buf_destroy(p->gpu, &p->overlay_bufs[i]);
     for (int i = 0; i < p->num_user_hooks; i++)
