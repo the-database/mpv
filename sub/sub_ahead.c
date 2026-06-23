@@ -95,6 +95,8 @@ struct sub_ahead {
     uint64_t last_served_content;
     bool have_last_served;
 
+    int inline_active;           // VO is inline-rendering; worker must not race it
+
     long dbg_hits, dbg_miss, dbg_clears;     // TEMP
 };
 
@@ -201,6 +203,14 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
             a->worker_sd->driver->decode(a->worker_sd, pkt);
             talloc_free(pkt);
             mp_mutex_lock(&a->lock);
+            continue;
+        }
+
+        // Pause while the VO is inline-rendering a missed frame, so the two
+        // heavy parallel renders don't oversaturate the cores (which turned one
+        // miss into a ~250ms stall and a burst of drops).
+        if (a->inline_active) {
+            mp_cond_wait(&a->wakeup, &a->lock);
             continue;
         }
 
@@ -374,6 +384,25 @@ void sub_ahead_set_video_params(struct sub_ahead *a,
         a->gen++;
         mp_cond_signal(&a->wakeup);
     }
+    mp_mutex_unlock(&a->lock);
+}
+
+void sub_ahead_inline_begin(struct sub_ahead *a)
+{
+    if (!a)
+        return;
+    mp_mutex_lock(&a->lock);
+    a->inline_active++;
+    mp_mutex_unlock(&a->lock);
+}
+
+void sub_ahead_inline_end(struct sub_ahead *a)
+{
+    if (!a)
+        return;
+    mp_mutex_lock(&a->lock);
+    a->inline_active--;
+    mp_cond_signal(&a->wakeup);   // let the worker resume
     mp_mutex_unlock(&a->lock);
 }
 
