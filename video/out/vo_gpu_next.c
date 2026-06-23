@@ -393,6 +393,99 @@ static void osd_blur_part(struct priv *p, pl_tex src, pl_tex dst,
     }
 }
 
+// ---- Deferred composite (SUBBITMAP_LIBASS_GLYPHS) GPU passes ----------------
+// libass emits uncombined per-glyph coverage; we reproduce its per-run pipeline
+// on the GPU: combine (saturating add) -> blur -> fix_outline -> alpha-over,
+// integer-exact, so the result matches the CPU-combined path bit for bit.
+
+// Add one glyph's atlas coverage into the run's f32 accumulator. Read-add-write;
+// pl_dispatch serializes overlapping parts via its texture-dependency tracking,
+// so this is the (associative, commutative) sum the CPU computes -- the final
+// clamp happens once at resolve, which is identical to the CPU's per-glyph
+// min(dst+src,255) because coverage is non-negative and saturation is sticky.
+static const char *const osd_combine_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh) {\n"
+    "    float cov = texelFetch(src, ivec2(sx+g.x, sy+g.y), 0).r;\n"
+    "    ivec2 d = ivec2(dx+g.x, dy+g.y);\n"
+    "    float a = imageLoad(acc, d).r;\n"
+    "    imageStore(acc, d, vec4(a + cov, 0.0, 0.0, 0.0));\n"
+    "}\n";
+// Resolve the f32 sum to r8 coverage with a single saturating clamp.
+static const char *const osd_resolve_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh)\n"
+    "    imageStore(dst, g, vec4(min(imageLoad(acc, g).r, 1.0), 0.0, 0.0, 0.0));\n";
+// fix_outline: border = border>fill ? border - fill/2 : 0, in 0..255 integers
+// (matching ass_fix_outline's integer floor division), in place on B.
+static const char *const osd_fixoutline_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh) {\n"
+    "    float bb = floor(imageLoad(bord, g).r * 255.0 + 0.5);\n"
+    "    float ff = floor(texelFetch(fill, g, 0).r * 255.0 + 0.5);\n"
+    "    float o = bb > ff ? bb - floor(ff * 0.5) : 0.0;\n"
+    "    imageStore(bord, g, vec4(o / 255.0, 0.0, 0.0, 0.0));\n"
+    "}\n";
+
+static void osd_combine_part(struct priv *p, pl_tex atlas, pl_tex acc,
+                             int sx, int sy, int dx, int dy, int rw, int rh)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 },
+          .binding = { .object=atlas } },
+        { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=1,
+                    .access=PL_DESC_ACCESS_READWRITE },
+          .binding = { .object=acc } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("sx"), .data=&sx }, { .var = pl_var_int("sy"), .data=&sy },
+        { .var = pl_var_int("dx"), .data=&dx }, { .var = pl_var_int("dy"), .data=&dy },
+        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 6, .body = osd_combine_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
+// One r/w-storage + one sampled/storage helper for resolve and fix_outline.
+static void osd_unop(struct priv *p, pl_tex a, pl_tex b, int rw, int rh,
+                     const char *aname, bool a_sampled, const char *bname,
+                     const char *body)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name=aname,
+                    .type = a_sampled ? PL_DESC_SAMPLED_TEX : PL_DESC_STORAGE_IMG,
+                    .binding=0,
+                    .access = a_sampled ? 0 : PL_DESC_ACCESS_READWRITE },
+          .binding = { .object=a } },
+        { .desc = { .name=bname, .type=PL_DESC_STORAGE_IMG, .binding=1,
+                    .access = PL_DESC_ACCESS_READWRITE },
+          .binding = { .object=b } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 2, .body = body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
 static void update_overlays(struct vo *vo, struct mp_osd_res res,
                             int flags, enum pl_overlay_coords coords,
                             struct osd_state *state, struct pl_frame *frame,
