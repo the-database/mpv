@@ -472,6 +472,8 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
         struct sub_bitmaps *res = sub_ahead_get_bitmaps(sub->ahead, dim, format, pts);
         if (res)
             return res;
+        // Miss: pause the worker so this inline render gets the cores to itself.
+        sub_ahead_inline_begin(sub->ahead);
     }
 
     mp_mutex_lock(&sub->lock);
@@ -488,6 +490,9 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
         res = sub->sd->driver->get_bitmaps(sub->sd, dim, format, pts);
 
     mp_mutex_unlock(&sub->lock);
+
+    if (sub->ahead)
+        sub_ahead_inline_end(sub->ahead);
     return res;
 }
 
