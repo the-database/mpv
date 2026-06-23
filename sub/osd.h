@@ -33,6 +33,9 @@ enum sub_bitmap_format {
                         // SUBBITMAP_BGRA during packing
     SUBBITMAP_LIBASS_GLYPHS, // like LIBASS but uncombined per-glyph parts, to be
                         // combined + composited on the GPU (deferred composite)
+    SUBBITMAP_LIBASS_OUTLINES, // like GLYPHS but each part carries the glyph's
+                        // coverage OUTLINE (line segments), rasterized on the GPU
+                        // instead of the CPU (deferred outline / "libass-gpu")
 
     SUBBITMAP_COUNT
 };
@@ -63,6 +66,11 @@ struct sub_bitmap {
             uint32_t run_id;     // coverage-combine within a run, over across
             uint32_t run_flags;  // run FilterDesc flags (fix_outline/shadow)
             uint8_t layer;       // 0=fill, 1=outline, 2=shadow (ASS_Image.type)
+            // Deferred-outline mode (SUBBITMAP_LIBASS_OUTLINES): the glyph's
+            // coverage as line segments (4*int32 each: x0,y0,x1,y1 in 1/64px,
+            // relative to x,y), to rasterize on the GPU. bitmap is NULL.
+            const int32_t *outline;
+            int32_t n_outline;
         } libass;
         struct {
             const struct sbr_output_image *image;

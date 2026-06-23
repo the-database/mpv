@@ -318,10 +318,13 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
                                          const bool sub_formats[SUBBITMAP_COUNT])
 {
     int format = SUBBITMAP_LIBASS;
-    // Prefer uncombined per-glyph output when the VO can composite it on the GPU
-    // (sd_ass falls back to plain LIBASS if --sub-gpu-composite is off).
+    // Prefer GPU-friendly output when the VO advertises it (sd_ass falls back to
+    // plain LIBASS if the matching --sub-gpu-* option is off). Outlines are the
+    // most capable (GPU also rasterizes), then per-glyph coverage.
     if (sub_formats[SUBBITMAP_LIBASS_GLYPHS] && !osd->opts->force_rgba_osd)
         format = SUBBITMAP_LIBASS_GLYPHS;
+    if (sub_formats[SUBBITMAP_LIBASS_OUTLINES] && !osd->opts->force_rgba_osd)
+        format = SUBBITMAP_LIBASS_OUTLINES;
     if (!sub_formats[format] || osd->opts->force_rgba_osd)
         format = SUBBITMAP_BGRA;
 
@@ -591,6 +594,17 @@ struct sub_bitmaps *sub_bitmaps_copy(struct sub_bitmap_copy_cache **p_cache,
     *res = *in;
 
     // Note: the p_cache thing is a lie and unused.
+
+    // Outline mode has no packed atlas; each part carries its coverage outline,
+    // owned by the packer for this frame. Shallow-copy the parts (mangle_colors
+    // only edits the color field).
+    if (in->format == SUBBITMAP_LIBASS_OUTLINES) {
+        res->packed = NULL;
+        res->parts = NULL;
+        MP_RESIZE_ARRAY(res, res->parts, res->num_parts);
+        memcpy(res->parts, in->parts, sizeof(res->parts[0]) * res->num_parts);
+        return res;
+    }
 
     // The bitmaps being refcounted is essential for performance, and for
     // not invalidating in->parts[*].bitmap pointers.
