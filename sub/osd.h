@@ -62,6 +62,7 @@ struct sub_bitmap {
             uint64_t glyph_id;   // stable cache id; 0 = legacy combined part
             uint32_t run_id;     // coverage-combine within a run, over across
             uint32_t run_flags;  // run FilterDesc flags (fix_outline/shadow)
+            uint8_t layer;       // 0=fill, 1=outline, 2=shadow (ASS_Image.type)
         } libass;
         struct {
             const struct sbr_output_image *image;
