@@ -162,6 +162,9 @@ struct priv {
     struct gcache_slot { uint64_t id; int ax, ay, w, h; } *gcache;
     int gcache_cap, gcache_count;            // open-addressed table (cap = pow2)
     int gatlas_w, gatlas_h, gsx, gsy, growh; // skyline allocator cursor
+    pl_buf glyph_stage[3];                   // async upload staging ring (no VO stall)
+    unsigned glyph_stage_idx;
+    uint8_t *gstage_cpu; size_t gstage_cpu_sz; // tight-repack scratch for misses
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -625,9 +628,14 @@ static void gcache_reset(struct priv *p)
 
 // Locate a glyph in the persistent atlas, uploading it from `src` on a miss
 // (skyline-packed, 1px pad). Returns false if it can't be placed this frame.
-static bool gcache_locate(struct priv *p, uint64_t id, int w, int h,
-                          const void *src, ptrdiff_t row_pitch, struct gpos *out)
+// Reserve a glyph's slot in the persistent atlas. Cache hit: *upload stays
+// false. Miss: a skyline slot is allocated + the id inserted, *upload set true
+// (the caller uploads the pixels asynchronously, batched, to avoid a VO stall).
+// Returns false only if the glyph can't be placed this frame (atlas full).
+static bool gcache_reserve(struct priv *p, uint64_t id, int w, int h,
+                           struct gpos *out, bool *upload)
 {
+    *upload = false;
     struct gcache_slot *s = gcache_find(p, id);
     if (s && s->w == w && s->h == h) {
         out->ax = s->ax; out->ay = s->ay;
@@ -640,13 +648,12 @@ static bool gcache_locate(struct priv *p, uint64_t id, int w, int h,
     int gx = p->gsx, gy = p->gsy;
     p->gsx += nw;
     if (nh > p->growh) p->growh = nh;
-    pl_tex_upload(p->gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
-        .rc = { .x0 = gx, .y0 = gy, .x1 = gx + w, .y1 = gy + h }, .row_pitch = row_pitch, .ptr = src));
     uint64_t hh = id & (p->gcache_cap - 1);
     while (p->gcache[hh].id) hh = (hh + 1) & (p->gcache_cap - 1);
     p->gcache[hh] = (struct gcache_slot){ id, gx, gy, w, h };
     p->gcache_count++;
     out->ax = gx; out->ay = gy;
+    *upload = true;
     return true;
 }
 
@@ -717,17 +724,72 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 
     void *tmp = talloc_new(NULL);
 
-    // Resolve every deferred glyph to its atlas position (uploading misses).
+    // Resolve every deferred glyph to its atlas position, collecting cache
+    // misses to upload in one async batch (a synchronous per-glyph .ptr upload
+    // stalls the VO thread on d3d11; see the staging-buffer note below).
     struct gpos *cpos = talloc_array(tmp, struct gpos, item->num_parts);
+    struct gmiss { int ax, ay, w, h; const uint8_t *src; };
+    struct gmiss *miss = NULL;
+    int nmiss = 0;
+    size_t miss_bytes = 0;
     ptrdiff_t pstride = item->packed->stride[0];
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
         cpos[i] = (struct gpos){0, 0};
         if (b->libass.glyph_id == 0)
             continue;
-        const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
-                            + (ptrdiff_t) b->src_y * pstride + b->src_x;
-            gcache_locate(p, b->libass.glyph_id, b->w, b->h, gsrc, pstride, &cpos[i]);
+        bool up;
+        if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up))
+            continue;
+        if (up) {
+            const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
+                                + (ptrdiff_t) b->src_y * pstride + b->src_x;
+            MP_TARRAY_APPEND(tmp, miss, nmiss,
+                ((struct gmiss){ cpos[i].ax, cpos[i].ay, b->w, b->h, gsrc }));
+            miss_bytes += (size_t) b->w * b->h;
+        }
+    }
+
+    // Flush the misses: tight-repack into a CPU scratch, one async buffer write,
+    // then per-glyph async texture uploads (buffer-backed = no VO-thread stall).
+    if (nmiss) {
+        if (p->gstage_cpu_sz < miss_bytes) {
+            p->gstage_cpu = talloc_realloc(p, p->gstage_cpu, uint8_t, miss_bytes);
+            p->gstage_cpu_sz = miss_bytes;
+        }
+        pl_buf *ring = &p->glyph_stage[p->glyph_stage_idx++ % 3];
+        bool buf_ok = (*ring) && (*ring)->params.size >= miss_bytes;
+        if (!buf_ok) {
+            size_t want = (miss_bytes + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);
+            buf_ok = pl_buf_recreate(gpu, ring,
+                                     pl_buf_params(.size = want, .host_writable = true));
+        }
+        size_t off = 0;
+        size_t *offs = talloc_array(tmp, size_t, nmiss);
+        for (int m = 0; m < nmiss; m++) {           // repack tight into the scratch
+            struct gmiss *g = &miss[m];
+            offs[m] = off;
+            for (int row = 0; row < g->h; row++)
+                memcpy(p->gstage_cpu + off + (size_t) row * g->w,
+                       g->src + (ptrdiff_t) row * pstride, g->w);
+            off += (size_t) g->w * g->h;
+        }
+        if (buf_ok) {
+            pl_buf_write(gpu, *ring, 0, p->gstage_cpu, miss_bytes);
+            for (int m = 0; m < nmiss; m++) {
+                struct gmiss *g = &miss[m];
+                pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
+                    .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
+                    .row_pitch = g->w, .buf = *ring, .buf_offset = offs[m]));
+            }
+        } else {                                    // fallback: synchronous
+            for (int m = 0; m < nmiss; m++) {
+                struct gmiss *g = &miss[m];
+                pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
+                    .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
+                    .row_pitch = g->w, .ptr = p->gstage_cpu + offs[m]));
+            }
+        }
     }
 
     int max_run = 0;
@@ -2860,6 +2922,8 @@ static void uninit(struct vo *vo)
     pl_tex_destroy(p->gpu, &p->run_cov_f);
     pl_tex_destroy(p->gpu, &p->run_cov_b);
     pl_tex_destroy(p->gpu, &p->glyph_atlas);
+    for (int i = 0; i < 3; i++)
+        pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
         pl_buf_destroy(p->gpu, &p->overlay_bufs[i]);
     for (int i = 0; i < p->num_user_hooks; i++)
