@@ -74,7 +74,7 @@ struct osd_entry {
 // Ring of streaming upload buffers cycled across uploads, so a buffer is never
 // reused while its previous async upload is still in flight (which would make
 // pl_buf_write block). Sized well above the in-flight depth.
-#define NUM_OVERLAY_BUFS 8
+#define NUM_OVERLAY_BUFS 16
 
 struct osd_state {
     struct osd_entry entries[MAX_OSD_PARTS];
@@ -422,10 +422,15 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         pl_fmt tex_fmt = p->osd_fmt[item->format];
         if (!entry->tex)
             MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
+        // Round the OSD texture up and grow it monotonically so it isn't
+        // reallocated every frame as the atlas grows through a dense scene
+        // (each realloc stalls the display thread).
+        int want_w = (item->packed_w + 255) & ~255;
+        int want_h = (item->packed_h + 255) & ~255;
         bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
             .format = tex_fmt,
-            .w = MPMAX(item->packed_w, entry->tex ? entry->tex->params.w : 0),
-            .h = MPMAX(item->packed_h, entry->tex ? entry->tex->params.h : 0),
+            .w = MPMAX(want_w, entry->tex ? entry->tex->params.w : 0),
+            .h = MPMAX(want_h, entry->tex ? entry->tex->params.h : 0),
             .host_writable = true,
             .sampleable = true,
         });
@@ -445,8 +450,17 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         size_t buf_size = (size_t) upload_params.row_pitch * item->packed_h;
         pl_buf *ring = &p->overlay_bufs[p->overlay_buf_idx++ % NUM_OVERLAY_BUFS];
         int64_t dbg_u0 = mp_time_ns();
-        if (pl_buf_recreate(p->gpu, ring,
-                            pl_buf_params(.size = buf_size, .host_writable = true)))
+        // Reuse the staging buffer whenever it's already big enough; only
+        // (re)allocate on growth, rounded up, so it stops being reallocated as
+        // the atlas grows frame-to-frame through a dense scene (that realloc was
+        // the ~187ms VO-thread stall).
+        bool buf_ok = (*ring) && (*ring)->params.size >= buf_size;
+        if (!buf_ok) {
+            size_t want = (buf_size + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
+            buf_ok = pl_buf_recreate(p->gpu, ring,
+                                     pl_buf_params(.size = want, .host_writable = true));
+        }
+        if (buf_ok)
         {
             pl_buf_write(p->gpu, *ring, 0, item->packed->planes[0], buf_size);
             upload_params.buf = *ring;
