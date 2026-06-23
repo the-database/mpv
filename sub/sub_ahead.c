@@ -215,9 +215,14 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         uint64_t gen = a->gen;
         double interval = a->video_fps > 0 ? 1.0 / a->video_fps : 1.0 / 24.0;
 
-        // Nearest upcoming frame not yet in the ring.
+        // Nearest upcoming frame not yet in the ring. Start at i=1 (the NEXT
+        // frame), never the current one: if the current frame is a miss, the VO
+        // renders it inline, and the worker must not render it too -- otherwise
+        // both render the same heavy frame at once, the cores oversaturate, and
+        // one miss balloons into a multi-frame stall. Skipping it keeps a miss a
+        // single inline frame while the worker races ahead to refill.
         double target = MP_NOPTS_VALUE;
-        for (int i = 0; i <= depth; i++) {
+        for (int i = 1; i <= depth; i++) {
             double V = vo + i * interval;
             if (ahead_find(a, V, dim, format) < 0) {
                 target = V;
