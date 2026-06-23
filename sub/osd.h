@@ -31,6 +31,8 @@ enum sub_bitmap_format {
     SUBBITMAP_BGRA,     // IMGFMT_BGRA (MSB=A, LSB=B), scaled, premultiplied alpha
     SUBBITMAP_SUBRANDR, // contains `sbr_output_image`s, must be converted to
                         // SUBBITMAP_BGRA during packing
+    SUBBITMAP_LIBASS_GLYPHS, // like LIBASS but uncombined per-glyph parts, to be
+                        // combined + composited on the GPU (deferred composite)
 
     SUBBITMAP_COUNT
 };
@@ -55,6 +57,11 @@ struct sub_bitmap {
             // Deferred-blur mode: gaussian std-dev (px) still to apply to this
             // part's coverage on the GPU; 0 = already blurred / no blur.
             float blur_x, blur_y;
+            // Deferred-composite mode (SUBBITMAP_LIBASS_GLYPHS): this part is a
+            // single uncombined per-glyph coverage bitmap.
+            uint64_t glyph_id;   // stable cache id; 0 = legacy combined part
+            uint32_t run_id;     // coverage-combine within a run, over across
+            uint32_t run_flags;  // run FilterDesc flags (fix_outline/shadow)
         } libass;
         struct {
             const struct sbr_output_image *image;
