@@ -308,6 +308,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->libass.glyph_id = img->glyph_id;
             b->libass.run_id = img->run_id;
             b->libass.run_flags = img->run_flags;
+            b->libass.layer = img->type;   // 0=character/fill, 1=outline, 2=shadow
             b->dw = b->w = img->w;
             b->dh = b->h = img->h;
             b->x = img->dst_x;
