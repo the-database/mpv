@@ -569,13 +569,34 @@ static bool gc_ensure(pl_gpu gpu, pl_tex *t, pl_fmt fmt, int w, int h,
         .blit_src = blit_src, .blit_dst = blit_dst, .host_writable = host_writable));
 }
 
+// Match libass's deferred-blur expand padding (ass_blur_expand_only): the blur
+// runs over coverage padded by this many pixels per side, and osd_blur_part's
+// edge renormalization depends on it, so the margin must equal it for a
+// bit-exact match. Mirrors find_best_method() + the shift formula.
+static int blur_expand_pad(float sigma)
+{
+    double r2 = (double) sigma * sigma;
+    if (r2 <= 0.001)
+        return 0;
+    int level, radius;
+    if (r2 < 0.5) {
+        level = 0; radius = 4;
+    } else {
+        double frac = frexp(sqrt(0.11569 * r2 + 0.20591047), &level);
+        double mul = pow(0.25, level);
+        radius = 8 - (int)((10.1525 + 0.8335 * mul) * (1 - frac));
+        if (radius < 4) radius = 4;
+    }
+    return ((radius + 4) << level) - 4;
+}
+
 // One grouped composite unit: a deferred run (run_id != 0) carries its fill and
 // border glyph lists separately and gets combine+blur+fix_outline; a fallback
 // singleton (glyph_id == 0) is already-combined coverage that only needs blur.
 struct gc_region {
     int x0, y0, x1, y1;          // screen bbox of all member parts (pre-margin)
     int margin;                  // blur halo padding added on every side
-    float blur;
+    float blur_f, blur_b;        // fill / border gaussian std-dev (0 = no blur)
     uint32_t run_flags;
     int *fill, nfill;            // part indices (layer 0 / singleton)
     int *bord, nbord;            // part indices (layer 1)
@@ -585,7 +606,8 @@ struct gc_region {
 };
 
 // Combine a region's glyph list (saturating add) into run_acc at run-local
-// coords, resolve to cov, then separable-blur cov in place (cov->tmp->cov).
+// coords and resolve to cov. (Blur happens later -- after fix_outline -- to
+// match libass's combine -> expand -> fix_outline -> blur order.)
 static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
                          struct gc_region *r, int *parts, int n,
                          pl_tex cov, int bw, int bh)
@@ -598,8 +620,12 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
                          dx, dy, b->w, b->h);
     }
     osd_unop(p, p->run_acc, cov, bw, bh, "acc", false, "dst", osd_resolve_body);
-    osd_blur_part(p, cov, p->run_tmp, 0, 0, bw, bh, r->blur, osd_blur_body_h);
-    osd_blur_part(p, p->run_tmp, cov, 0, 0, bw, bh, r->blur, osd_blur_body_v);
+}
+
+static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
+{
+    osd_blur_part(p, cov, p->run_tmp, 0, 0, bw, bh, sigma, osd_blur_body_h);
+    osd_blur_part(p, p->run_tmp, cov, 0, 0, bw, bh, sigma, osd_blur_body_v);
 }
 
 // Composite a SUBBITMAP_LIBASS_GLYPHS item: reproduce libass's per-run combine
@@ -639,7 +665,7 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             MP_TARRAY_GROW(tmp, regs, nregs);
             r = &regs[nregs++];
             *r = (struct gc_region){ .x0 = b->x, .y0 = b->y,
-                .x1 = b->x + b->dw, .y1 = b->y + b->dh, .blur = b->libass.blur_x,
+                .x1 = b->x + b->dw, .y1 = b->y + b->dh, .blur_f = b->libass.blur_x,
                 .fill_color = b->libass.color, .single_layer = b->libass.layer };
             MP_TARRAY_APPEND(tmp, r->fill, r->nfill, i);
             continue;
@@ -649,7 +675,7 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             MP_TARRAY_GROW(tmp, regs, nregs);
             ri = idx[b->libass.run_id] = nregs++;
             regs[ri] = (struct gc_region){ .x0 = b->x, .y0 = b->y,
-                .x1 = b->x + b->dw, .y1 = b->y + b->dh, .blur = b->libass.blur_x,
+                .x1 = b->x + b->dw, .y1 = b->y + b->dh,
                 .run_flags = b->libass.run_flags, .single_layer = 0xff };
         }
         r = &regs[ri];
@@ -657,9 +683,11 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         r->x1 = MPMAX(r->x1, b->x + b->dw); r->y1 = MPMAX(r->y1, b->y + b->dh);
         if (b->libass.layer == 1) {
             r->bord_color = b->libass.color;
+            r->blur_b = b->libass.blur_x;
             MP_TARRAY_APPEND(tmp, r->bord, r->nbord, i);
         } else {
             r->fill_color = b->libass.color;
+            r->blur_f = b->libass.blur_x;
             MP_TARRAY_APPEND(tmp, r->fill, r->nfill, i);
         }
     }
@@ -675,7 +703,11 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     } while (0)
     for (int i = 0; i < nregs; i++) {
         struct gc_region *r = &regs[i];
-        r->margin = (int)(3.0f * r->blur + 0.999f);
+        // Deferred runs are raw (unexpanded) per-glyph coverage, so they need
+        // the blur halo padding. Fallback singletons are already libass-expanded
+        // combined coverage (blur pending) -- blur them over their own bounds.
+        r->margin = (r->single_layer != 0xff) ? 0
+                  : blur_expand_pad(MPMAX(r->blur_f, r->blur_b));
         int rw = r->x1 - r->x0 + 2 * r->margin, rh = r->y1 - r->y0 + 2 * r->margin;
         if (r->nfill) ALLOC_REGION(r->fill_ax, r->fill_ay, rw, rh);
         if (r->nbord) ALLOC_REGION(r->bord_ax, r->bord_ay, rw, rh);
@@ -698,14 +730,18 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             gc_build_cov(p, item, r, r->fill, r->nfill, p->run_cov_f, bw, bh);
             if (r->nbord) {
                 gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh);
+                // fix_outline on the unblurred coverage (libass order), then blur.
                 if (r->run_flags & 1)   // bit 0 = apply fix_outline (see libass)
                     osd_unop(p, p->run_cov_f, p->run_cov_b, bw, bh,
                              "fill", true, "bord", osd_fixoutline_body);
+                gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
                 osd_copy(p, p->run_cov_b, entry->tex, r->bord_ax, r->bord_ay, bw, bh);
             }
+            gc_blur(p, p->run_cov_f, bw, bh, r->blur_f);  // σ may be 0 (bordered fill)
             osd_copy(p, p->run_cov_f, entry->tex, r->fill_ax, r->fill_ay, bw, bh);
         } else if (r->nbord) {
             gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh);
+            gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
             osd_copy(p, p->run_cov_b, entry->tex, r->bord_ax, r->bord_ay, bw, bh);
         }
     }
