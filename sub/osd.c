@@ -319,6 +319,10 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
                                          const bool sub_formats[SUBBITMAP_COUNT])
 {
     int format = SUBBITMAP_LIBASS;
+    // Prefer uncombined per-glyph output when the VO can composite it on the GPU
+    // (sd_ass falls back to plain LIBASS if --sub-gpu-composite is off).
+    if (sub_formats[SUBBITMAP_LIBASS_GLYPHS] && !osd->opts->force_rgba_osd)
+        format = SUBBITMAP_LIBASS_GLYPHS;
     if (!sub_formats[format] || osd->opts->force_rgba_osd)
         format = SUBBITMAP_BGRA;
 
