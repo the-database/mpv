@@ -320,11 +320,15 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
     int format = SUBBITMAP_LIBASS;
     // Prefer GPU-friendly output when the VO advertises it (sd_ass falls back to
     // plain LIBASS if the matching --sub-gpu-* option is off). Outlines are the
-    // most capable (GPU also rasterizes), then per-glyph coverage.
-    if (sub_formats[SUBBITMAP_LIBASS_GLYPHS] && !osd->opts->force_rgba_osd)
-        format = SUBBITMAP_LIBASS_GLYPHS;
-    if (sub_formats[SUBBITMAP_LIBASS_OUTLINES] && !osd->opts->force_rgba_osd)
-        format = SUBBITMAP_LIBASS_OUTLINES;
+    // most capable (GPU also rasterizes), then per-glyph coverage. ONLY for
+    // subtitles: the OSD/OSC renderer (osd_libass) runs in normal CPU-raster mode
+    // and carries no outline/glyph data, so it must stay on plain LIBASS.
+    if (obj->is_sub && !osd->opts->force_rgba_osd) {
+        if (sub_formats[SUBBITMAP_LIBASS_GLYPHS])
+            format = SUBBITMAP_LIBASS_GLYPHS;
+        if (sub_formats[SUBBITMAP_LIBASS_OUTLINES])
+            format = SUBBITMAP_LIBASS_OUTLINES;
+    }
     if (!sub_formats[format] || osd->opts->force_rgba_osd)
         format = SUBBITMAP_BGRA;
 
