@@ -885,8 +885,9 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // Persistent glyph cache: ensure the atlas + map, reset if near-full, then
     // upload only the cache-miss glyphs (the per-frame bandwidth win).
     if (!p->glyph_atlas) {
-        // Large enough to hold big 8K glyphs / drawing shapes, within the limit.
-        p->gatlas_w = p->gatlas_h = MPMIN(gpu->limits.max_tex_2d_dim, 8192);
+        // As large as the GPU allows: a dense 8K frame's glyphs + clip masks must
+        // mostly fit at once or later ones get dropped (flashing). 16384^2 = 256MB.
+        p->gatlas_w = p->gatlas_h = MPMIN(gpu->limits.max_tex_2d_dim, 16384);
         // storable too: the GPU rasterizer (outline mode) writes coverage here.
         if (!gc_ensure(gpu, &p->glyph_atlas, r8, p->gatlas_w, p->gatlas_h,
                        true, true, false, false, true))
@@ -915,14 +916,24 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     struct clipmask *clips = NULL;
     int nclips = 0;
     ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
+    // The persistent glyph atlas accumulates glyphs across frames; a dense frame
+    // can exhaust the remaining space mid-frame, dropping its later glyphs/clip
+    // masks (flashing). Nothing is rasterized until after this loop, so if a
+    // reservation fails, reset the atlas once and rebuild from empty.
+    bool gc_retried = false;
+gc_restart:
+    nmiss = nrjobs = nclips = ne = nh = 0;
+    miss_bytes = 0;
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
         cpos[i] = (struct gpos){0, 0};
         if (b->libass.glyph_id == 0)
             continue;
         bool up;
-        if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up))
-            continue;
+        if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up)) {
+            if (!gc_retried) { gcache_reset(p); gc_retried = true; goto gc_restart; }
+            continue;   // already rebuilt from empty: this frame genuinely overflows
+        }
         if (b->libass.run_flags & RUN_FLAG_CLIP_MASK)   // record (still rasterized below)
             MP_TARRAY_APPEND(tmp, clips, nclips, ((struct clipmask){
                 b->libass.run_id, cpos[i].ax, cpos[i].ay, b->x, b->y, b->w, b->h,
