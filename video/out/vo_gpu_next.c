@@ -589,10 +589,15 @@ static bool gc_ensure(pl_gpu gpu, pl_tex *t, pl_fmt fmt, int w, int h,
                       bool storable, bool sampleable, bool blit_src,
                       bool blit_dst, bool host_writable)
 {
+    w = MPMAX(w, *t ? (*t)->params.w : 0);
+    h = MPMAX(h, *t ? (*t)->params.h : 0);
+    // Respect the GPU's max 2D texture size; bail (caller skips) rather than
+    // hit a libplacebo validation crash. At 8K the coverage atlas can stack
+    // taller than this.
+    if (w > gpu->limits.max_tex_2d_dim || h > gpu->limits.max_tex_2d_dim)
+        return false;
     return pl_tex_recreate(gpu, t, pl_tex_params(
-        .format = fmt,
-        .w = MPMAX(w, *t ? (*t)->params.w : 0),
-        .h = MPMAX(h, *t ? (*t)->params.h : 0),
+        .format = fmt, .w = w, .h = h,
         .storable = storable, .sampleable = sampleable,
         .blit_src = blit_src, .blit_dst = blit_dst, .host_writable = host_writable));
 }
@@ -657,6 +662,8 @@ static bool gcache_reserve(struct priv *p, uint64_t id, int w, int h,
         return true;
     }
     int nw = w + 1, nh = h + 1;     // 1px pad against bilinear bleed
+    if (nw > p->gatlas_w || nh > p->gatlas_h)
+        return false;               // glyph larger than the whole atlas: skip (no OOB)
     if (p->gsx + nw > p->gatlas_w) { p->gsy += p->growh; p->gsx = 0; p->growh = 0; }
     if (p->gsy + nh > p->gatlas_h)
         return false;               // atlas full this frame (reset happens at frame start)
@@ -714,7 +721,8 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
 // Exact-area analytic coverage from a glyph's line segments, written into the
 // glyph atlas slot. Matches libass's CPU raster to <=9/255 (validated, edge-AA
 // only). Antiderivative of clamp(t,0,1) for the exact clamped-ramp integral.
-#define EDGE_TEX_W 1024   // edge_tex width; edge i is at (i%W, i/W)
+#define EDGE_TEX_W 8192   // edge_tex width; edge i is at (i%W, i/W). Wide so the
+                          // height (n_edges/W) stays well under max_tex_2d_dim at 8K.
 static const char *const osd_raster_prelude =
     "float Hc(float t){ if (t<=0.0) return 0.0; if (t>=1.0) return t-0.5; return 0.5*t*t; }\n";
 static const char *const osd_raster_body =
@@ -789,7 +797,8 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // Persistent glyph cache: ensure the atlas + map, reset if near-full, then
     // upload only the cache-miss glyphs (the per-frame bandwidth win).
     if (!p->glyph_atlas) {
-        p->gatlas_w = p->gatlas_h = 4096;
+        // Large enough to hold big 8K glyphs / drawing shapes, within the limit.
+        p->gatlas_w = p->gatlas_h = MPMIN(gpu->limits.max_tex_2d_dim, 8192);
         // storable too: the GPU rasterizer (outline mode) writes coverage here.
         if (!gc_ensure(gpu, &p->glyph_atlas, r8, p->gatlas_w, p->gatlas_h,
                        true, true, false, false, true))
@@ -943,7 +952,9 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 
     if (!nregs) { talloc_free(tmp); return; }   // no deferred runs in this item
 
-    const int AW = 4096;
+    // Pack the result atlas as wide as the GPU allows so it stays short enough
+    // to fit max_tex_2d_dim in height (at 8K many wide runs stack very tall).
+    const int AW = MPMIN(gpu->limits.max_tex_2d_dim, 16384);
     int shelf_x = 0, shelf_y = 0, shelf_h = 0, max_w = 0;
     int run_acc_w = 0, run_acc_h = 0;
     #define ALLOC_REGION(AX, AY, RW, RH) do {                               \
