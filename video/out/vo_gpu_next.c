@@ -697,6 +697,7 @@ struct gc_region {
     uint32_t fill_color, bord_color;
     int fill_ax, fill_ay, bord_ax, bord_ay;  // result-atlas positions
     uint8_t single_layer;        // 0xff for a run; else the singleton's layer
+    uint32_t clip_id;            // vector \clip mask to multiply by (0 = none)
 };
 
 // Combine a region's glyph list (saturating add) into run_acc at run-local
@@ -722,6 +723,66 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
     osd_blur_part(p, p->run_tmp, cov, 0, 0, bw, bh, sigma, osd_blur_body_v);
 }
 
+// A vector-\clip mask, rasterized into the glyph atlas (like a glyph) at (ax,ay)
+// and corresponding to screen origin (sx,sy); multiply a run's coverage by it.
+struct clipmask { uint32_t id; int ax, ay, sx, sy, w, h, inv; };
+
+static const char *const osd_clipmult_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x >= bw || g.y >= bh) return;\n"
+    "int mlx = ox + g.x - csx, mly = oy + g.y - csy;\n"   // clip-mask-local coord
+    "float m = 0.0;\n"
+    "if (mlx >= 0 && mlx < cw && mly >= 0 && mly < ch)\n"
+    "    m = texelFetch(mask, ivec2(cax + mlx, cay + mly), 0).r;\n"
+    "float f = inv != 0 ? (1.0 - m) : m;\n"
+    "float c = imageLoad(cov, g).r;\n"
+    "imageStore(cov, g, vec4(c * f, 0.0, 0.0, 0.0));\n";
+
+// Multiply cov (run-local, screen origin (ox,oy)) in place by the clip mask.
+static void gc_clip_mult(struct priv *p, pl_tex cov, int bw, int bh, int ox, int oy,
+                         const struct clipmask *cm)
+{
+    int cax = cm->ax, cay = cm->ay, csx = cm->sx, csy = cm->sy,
+        cw = cm->w, ch = cm->h, inv = cm->inv;
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name = "cov", .type = PL_DESC_STORAGE_IMG, .binding = 0,
+                    .access = PL_DESC_ACCESS_READWRITE }, .binding = { .object = cov } },
+        { .desc = { .name = "mask", .type = PL_DESC_SAMPLED_TEX, .binding = 1 },
+          .binding = { .object = p->glyph_atlas } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("bw"), .data = &bw }, { .var = pl_var_int("bh"), .data = &bh },
+        { .var = pl_var_int("ox"), .data = &ox }, { .var = pl_var_int("oy"), .data = &oy },
+        { .var = pl_var_int("cax"), .data = &cax }, { .var = pl_var_int("cay"), .data = &cay },
+        { .var = pl_var_int("csx"), .data = &csx }, { .var = pl_var_int("csy"), .data = &csy },
+        { .var = pl_var_int("cw"), .data = &cw }, { .var = pl_var_int("ch"), .data = &ch },
+        { .var = pl_var_int("inv"), .data = &inv },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = { 16, 16 },
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 11, .body = osd_clipmult_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (bw + 15) / 16, (bh + 15) / 16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
+static void gc_apply_clip(struct priv *p, pl_tex cov, int bw, int bh,
+                          struct gc_region *r, struct clipmask *clips, int nclips)
+{
+    if (!r->clip_id)
+        return;
+    for (int c = 0; c < nclips; c++)
+        if (clips[c].id == r->clip_id) {
+            gc_clip_mult(p, cov, bw, bh, r->x0 - r->margin, r->y0 - r->margin, &clips[c]);
+            return;
+        }
+}
+
 // --- GPU glyph rasterizer (SUBBITMAP_LIBASS_OUTLINES) -----------------------
 // Exact-area analytic coverage from a glyph's line segments, written into the
 // glyph atlas slot. Matches libass's CPU raster to <=9/255 (validated, edge-AA
@@ -730,6 +791,8 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
 #define HDR_TEX_W  8192   // Wide so the height (count/W) stays under max_tex_2d_dim at 8K.
 #define WORK_TEX_W 8192
 #define RASTER_BAND_H 8   // Y-band height (px): a pixel only tests edges crossing its band.
+#define RUN_FLAG_CLIP_MASK    0x2  // libass ABI: this part is a vector-clip mask
+#define RUN_FLAG_CLIP_INVERSE 0x4  // the clip mask is inverse (\iclip)
 static const char *const osd_raster_prelude =
     "float Hc(float t){ if (t<=0.0) return 0.0; if (t>=1.0) return t-0.5; return 0.5*t*t; }\n";
 // One dispatch for ALL glyphs: one 16x16 workgroup per work-list tile (avoids the
@@ -847,6 +910,10 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     size_t miss_bytes = 0;
     struct rjob { int ax, ay, w, h, hbase, nbands; } *rjobs = NULL;  // outline raster jobs
     int nrjobs = 0, ne = 0, nh = 0;          // ne = binned edges, nh = band headers (vec4 each)
+    // Vector-\clip masks found in this item: rasterized like glyphs, then used to
+    // multiply each clipped run's coverage.
+    struct clipmask *clips = NULL;
+    int nclips = 0;
     ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
@@ -856,6 +923,10 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         bool up;
         if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up))
             continue;
+        if (b->libass.run_flags & RUN_FLAG_CLIP_MASK)   // record (still rasterized below)
+            MP_TARRAY_APPEND(tmp, clips, nclips, ((struct clipmask){
+                b->libass.run_id, cpos[i].ax, cpos[i].ay, b->x, b->y, b->w, b->h,
+                !!(b->libass.run_flags & RUN_FLAG_CLIP_INVERSE) }));
         if (up && is_outline) {
             // Bin this glyph's edges into Y-bands (counting sort), so the shader
             // reads only the edges crossing each pixel's band. Edges are
@@ -1018,13 +1089,16 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         struct gc_region *r;
         if (b->libass.glyph_id == 0)
             continue;   // already-combined fallback parts go via the legacy path
+        if (b->libass.run_flags & RUN_FLAG_CLIP_MASK)
+            continue;   // clip masks are multiplied in, not drawn as runs
         int ri = idx[b->libass.run_id];
         if (ri < 0) {
             MP_TARRAY_GROW(tmp, regs, nregs);
             ri = idx[b->libass.run_id] = nregs++;
             regs[ri] = (struct gc_region){ .x0 = b->x, .y0 = b->y,
                 .x1 = b->x + b->dw, .y1 = b->y + b->dh,
-                .run_flags = b->libass.run_flags, .single_layer = 0xff };
+                .run_flags = b->libass.run_flags, .single_layer = 0xff,
+                .clip_id = b->libass.clip_id };
         }
         r = &regs[ri];
         r->x0 = MPMIN(r->x0, b->x); r->y0 = MPMIN(r->y0, b->y);
@@ -1085,13 +1159,16 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                     osd_unop(p, p->run_cov_f, p->run_cov_b, bw, bh,
                              "fill", true, "bord", osd_fixoutline_body);
                 gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
+                gc_apply_clip(p, p->run_cov_b, bw, bh, r, clips, nclips);
                 osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
             }
             gc_blur(p, p->run_cov_f, bw, bh, r->blur_f);  // σ may be 0 (bordered fill)
+            gc_apply_clip(p, p->run_cov_f, bw, bh, r, clips, nclips);
             osd_copy(p, p->run_cov_f, entry->result_tex, r->fill_ax, r->fill_ay, bw, bh);
         } else if (r->nbord) {
             gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos);
             gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
+            gc_apply_clip(p, p->run_cov_b, bw, bh, r, clips, nclips);
             osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
         }
     }
