@@ -170,6 +170,8 @@ struct priv {
     pl_tex hdr_tex;                          // per-(glyph,Y-band) (offset,count) into edge_tex
     float *hbuf; int hbuf_cap;               // CPU header scratch (in vec4 units)
     int *bscratch; int bscratch_cap;         // per-glyph band counting-sort scratch
+    pl_tex work_tex;                         // batched raster: one 16x16 tile per workgroup
+    float *wbuf; int wbuf_cap;               // CPU work-list scratch (in vec4 units)
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -724,18 +726,28 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
 // Exact-area analytic coverage from a glyph's line segments, written into the
 // glyph atlas slot. Matches libass's CPU raster to <=9/255 (validated, edge-AA
 // only). Antiderivative of clamp(t,0,1) for the exact clamped-ramp integral.
-#define EDGE_TEX_W 8192   // edge_tex/hdr_tex width; element i is at (i%W, i/W). Wide so
-#define HDR_TEX_W  8192   // the height (count/W) stays well under max_tex_2d_dim at 8K.
+#define EDGE_TEX_W 8192   // edge_tex/hdr_tex/work_tex width; element i is at (i%W, i/W).
+#define HDR_TEX_W  8192   // Wide so the height (count/W) stays under max_tex_2d_dim at 8K.
+#define WORK_TEX_W 8192
 #define RASTER_BAND_H 8   // Y-band height (px): a pixel only tests edges crossing its band.
 static const char *const osd_raster_prelude =
     "float Hc(float t){ if (t<=0.0) return 0.0; if (t>=1.0) return t-0.5; return 0.5*t*t; }\n";
-// Y-band binned: each pixel reads only the edges crossing its band (winding
-// coverage needs every edge in the *row*, regardless of x -- so we bin by Y only).
+// One dispatch for ALL glyphs: one 16x16 workgroup per work-list tile (avoids the
+// per-glyph CPU dispatch overhead). Each tile carries its glyph's atlas origin,
+// local tile offset, bounds and Y-band header range. Y-band binned: a pixel reads
+// only edges crossing its band (winding coverage needs every edge in the *row*).
 static const char *const osd_raster_body =
-    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
-    "if (g.x >= rw || g.y >= rh) return;\n"
-    "float px = float(g.x), py = float(g.y);\n"
-    "int band = g.y / band_h; if (band >= nbands) band = nbands - 1;\n"
+    "int wi = int(gl_WorkGroupID.y) * gridx + int(gl_WorkGroupID.x);\n"
+    "if (wi >= ntiles) return;\n"
+    "int w0 = 2 * wi;\n"
+    "vec4 t0 = texelFetch(work, ivec2(w0 % ww, w0 / ww), 0);\n"
+    "vec4 t1 = texelFetch(work, ivec2((w0+1) % ww, (w0+1) / ww), 0);\n"
+    "int ax = int(t0.x), ay = int(t0.y), gx0 = int(t0.z), gy0 = int(t0.w);\n"
+    "int rw = int(t1.x), rh = int(t1.y), hbase = int(t1.z), nbands = int(t1.w);\n"
+    "int lpx = gx0 + int(gl_LocalInvocationID.x), lpy = gy0 + int(gl_LocalInvocationID.y);\n"
+    "if (lpx >= rw || lpy >= rh) return;\n"
+    "float px = float(lpx), py = float(lpy);\n"
+    "int band = lpy / band_h; if (band >= nbands) band = nbands - 1;\n"
     "int h = hbase + band;\n"
     "vec4 hd = texelFetch(hdrs, ivec2(h % hw, h / hw), 0);\n"
     "int off = int(hd.x), cnt = int(hd.y);\n"
@@ -756,14 +768,13 @@ static const char *const osd_raster_body =
     "    else area = L * (Hc(f1) - Hc(f0)) / (f1 - f0);\n"
     "    acc += dir * area;\n"
     "}\n"
-    "imageStore(dst, ivec2(ox + g.x, oy + g.y), vec4(clamp(abs(acc), 0.0, 1.0), 0.0, 0.0, 0.0));\n";
+    "imageStore(dst, ivec2(ax + lpx, ay + lpy), vec4(clamp(abs(acc), 0.0, 1.0), 0.0, 0.0, 0.0));\n";
 
-// Rasterize one glyph into the atlas at (ax,ay). Its nbands Y-band headers start
-// at hbase in hdr_tex; each header points at a run of edges in edge_tex.
-static void gc_raster_outline(struct priv *p, int hbase, int nbands,
-                              int ax, int ay, int rw, int rh)
+// Rasterize ALL collected glyphs in one dispatch: ntiles 16x16 work-list tiles.
+static void gc_raster_batch(struct priv *p, int ntiles)
 {
-    int ew = EDGE_TEX_W, hw = HDR_TEX_W, band_h = RASTER_BAND_H;
+    int ew = EDGE_TEX_W, hw = HDR_TEX_W, ww = WORK_TEX_W, band_h = RASTER_BAND_H;
+    int gridx = MPMIN(ntiles, 32768), gridy = (ntiles + gridx - 1) / gridx;
     pl_shader sh = pl_dispatch_begin(p->osd_dp);
     struct pl_shader_desc descs[] = {
         { .desc = { .name = "dst", .type = PL_DESC_STORAGE_IMG, .binding = 0,
@@ -772,23 +783,24 @@ static void gc_raster_outline(struct priv *p, int hbase, int nbands,
           .binding = { .object = p->edge_tex } },
         { .desc = { .name = "hdrs", .type = PL_DESC_SAMPLED_TEX, .binding = 2 },
           .binding = { .object = p->hdr_tex } },
+        { .desc = { .name = "work", .type = PL_DESC_SAMPLED_TEX, .binding = 3 },
+          .binding = { .object = p->work_tex } },
     };
     struct pl_shader_var vars[] = {
-        { .var = pl_var_int("rw"), .data = &rw }, { .var = pl_var_int("rh"), .data = &rh },
-        { .var = pl_var_int("ox"), .data = &ax }, { .var = pl_var_int("oy"), .data = &ay },
-        { .var = pl_var_int("hbase"), .data = &hbase }, { .var = pl_var_int("nbands"), .data = &nbands },
+        { .var = pl_var_int("ntiles"), .data = &ntiles }, { .var = pl_var_int("gridx"), .data = &gridx },
         { .var = pl_var_int("band_h"), .data = &band_h },
         { .var = pl_var_int("ew"), .data = &ew }, { .var = pl_var_int("hw"), .data = &hw },
+        { .var = pl_var_int("ww"), .data = &ww },
     };
     struct pl_custom_shader cs = {
         .compute = true, .compute_group_size = { 16, 16 },
-        .descriptors = descs, .num_descriptors = 3,
-        .variables = vars, .num_variables = 9,
+        .descriptors = descs, .num_descriptors = 4,
+        .variables = vars, .num_variables = 6,
         .prelude = osd_raster_prelude, .body = osd_raster_body,
     };
     if (pl_shader_custom(sh, &cs))
         pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
-            .shader = &sh, .dispatch_size = { (rw + 15) / 16, (rh + 15) / 16, 1 }));
+            .shader = &sh, .dispatch_size = { gridx, gridy, 1 }));
     else
         pl_dispatch_abort(p->osd_dp, &sh);
 }
@@ -912,19 +924,42 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         if ((size_t) p->hbuf_cap < hneed) {
             p->hbuf_cap = hneed; p->hbuf = talloc_realloc(p, p->hbuf, float, p->hbuf_cap);
         }
+        // Build the tile work-list (one 16x16 tile per workgroup) for all glyphs.
+        int ntiles = 0;
+        for (int j = 0; j < nrjobs; j++) {
+            struct rjob *r = &rjobs[j];
+            ntiles += ((r->w + 15) / 16) * ((r->h + 15) / 16);
+        }
+        int wh = (2 * ntiles + WORK_TEX_W - 1) / WORK_TEX_W;     // 2 texels per tile
+        size_t wneed = (size_t) WORK_TEX_W * wh * 4;
+        if ((size_t) p->wbuf_cap < wneed) {
+            p->wbuf_cap = wneed; p->wbuf = talloc_realloc(p, p->wbuf, float, p->wbuf_cap);
+        }
+        int ti = 0;
+        for (int j = 0; j < nrjobs; j++) {
+            struct rjob *r = &rjobs[j];
+            int txs = (r->w + 15) / 16, tys = (r->h + 15) / 16;
+            for (int ty = 0; ty < tys; ty++) for (int tx = 0; tx < txs; tx++) {
+                float *w0 = &p->wbuf[(2 * ti) * 4];
+                w0[0] = r->ax; w0[1] = r->ay; w0[2] = tx * 16; w0[3] = ty * 16;
+                w0[4] = r->w;  w0[5] = r->h;  w0[6] = r->hbase; w0[7] = r->nbands;
+                ti++;
+            }
+        }
         pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
         if (ef && gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true, false, false, true) &&
-                  gc_ensure(gpu, &p->hdr_tex, ef, HDR_TEX_W, hh, false, true, false, false, true)) {
+                  gc_ensure(gpu, &p->hdr_tex, ef, HDR_TEX_W, hh, false, true, false, false, true) &&
+                  gc_ensure(gpu, &p->work_tex, ef, WORK_TEX_W, wh, false, true, false, false, true)) {
             pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
                 .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
                 .row_pitch = (size_t) EDGE_TEX_W * 4 * sizeof(float), .ptr = p->ebuf));
             pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->hdr_tex,
                 .rc = { .x1 = HDR_TEX_W, .y1 = hh },
                 .row_pitch = (size_t) HDR_TEX_W * 4 * sizeof(float), .ptr = p->hbuf));
-            for (int j = 0; j < nrjobs; j++) {
-                struct rjob *r = &rjobs[j];
-                gc_raster_outline(p, r->hbase, r->nbands, r->ax, r->ay, r->w, r->h);
-            }
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->work_tex,
+                .rc = { .x1 = WORK_TEX_W, .y1 = wh },
+                .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = p->wbuf));
+            gc_raster_batch(p, ntiles);
         }
     }
 
@@ -3110,6 +3145,7 @@ static void uninit(struct vo *vo)
     pl_tex_destroy(p->gpu, &p->glyph_atlas);
     pl_tex_destroy(p->gpu, &p->edge_tex);
     pl_tex_destroy(p->gpu, &p->hdr_tex);
+    pl_tex_destroy(p->gpu, &p->work_tex);
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
