@@ -172,6 +172,10 @@ struct priv {
     int *bscratch; int bscratch_cap;         // per-glyph band counting-sort scratch
     pl_tex work_tex;                         // batched raster: one 16x16 tile per workgroup
     float *wbuf; int wbuf_cap;               // CPU work-list scratch (in vec4 units)
+    pl_tex result_acc;                       // r32f atlas-wide combine accumulator
+    pl_tex result_tmp;                       // r8 atlas-wide blur intermediate
+    pl_tex blurwork_tex;                     // batched blur: one 16x16 tile per workgroup
+    float *bwbuf; int bwbuf_cap;             // CPU blur work-list scratch (vec4 units)
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -723,6 +727,104 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
     osd_blur_part(p, p->run_tmp, cov, 0, 0, bw, bh, sigma, osd_blur_body_v);
 }
 
+#define BLURWORK_W 8192
+// Batched separable blur: one 16x16 workgroup per slot-tile. Each tile carries
+// its result-atlas slot position, bounds and sigma -- so all regions blur in
+// just two dispatches (h, v) instead of two per region.
+static const char *const osd_blur_batch_pre =
+    "int _wi; vec4 _t0,_t1; int _ax,_ay,_bw,_bh,_px,_py; float _sg;\n"
+    "bool _bload() {\n"
+    "  _wi = int(gl_WorkGroupID.y)*gridx + int(gl_WorkGroupID.x);\n"
+    "  if (_wi >= ntiles) return false;\n"
+    "  int w0 = 2*_wi;\n"
+    "  _t0 = texelFetch(work, ivec2(w0%ww, w0/ww), 0);\n"
+    "  _t1 = texelFetch(work, ivec2((w0+1)%ww, (w0+1)/ww), 0);\n"
+    "  _ax=int(_t0.x); _ay=int(_t0.y); _bw=int(_t1.x); _bh=int(_t1.y); _sg=_t1.z;\n"
+    "  int lx=int(_t0.z)+int(gl_LocalInvocationID.x), ly=int(_t0.w)+int(gl_LocalInvocationID.y);\n"
+    "  if (lx>=_bw || ly>=_bh) return false;\n"
+    "  _px=_ax+lx; _py=_ay+ly; return true;\n"
+    "}\n"
+    "void _taps(out int s, out int n){ int r=int(3.0*_sg+0.999); s=(r+7)/8; if(s<1)s=1; n=(r+s-1)/s; }\n";
+static const char *const osd_blur_batch_h =
+    "if (_bload()) {\n"
+    "  int st,nt; _taps(st,nt); float a=0.0,ws=0.0;\n"
+    "  for (int t=-nt;t<=nt;t++){ int d=t*st, q=_px+d;\n"
+    "    if (q>=_ax && q<_ax+_bw){ float w=_sg>0.0?exp(-0.5*float(d*d)/(_sg*_sg)):float(d==0);\n"
+    "      a+=w*texelFetch(src,ivec2(q,_py),0).r; ws+=w; } }\n"
+    "  imageStore(dst, ivec2(_px,_py), vec4(a/ws,0.0,0.0,0.0));\n"
+    "}\n";
+static const char *const osd_blur_batch_v =
+    "if (_bload()) {\n"
+    "  int st,nt; _taps(st,nt); float a=0.0,ws=0.0;\n"
+    "  for (int t=-nt;t<=nt;t++){ int d=t*st, q=_py+d;\n"
+    "    if (q>=_ay && q<_ay+_bh){ float w=_sg>0.0?exp(-0.5*float(d*d)/(_sg*_sg)):float(d==0);\n"
+    "      a+=w*texelFetch(src,ivec2(_px,q),0).r; ws+=w; } }\n"
+    "  imageStore(dst, ivec2(_px,_py), vec4(a/ws,0.0,0.0,0.0));\n"
+    "}\n";
+static void gc_blur_batch(struct priv *p, pl_tex src, pl_tex dst, int ntiles,
+                          const char *body)
+{
+    int ww = BLURWORK_W, gridx = MPMIN(ntiles, 32768), gridy = (ntiles+gridx-1)/gridx;
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 }, .binding={.object=src} },
+        { .desc = { .name="dst", .type=PL_DESC_STORAGE_IMG, .binding=1,
+                    .access=PL_DESC_ACCESS_WRITEONLY }, .binding={.object=dst} },
+        { .desc = { .name="work", .type=PL_DESC_SAMPLED_TEX, .binding=2 },
+          .binding={.object=p->blurwork_tex} },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("ntiles"), .data=&ntiles }, { .var = pl_var_int("gridx"), .data=&gridx },
+        { .var = pl_var_int("ww"), .data=&ww },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 3,
+        .variables = vars, .num_variables = 3,
+        .prelude = osd_blur_batch_pre, .body = body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { gridx, gridy, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
+// fix_outline between two slots of the same result atlas (border -= fill/2).
+static const char *const osd_fixoutline_slot_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh) {\n"
+    "    ivec2 bp = ivec2(box+g.x, boy+g.y), fp = ivec2(fox+g.x, foy+g.y);\n"
+    "    float bb = floor(imageLoad(res, bp).r*255.0+0.5);\n"
+    "    float ff = floor(imageLoad(res, fp).r*255.0+0.5);\n"
+    "    float o = bb > ff ? bb - floor(ff*0.5) : 0.0;\n"
+    "    imageStore(res, bp, vec4(o/255.0, 0.0, 0.0, 0.0));\n"
+    "}\n";
+static void gc_fixoutline_slot(struct priv *p, pl_tex res, int box, int boy,
+                               int fox, int foy, int rw, int rh)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="res", .type=PL_DESC_STORAGE_IMG, .binding=0,
+                    .access=PL_DESC_ACCESS_READWRITE }, .binding={.object=res} },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("box"), .data=&box }, { .var = pl_var_int("boy"), .data=&boy },
+        { .var = pl_var_int("fox"), .data=&fox }, { .var = pl_var_int("foy"), .data=&foy },
+        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 1,
+        .variables = vars, .num_variables = 6, .body = osd_fixoutline_slot_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
 // A vector-\clip mask, rasterized into the glyph atlas (like a glyph) at (ax,ay)
 // and corresponding to screen origin (sx,sy); multiply a run's coverage by it.
 struct clipmask { uint32_t id; int ax, ay, sx, sy, w, h, inv; };
@@ -735,11 +837,13 @@ static const char *const osd_clipmult_body =
     "if (mlx >= 0 && mlx < cw && mly >= 0 && mly < ch)\n"
     "    m = texelFetch(mask, ivec2(cax + mlx, cay + mly), 0).r;\n"
     "float f = inv != 0 ? (1.0 - m) : m;\n"
-    "float c = imageLoad(cov, g).r;\n"
-    "imageStore(cov, g, vec4(c * f, 0.0, 0.0, 0.0));\n";
+    "ivec2 sp = ivec2(sox + g.x, soy + g.y);\n"
+    "float c = imageLoad(cov, sp).r;\n"
+    "imageStore(cov, sp, vec4(c * f, 0.0, 0.0, 0.0));\n";
 
-// Multiply cov (run-local, screen origin (ox,oy)) in place by the clip mask.
-static void gc_clip_mult(struct priv *p, pl_tex cov, int bw, int bh, int ox, int oy,
+// Multiply cov (at slot (sox,soy), screen origin (ox,oy)) by the clip mask.
+static void gc_clip_mult(struct priv *p, pl_tex cov, int bw, int bh,
+                         int sox, int soy, int ox, int oy,
                          const struct clipmask *cm)
 {
     int cax = cm->ax, cay = cm->ay, csx = cm->sx, csy = cm->sy,
@@ -753,6 +857,7 @@ static void gc_clip_mult(struct priv *p, pl_tex cov, int bw, int bh, int ox, int
     };
     struct pl_shader_var vars[] = {
         { .var = pl_var_int("bw"), .data = &bw }, { .var = pl_var_int("bh"), .data = &bh },
+        { .var = pl_var_int("sox"), .data = &sox }, { .var = pl_var_int("soy"), .data = &soy },
         { .var = pl_var_int("ox"), .data = &ox }, { .var = pl_var_int("oy"), .data = &oy },
         { .var = pl_var_int("cax"), .data = &cax }, { .var = pl_var_int("cay"), .data = &cay },
         { .var = pl_var_int("csx"), .data = &csx }, { .var = pl_var_int("csy"), .data = &csy },
@@ -762,7 +867,7 @@ static void gc_clip_mult(struct priv *p, pl_tex cov, int bw, int bh, int ox, int
     struct pl_custom_shader cs = {
         .compute = true, .compute_group_size = { 16, 16 },
         .descriptors = descs, .num_descriptors = 2,
-        .variables = vars, .num_variables = 11, .body = osd_clipmult_body,
+        .variables = vars, .num_variables = 13, .body = osd_clipmult_body,
     };
     if (pl_shader_custom(sh, &cs))
         pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
@@ -771,14 +876,15 @@ static void gc_clip_mult(struct priv *p, pl_tex cov, int bw, int bh, int ox, int
         pl_dispatch_abort(p->osd_dp, &sh);
 }
 
-static void gc_apply_clip(struct priv *p, pl_tex cov, int bw, int bh,
+static void gc_apply_clip(struct priv *p, pl_tex cov, int bw, int bh, int sox, int soy,
                           struct gc_region *r, struct clipmask *clips, int nclips)
 {
     if (!r->clip_id)
         return;
     for (int c = 0; c < nclips; c++)
         if (clips[c].id == r->clip_id) {
-            gc_clip_mult(p, cov, bw, bh, r->x0 - r->margin, r->y0 - r->margin, &clips[c]);
+            gc_clip_mult(p, cov, bw, bh, sox, soy,
+                         r->x0 - r->margin, r->y0 - r->margin, &clips[c]);
             return;
         }
 }
@@ -1150,39 +1256,87 @@ gc_restart:
     int atlas_w = MPMAX(max_w, 1), atlas_h = MPMAX(shelf_y + shelf_h, 1);
 
     if (!gc_ensure(gpu, &entry->result_tex, r8, atlas_w, atlas_h, true, true, false, false, false) ||
-        !gc_ensure(gpu, &p->run_acc, p->osd_acc_fmt, run_acc_w, run_acc_h, true, false, false, false, false) ||
-        !gc_ensure(gpu, &p->run_tmp, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
-        !gc_ensure(gpu, &p->run_cov_f, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
-        !gc_ensure(gpu, &p->run_cov_b, r8, run_acc_w, run_acc_h, true, true, false, false, false)) {
+        !gc_ensure(gpu, &p->result_acc, p->osd_acc_fmt, atlas_w, atlas_h, true, false, false, false, false) ||
+        !gc_ensure(gpu, &p->result_tmp, r8, atlas_w, atlas_h, true, true, false, false, false)) {
         talloc_free(tmp);
         return;
     }
 
+    // Batched back-half: instead of ~6 GPU dispatches PER region (which is
+    // thousands on dense frames), combine every region's glyphs into its result
+    // slot, then resolve / fix_outline / blur / clip in a handful of batched
+    // dispatches over a slot-tile work-list.
+    #define REG_BWBH struct gc_region *r = &regs[i]; \
+        int bw = r->x1 - r->x0 + 2*r->margin, bh = r->y1 - r->y0 + 2*r->margin
+    // 1. clear accumulator + combine all glyphs into their slots.
+    osd_clear(p, p->result_acc, atlas_w, atlas_h);
     for (int i = 0; i < nregs; i++) {
-        struct gc_region *r = &regs[i];
-        int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
-        if (r->nfill) {
-            gc_build_cov(p, item, r, r->fill, r->nfill, p->run_cov_f, bw, bh, cpos);
-            if (r->nbord) {
-                gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos);
-                // fix_outline on the unblurred coverage (libass order), then blur.
-                if (r->run_flags & 1)   // bit 0 = apply fix_outline (see libass)
-                    osd_unop(p, p->run_cov_f, p->run_cov_b, bw, bh,
-                             "fill", true, "bord", osd_fixoutline_body);
-                gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
-                gc_apply_clip(p, p->run_cov_b, bw, bh, r, clips, nclips);
-                osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
-            }
-            gc_blur(p, p->run_cov_f, bw, bh, r->blur_f);  // σ may be 0 (bordered fill)
-            gc_apply_clip(p, p->run_cov_f, bw, bh, r, clips, nclips);
-            osd_copy(p, p->run_cov_f, entry->result_tex, r->fill_ax, r->fill_ay, bw, bh);
-        } else if (r->nbord) {
-            gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos);
-            gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
-            gc_apply_clip(p, p->run_cov_b, bw, bh, r, clips, nclips);
-            osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
+        REG_BWBH; (void)bw; (void)bh;
+        for (int k = 0; k < r->nfill; k++) {
+            const struct sub_bitmap *b = &item->parts[r->fill[k]];
+            osd_combine_part(p, p->glyph_atlas, p->result_acc, cpos[r->fill[k]].ax,
+                cpos[r->fill[k]].ay, r->fill_ax + b->x - r->x0 + r->margin,
+                r->fill_ay + b->y - r->y0 + r->margin, b->w, b->h);
+        }
+        for (int k = 0; k < r->nbord; k++) {
+            const struct sub_bitmap *b = &item->parts[r->bord[k]];
+            osd_combine_part(p, p->glyph_atlas, p->result_acc, cpos[r->bord[k]].ax,
+                cpos[r->bord[k]].ay, r->bord_ax + b->x - r->x0 + r->margin,
+                r->bord_ay + b->y - r->y0 + r->margin, b->w, b->h);
         }
     }
+    // 2. resolve the whole accumulator to r8 coverage in one dispatch.
+    osd_unop(p, p->result_acc, entry->result_tex, atlas_w, atlas_h,
+             "acc", false, "dst", osd_resolve_body);
+    // 3. fix_outline per bordered region (few), on the result slots.
+    for (int i = 0; i < nregs; i++) {
+        REG_BWBH;
+        if (r->nfill && r->nbord && (r->run_flags & 1))
+            gc_fixoutline_slot(p, entry->result_tex, r->bord_ax, r->bord_ay,
+                               r->fill_ax, r->fill_ay, bw, bh);
+    }
+    // 4. batched separable blur: one slot-tile work-list, two dispatches.
+    int ntiles = 0;
+    for (int i = 0; i < nregs; i++) {
+        REG_BWBH; int tx = (bw+15)/16, ty = (bh+15)/16;
+        if (r->nfill) ntiles += tx*ty;
+        if (r->nbord) ntiles += tx*ty;
+    }
+    if (ntiles) {
+        int bwh = (2*ntiles + BLURWORK_W - 1) / BLURWORK_W;
+        size_t need = (size_t) BLURWORK_W * bwh * 4;
+        if ((size_t) p->bwbuf_cap < need) {
+            p->bwbuf_cap = need; p->bwbuf = talloc_realloc(p, p->bwbuf, float, p->bwbuf_cap);
+        }
+        int ti = 0;
+        #define ADD_SLOT(AX, AY, SG) do { int tx=(bw+15)/16, ty=(bh+15)/16; \
+            for (int yy=0; yy<ty; yy++) for (int xx=0; xx<tx; xx++) { \
+                float *w0 = &p->bwbuf[(2*ti)*4]; \
+                w0[0]=(AX); w0[1]=(AY); w0[2]=xx*16; w0[3]=yy*16; \
+                w0[4]=bw; w0[5]=bh; w0[6]=(SG); w0[7]=0; ti++; } } while (0)
+        for (int i = 0; i < nregs; i++) {
+            REG_BWBH;
+            if (r->nfill) ADD_SLOT(r->fill_ax, r->fill_ay, r->blur_f);
+            if (r->nbord) ADD_SLOT(r->bord_ax, r->bord_ay, r->blur_b);
+        }
+        #undef ADD_SLOT
+        pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
+        if (ef && gc_ensure(gpu, &p->blurwork_tex, ef, BLURWORK_W, bwh, false, true, false, false, true)) {
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->blurwork_tex,
+                .rc = { .x1 = BLURWORK_W, .y1 = bwh },
+                .row_pitch = (size_t) BLURWORK_W * 4 * sizeof(float), .ptr = p->bwbuf));
+            gc_blur_batch(p, entry->result_tex, p->result_tmp, ntiles, osd_blur_batch_h);
+            gc_blur_batch(p, p->result_tmp, entry->result_tex, ntiles, osd_blur_batch_v);
+        }
+    }
+    // 5. vector clip per clipped region, on the result slots (after blur).
+    for (int i = 0; i < nregs; i++) {
+        REG_BWBH;
+        if (!r->clip_id) continue;
+        if (r->nbord) gc_apply_clip(p, entry->result_tex, bw, bh, r->bord_ax, r->bord_ay, r, clips, nclips);
+        if (r->nfill) gc_apply_clip(p, entry->result_tex, bw, bh, r->fill_ax, r->fill_ay, r, clips, nclips);
+    }
+    #undef REG_BWBH
 
     // Emit one monochrome overlay; parts in z-order: border (1) then fill (0)
     // across all runs (deferred runs never carry a shadow).
