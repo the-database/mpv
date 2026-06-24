@@ -75,6 +75,10 @@ struct sub_bitmap {
             // (its outline rasterizes to a mask; bit 2 = inverse \iclip). A
             // clipped part carries clip_id == the mask part's run_id (0 = none).
             uint32_t clip_id;
+            // Outline-mode rectangular \clip: the visible rectangle in storage
+            // px (same space as the part's dst). The consumer intersects the
+            // run's drawn area with it; equals the full frame when unclipped.
+            int32_t clip_rx0, clip_ry0, clip_rx1, clip_ry1;
         } libass;
         struct {
             const struct sbr_output_image *image;

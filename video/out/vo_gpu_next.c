@@ -702,6 +702,7 @@ struct gc_region {
     int fill_ax, fill_ay, bord_ax, bord_ay;  // result-atlas positions
     uint8_t single_layer;        // 0xff for a run; else the singleton's layer
     uint32_t clip_id;            // vector \clip mask to multiply by (0 = none)
+    int rcx0, rcy0, rcx1, rcy1;  // rectangular \clip; visible screen rect
 };
 
 // Combine a region's glyph list (saturating add) into run_acc at run-local
@@ -1215,7 +1216,9 @@ gc_restart:
             regs[ri] = (struct gc_region){ .x0 = b->x, .y0 = b->y,
                 .x1 = b->x + b->dw, .y1 = b->y + b->dh,
                 .run_flags = b->libass.run_flags, .single_layer = 0xff,
-                .clip_id = b->libass.clip_id };
+                .clip_id = b->libass.clip_id,
+                .rcx0 = b->libass.clip_rx0, .rcy0 = b->libass.clip_ry0,
+                .rcx1 = b->libass.clip_rx1, .rcy1 = b->libass.clip_ry1 };
         }
         r = &regs[ri];
         r->x0 = MPMIN(r->x0, b->x); r->y0 = MPMIN(r->y0, b->y);
@@ -1349,10 +1352,18 @@ gc_restart:
             if (pass == 1 && r->nbord) { ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
             else if (pass == 0 && r->nfill) { ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
             else continue;
+            // Rectangular \clip: intersect the screen dst with the clip rect and
+            // shift src to match (no shader -- a plain rect crop on the overlay).
+            int dx0 = r->x0 - r->margin, dy0 = r->y0 - r->margin;
+            int dx1 = r->x1 + r->margin, dy1 = r->y1 + r->margin;
+            int cx0 = MPMAX(dx0, r->rcx0), cy0 = MPMAX(dy0, r->rcy0);
+            int cx1 = MPMIN(dx1, r->rcx1), cy1 = MPMIN(dy1, r->rcy1);
+            if (cx0 >= cx1 || cy0 >= cy1)
+                continue;   // fully clipped away
             struct pl_overlay_part part = {
-                .src = { ax, ay, ax + bw, ay + bh },
-                .dst = { r->x0 - r->margin, r->y0 - r->margin,
-                         r->x1 + r->margin, r->y1 + r->margin },
+                .src = { ax + (cx0 - dx0), ay + (cy0 - dy0),
+                         ax + (cx1 - dx0), ay + (cy1 - dy0) },
+                .dst = { cx0, cy0, cx1, cy1 },
                 .color = { (c >> 24) / 255.0f, ((c >> 16) & 0xFF) / 255.0f,
                            ((c >> 8) & 0xFF) / 255.0f, (255 - (c & 0xFF)) / 255.0f },
             };
