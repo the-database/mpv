@@ -165,6 +165,8 @@ struct priv {
     pl_buf glyph_stage[3];                   // async upload staging ring (no VO stall)
     unsigned glyph_stage_idx;
     uint8_t *gstage_cpu; size_t gstage_cpu_sz; // tight-repack scratch for misses
+    pl_tex edge_tex;                         // outline mode: rgba32f edge list (x0,y0,x1,y1)
+    float *ebuf; int ebuf_cap;               // CPU edge scratch (in vec4 units)
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -712,7 +714,7 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
 // Exact-area analytic coverage from a glyph's line segments, written into the
 // glyph atlas slot. Matches libass's CPU raster to <=9/255 (validated, edge-AA
 // only). Antiderivative of clamp(t,0,1) for the exact clamped-ramp integral.
-#define MAX_RASTER_EDGES 2048
+#define EDGE_TEX_W 1024   // edge_tex width; edge i is at (i%W, i/W)
 static const char *const osd_raster_prelude =
     "float Hc(float t){ if (t<=0.0) return 0.0; if (t>=1.0) return t-0.5; return 0.5*t*t; }\n";
 static const char *const osd_raster_body =
@@ -721,13 +723,14 @@ static const char *const osd_raster_body =
     "float px = float(g.x), py = float(g.y);\n"
     "float acc = 0.0;\n"
     "for (int i = 0; i < nedges; i++) {\n"
-    "    vec4 e = edges[i];\n"
-    "    float ya = e.y, yb = e.w;\n"
+    "    int e = ebase + i;\n"
+    "    vec4 ed = texelFetch(edges, ivec2(e % ew, e / ew), 0);\n"
+    "    float ya = ed.y, yb = ed.w;\n"
     "    if (ya == yb) continue;\n"
     "    float dir = yb > ya ? 1.0 : -1.0;\n"
     "    float y0 = max(py, min(ya, yb)), y1 = min(py + 1.0, max(ya, yb));\n"
     "    if (y1 <= y0) continue;\n"
-    "    float xa = e.x, xb = e.z, inv = 1.0 / (yb - ya);\n"
+    "    float xa = ed.x, xb = ed.z, inv = 1.0 / (yb - ya);\n"
     "    float X0 = xa + (xb - xa) * (y0 - ya) * inv;\n"
     "    float X1 = xa + (xb - xa) * (y1 - ya) * inv;\n"
     "    float f0 = px + 1.0 - X0, f1 = px + 1.0 - X1, L = y1 - y0, area;\n"
@@ -737,31 +740,29 @@ static const char *const osd_raster_body =
     "}\n"
     "imageStore(dst, ivec2(ox + g.x, oy + g.y), vec4(clamp(abs(acc), 0.0, 1.0), 0.0, 0.0, 0.0));\n";
 
-// Rasterize one glyph's segments (4*int32 each, 1/64px relative to glyph origin)
-// into the glyph atlas at (ax,ay), covering rw x rh.
-static void gc_raster_outline(struct priv *p, const int32_t *segs, int n,
+// Rasterize one glyph (nedges edges starting at ebase in edge_tex) into the
+// glyph atlas at (ax,ay), covering rw x rh.
+static void gc_raster_outline(struct priv *p, int ebase, int nedges,
                               int ax, int ay, int rw, int rh)
 {
-    static float edges[MAX_RASTER_EDGES * 4];
-    if (n > MAX_RASTER_EDGES) n = MAX_RASTER_EDGES;   // truncate huge glyphs (rare)
-    for (int i = 0; i < n * 4; i++)
-        edges[i] = segs[i] / 64.0f;                   // 1/64px -> pixel coords
+    int ew = EDGE_TEX_W;
     pl_shader sh = pl_dispatch_begin(p->osd_dp);
     struct pl_shader_desc descs[] = {
         { .desc = { .name = "dst", .type = PL_DESC_STORAGE_IMG, .binding = 0,
                     .access = PL_DESC_ACCESS_WRITEONLY }, .binding = { .object = p->glyph_atlas } },
+        { .desc = { .name = "edges", .type = PL_DESC_SAMPLED_TEX, .binding = 1 },
+          .binding = { .object = p->edge_tex } },
     };
     struct pl_shader_var vars[] = {
         { .var = pl_var_int("rw"), .data = &rw }, { .var = pl_var_int("rh"), .data = &rh },
         { .var = pl_var_int("ox"), .data = &ax }, { .var = pl_var_int("oy"), .data = &ay },
-        { .var = pl_var_int("nedges"), .data = &n },
-        { .var = { .name = "edges", .type = PL_VAR_FLOAT, .dim_v = 4, .dim_m = 1,
-                   .dim_a = MAX_RASTER_EDGES }, .data = edges },
+        { .var = pl_var_int("nedges"), .data = &nedges },
+        { .var = pl_var_int("ebase"), .data = &ebase }, { .var = pl_var_int("ew"), .data = &ew },
     };
     struct pl_custom_shader cs = {
         .compute = true, .compute_group_size = { 16, 16 },
-        .descriptors = descs, .num_descriptors = 1,
-        .variables = vars, .num_variables = 6,
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 7,
         .prelude = osd_raster_prelude, .body = osd_raster_body,
     };
     if (pl_shader_custom(sh, &cs))
@@ -810,6 +811,8 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     struct gmiss *miss = NULL;
     int nmiss = 0;
     size_t miss_bytes = 0;
+    struct rjob { int ax, ay, w, h, base, n; } *rjobs = NULL;  // outline raster jobs
+    int nrjobs = 0, ne = 0;                                    // ne = edges collected (vec4)
     ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
@@ -820,15 +823,44 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up))
             continue;
         if (up && is_outline) {
-            // Rasterize the glyph's outline directly into its atlas slot.
-            gc_raster_outline(p, b->libass.outline, b->libass.n_outline,
-                              cpos[i].ax, cpos[i].ay, b->w, b->h);
+            // Collect this glyph's edges into the shared edge buffer + a job.
+            int nseg = b->libass.n_outline, base = ne;
+            if (p->ebuf_cap < (ne + nseg) * 4) {
+                p->ebuf_cap = MPMAX((ne + nseg) * 4 * 2, 4096);
+                p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+            }
+            for (int k = 0; k < nseg * 4; k++)
+                p->ebuf[ne * 4 + k] = b->libass.outline[k] / 64.0f;
+            ne += nseg;
+            MP_TARRAY_APPEND(tmp, rjobs, nrjobs,
+                ((struct rjob){ cpos[i].ax, cpos[i].ay, b->w, b->h, base, nseg }));
         } else if (up) {
             const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
                                 + (ptrdiff_t) b->src_y * pstride + b->src_x;
             MP_TARRAY_APPEND(tmp, miss, nmiss,
                 ((struct gmiss){ cpos[i].ax, cpos[i].ay, b->w, b->h, gsrc }));
             miss_bytes += (size_t) b->w * b->h;
+        }
+    }
+
+    // Upload all collected edges once, then rasterize each glyph from the texture.
+    if (ne) {
+        int eh = (ne + EDGE_TEX_W - 1) / EDGE_TEX_W;
+        size_t need = (size_t) EDGE_TEX_W * eh * 4;
+        if ((size_t) p->ebuf_cap < need) {
+            p->ebuf_cap = need;
+            p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+        }
+        pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
+        if (ef && gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh,
+                            false, true, false, false, true)) {
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
+                .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
+                .row_pitch = (size_t) EDGE_TEX_W * 4 * sizeof(float), .ptr = p->ebuf));
+            for (int j = 0; j < nrjobs; j++) {
+                struct rjob *r = &rjobs[j];
+                gc_raster_outline(p, r->base, r->n, r->ax, r->ay, r->w, r->h);
+            }
         }
     }
 
@@ -3010,6 +3042,7 @@ static void uninit(struct vo *vo)
     pl_tex_destroy(p->gpu, &p->run_cov_f);
     pl_tex_destroy(p->gpu, &p->run_cov_b);
     pl_tex_destroy(p->gpu, &p->glyph_atlas);
+    pl_tex_destroy(p->gpu, &p->edge_tex);
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
