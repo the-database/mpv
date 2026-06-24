@@ -320,6 +320,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->libass.layer = img->type;   // 0=character/fill, 1=outline, 2=shadow
             b->libass.outline = NULL;
             b->libass.n_outline = 0;
+            b->libass.clip_id = img->clip_id;
             if (format == SUBBITMAP_LIBASS_OUTLINES && img->n_outline > 0) {
                 // Own a copy: the libass segment data is only valid for this frame.
                 b->libass.outline = ta_memdup(p->seg_ctx, (void *) img->outline,

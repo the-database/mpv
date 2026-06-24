@@ -71,6 +71,10 @@ struct sub_bitmap {
             // relative to x,y), to rasterize on the GPU. bitmap is NULL.
             const int32_t *outline;
             int32_t n_outline;
+            // Outline-mode vector \clip: run_flags bit 1 marks a clip-mask part
+            // (its outline rasterizes to a mask; bit 2 = inverse \iclip). A
+            // clipped part carries clip_id == the mask part's run_id (0 = none).
+            uint32_t clip_id;
         } libass;
         struct {
             const struct sbr_output_image *image;
