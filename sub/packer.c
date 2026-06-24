@@ -326,6 +326,8 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
                                               (size_t) img->n_outline * 4 * sizeof(int32_t));
                 b->libass.n_outline = img->n_outline;
                 b->bitmap = NULL;
+                b->stride = 0;
+                b->src_x = b->src_y = 0;   // unused in outline mode; don't leave stale
             }
             b->dw = b->w = img->w;
             b->dh = b->h = img->h;
