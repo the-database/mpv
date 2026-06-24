@@ -464,7 +464,7 @@ static const char *const osd_resolve_body =
     "    imageStore(dst, g, vec4(min(imageLoad(acc, g).r, 1.0), 0.0, 0.0, 0.0));\n";
 // fix_outline: border = border>fill ? border - fill/2 : 0, in 0..255 integers
 // (matching ass_fix_outline's integer floor division), in place on B.
-static const char *const osd_fixoutline_body =
+static const char *const osd_fixoutline_body MP_UNUSED =
     "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
     "if (g.x < rw && g.y < rh) {\n"
     "    float bb = floor(imageLoad(bord, g).r * 255.0 + 0.5);\n"
@@ -539,7 +539,7 @@ static const char *const osd_copy_body =
     "if (g.x < rw && g.y < rh)\n"
     "    imageStore(dst, ivec2(dx+g.x, dy+g.y), vec4(texelFetch(src, g, 0).r,0.0,0.0,0.0));\n";
 
-static void osd_copy(struct priv *p, pl_tex src, pl_tex dst, int dx, int dy,
+static void MP_UNUSED osd_copy(struct priv *p, pl_tex src, pl_tex dst, int dx, int dy,
                      int rw, int rh)
 {
     pl_shader sh = pl_dispatch_begin(p->osd_dp);
@@ -707,7 +707,7 @@ struct gc_region {
 // Combine a region's glyph list (saturating add) into run_acc at run-local
 // coords and resolve to cov. (Blur happens later -- after fix_outline -- to
 // match libass's combine -> expand -> fix_outline -> blur order.)
-static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
+static void MP_UNUSED gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
                          struct gc_region *r, int *parts, int n,
                          pl_tex cov, int bw, int bh, struct gpos *cpos)
 {
@@ -721,7 +721,7 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
     osd_unop(p, p->run_acc, cov, bw, bh, "acc", false, "dst", osd_resolve_body);
 }
 
-static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
+static void MP_UNUSED gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
 {
     osd_blur_part(p, cov, p->run_tmp, 0, 0, bw, bh, sigma, osd_blur_body_h);
     osd_blur_part(p, p->run_tmp, cov, 0, 0, bw, bh, sigma, osd_blur_body_v);
@@ -3388,6 +3388,9 @@ static void uninit(struct vo *vo)
     pl_tex_destroy(p->gpu, &p->edge_tex);
     pl_tex_destroy(p->gpu, &p->hdr_tex);
     pl_tex_destroy(p->gpu, &p->work_tex);
+    pl_tex_destroy(p->gpu, &p->result_acc);
+    pl_tex_destroy(p->gpu, &p->result_tmp);
+    pl_tex_destroy(p->gpu, &p->blurwork_tex);
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
