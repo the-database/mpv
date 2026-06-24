@@ -167,6 +167,9 @@ struct priv {
     uint8_t *gstage_cpu; size_t gstage_cpu_sz; // tight-repack scratch for misses
     pl_tex edge_tex;                         // outline mode: rgba32f edge list (x0,y0,x1,y1)
     float *ebuf; int ebuf_cap;               // CPU edge scratch (in vec4 units)
+    pl_tex hdr_tex;                          // per-(glyph,Y-band) (offset,count) into edge_tex
+    float *hbuf; int hbuf_cap;               // CPU header scratch (in vec4 units)
+    int *bscratch; int bscratch_cap;         // per-glyph band counting-sort scratch
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -721,17 +724,24 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
 // Exact-area analytic coverage from a glyph's line segments, written into the
 // glyph atlas slot. Matches libass's CPU raster to <=9/255 (validated, edge-AA
 // only). Antiderivative of clamp(t,0,1) for the exact clamped-ramp integral.
-#define EDGE_TEX_W 8192   // edge_tex width; edge i is at (i%W, i/W). Wide so the
-                          // height (n_edges/W) stays well under max_tex_2d_dim at 8K.
+#define EDGE_TEX_W 8192   // edge_tex/hdr_tex width; element i is at (i%W, i/W). Wide so
+#define HDR_TEX_W  8192   // the height (count/W) stays well under max_tex_2d_dim at 8K.
+#define RASTER_BAND_H 8   // Y-band height (px): a pixel only tests edges crossing its band.
 static const char *const osd_raster_prelude =
     "float Hc(float t){ if (t<=0.0) return 0.0; if (t>=1.0) return t-0.5; return 0.5*t*t; }\n";
+// Y-band binned: each pixel reads only the edges crossing its band (winding
+// coverage needs every edge in the *row*, regardless of x -- so we bin by Y only).
 static const char *const osd_raster_body =
     "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
     "if (g.x >= rw || g.y >= rh) return;\n"
     "float px = float(g.x), py = float(g.y);\n"
+    "int band = g.y / band_h; if (band >= nbands) band = nbands - 1;\n"
+    "int h = hbase + band;\n"
+    "vec4 hd = texelFetch(hdrs, ivec2(h % hw, h / hw), 0);\n"
+    "int off = int(hd.x), cnt = int(hd.y);\n"
     "float acc = 0.0;\n"
-    "for (int i = 0; i < nedges; i++) {\n"
-    "    int e = ebase + i;\n"
+    "for (int i = 0; i < cnt; i++) {\n"
+    "    int e = off + i;\n"
     "    vec4 ed = texelFetch(edges, ivec2(e % ew, e / ew), 0);\n"
     "    float ya = ed.y, yb = ed.w;\n"
     "    if (ya == yb) continue;\n"
@@ -748,29 +758,32 @@ static const char *const osd_raster_body =
     "}\n"
     "imageStore(dst, ivec2(ox + g.x, oy + g.y), vec4(clamp(abs(acc), 0.0, 1.0), 0.0, 0.0, 0.0));\n";
 
-// Rasterize one glyph (nedges edges starting at ebase in edge_tex) into the
-// glyph atlas at (ax,ay), covering rw x rh.
-static void gc_raster_outline(struct priv *p, int ebase, int nedges,
+// Rasterize one glyph into the atlas at (ax,ay). Its nbands Y-band headers start
+// at hbase in hdr_tex; each header points at a run of edges in edge_tex.
+static void gc_raster_outline(struct priv *p, int hbase, int nbands,
                               int ax, int ay, int rw, int rh)
 {
-    int ew = EDGE_TEX_W;
+    int ew = EDGE_TEX_W, hw = HDR_TEX_W, band_h = RASTER_BAND_H;
     pl_shader sh = pl_dispatch_begin(p->osd_dp);
     struct pl_shader_desc descs[] = {
         { .desc = { .name = "dst", .type = PL_DESC_STORAGE_IMG, .binding = 0,
                     .access = PL_DESC_ACCESS_WRITEONLY }, .binding = { .object = p->glyph_atlas } },
         { .desc = { .name = "edges", .type = PL_DESC_SAMPLED_TEX, .binding = 1 },
           .binding = { .object = p->edge_tex } },
+        { .desc = { .name = "hdrs", .type = PL_DESC_SAMPLED_TEX, .binding = 2 },
+          .binding = { .object = p->hdr_tex } },
     };
     struct pl_shader_var vars[] = {
         { .var = pl_var_int("rw"), .data = &rw }, { .var = pl_var_int("rh"), .data = &rh },
         { .var = pl_var_int("ox"), .data = &ax }, { .var = pl_var_int("oy"), .data = &ay },
-        { .var = pl_var_int("nedges"), .data = &nedges },
-        { .var = pl_var_int("ebase"), .data = &ebase }, { .var = pl_var_int("ew"), .data = &ew },
+        { .var = pl_var_int("hbase"), .data = &hbase }, { .var = pl_var_int("nbands"), .data = &nbands },
+        { .var = pl_var_int("band_h"), .data = &band_h },
+        { .var = pl_var_int("ew"), .data = &ew }, { .var = pl_var_int("hw"), .data = &hw },
     };
     struct pl_custom_shader cs = {
         .compute = true, .compute_group_size = { 16, 16 },
-        .descriptors = descs, .num_descriptors = 2,
-        .variables = vars, .num_variables = 7,
+        .descriptors = descs, .num_descriptors = 3,
+        .variables = vars, .num_variables = 9,
         .prelude = osd_raster_prelude, .body = osd_raster_body,
     };
     if (pl_shader_custom(sh, &cs))
@@ -820,8 +833,8 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     struct gmiss *miss = NULL;
     int nmiss = 0;
     size_t miss_bytes = 0;
-    struct rjob { int ax, ay, w, h, base, n; } *rjobs = NULL;  // outline raster jobs
-    int nrjobs = 0, ne = 0;                                    // ne = edges collected (vec4)
+    struct rjob { int ax, ay, w, h, hbase, nbands; } *rjobs = NULL;  // outline raster jobs
+    int nrjobs = 0, ne = 0, nh = 0;          // ne = binned edges, nh = band headers (vec4 each)
     ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
@@ -832,17 +845,53 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up))
             continue;
         if (up && is_outline) {
-            // Collect this glyph's edges into the shared edge buffer + a job.
-            int nseg = b->libass.n_outline, base = ne;
-            if (p->ebuf_cap < (ne + nseg) * 4) {
-                p->ebuf_cap = MPMAX((ne + nseg) * 4 * 2, 4096);
+            // Bin this glyph's edges into Y-bands (counting sort), so the shader
+            // reads only the edges crossing each pixel's band. Edges are
+            // duplicated into every band they span.
+            int nseg = b->libass.n_outline, rh = b->h;
+            const int32_t *seg = b->libass.outline;
+            int nbands = (rh + RASTER_BAND_H - 1) / RASTER_BAND_H;
+            if (nbands < 1) nbands = 1;
+            if (p->bscratch_cap < nbands * 2) {
+                p->bscratch_cap = MPMAX(nbands * 2 * 2, 512);
+                p->bscratch = talloc_realloc(p, p->bscratch, int, p->bscratch_cap);
+            }
+            int *bcount = p->bscratch, *boff = p->bscratch + nbands;
+            for (int bb = 0; bb < nbands; bb++) bcount[bb] = 0;
+            #define BANDS_OF(k, B0, B1) \
+                int lo_ = MPMIN(seg[(k)*4+1], seg[(k)*4+3]) / 64; \
+                int hi_ = MPMAX(seg[(k)*4+1], seg[(k)*4+3]) / 64; \
+                int r0_ = lo_ - 1 < 0 ? 0 : lo_ - 1; \
+                int r1_ = hi_ + 1 > rh - 1 ? rh - 1 : hi_ + 1; \
+                int B0 = r0_ / RASTER_BAND_H, B1 = r1_ < 0 ? 0 : r1_ / RASTER_BAND_H;
+            for (int k = 0; k < nseg; k++) { BANDS_OF(k, b0, b1);
+                for (int bb = b0; bb <= b1; bb++) bcount[bb]++; }
+            int total = 0;
+            for (int bb = 0; bb < nbands; bb++) { boff[bb] = total; total += bcount[bb]; }
+            if (p->ebuf_cap < (ne + total) * 4) {
+                p->ebuf_cap = MPMAX((ne + total) * 4 * 2, 8192);
                 p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
             }
-            for (int k = 0; k < nseg * 4; k++)
-                p->ebuf[ne * 4 + k] = b->libass.outline[k] / 64.0f;
-            ne += nseg;
+            if (p->hbuf_cap < (nh + nbands) * 4) {
+                p->hbuf_cap = MPMAX((nh + nbands) * 4 * 2, 2048);
+                p->hbuf = talloc_realloc(p, p->hbuf, float, p->hbuf_cap);
+            }
+            for (int bb = 0; bb < nbands; bb++) {        // headers (offset,count) per band
+                p->hbuf[(nh + bb) * 4 + 0] = ne + boff[bb];
+                p->hbuf[(nh + bb) * 4 + 1] = bcount[bb];
+                p->hbuf[(nh + bb) * 4 + 2] = p->hbuf[(nh + bb) * 4 + 3] = 0;
+            }
+            for (int k = 0; k < nseg; k++) { BANDS_OF(k, b0, b1);
+                for (int bb = b0; bb <= b1; bb++) {
+                    int dst = ne + boff[bb]++;
+                    for (int c = 0; c < 4; c++)
+                        p->ebuf[dst * 4 + c] = seg[k * 4 + c] / 64.0f;
+                }
+            }
+            #undef BANDS_OF
             MP_TARRAY_APPEND(tmp, rjobs, nrjobs,
-                ((struct rjob){ cpos[i].ax, cpos[i].ay, b->w, b->h, base, nseg }));
+                ((struct rjob){ cpos[i].ax, cpos[i].ay, b->w, b->h, nh, nbands }));
+            ne += total; nh += nbands;
         } else if (up) {
             const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
                                 + (ptrdiff_t) b->src_y * pstride + b->src_x;
@@ -852,23 +901,29 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         }
     }
 
-    // Upload all collected edges once, then rasterize each glyph from the texture.
+    // Upload binned edges + band headers once, then rasterize each glyph.
     if (ne) {
         int eh = (ne + EDGE_TEX_W - 1) / EDGE_TEX_W;
-        size_t need = (size_t) EDGE_TEX_W * eh * 4;
-        if ((size_t) p->ebuf_cap < need) {
-            p->ebuf_cap = need;
-            p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+        int hh = (nh + HDR_TEX_W - 1) / HDR_TEX_W;
+        size_t eneed = (size_t) EDGE_TEX_W * eh * 4, hneed = (size_t) HDR_TEX_W * hh * 4;
+        if ((size_t) p->ebuf_cap < eneed) {
+            p->ebuf_cap = eneed; p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+        }
+        if ((size_t) p->hbuf_cap < hneed) {
+            p->hbuf_cap = hneed; p->hbuf = talloc_realloc(p, p->hbuf, float, p->hbuf_cap);
         }
         pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
-        if (ef && gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh,
-                            false, true, false, false, true)) {
+        if (ef && gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true, false, false, true) &&
+                  gc_ensure(gpu, &p->hdr_tex, ef, HDR_TEX_W, hh, false, true, false, false, true)) {
             pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
                 .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
                 .row_pitch = (size_t) EDGE_TEX_W * 4 * sizeof(float), .ptr = p->ebuf));
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->hdr_tex,
+                .rc = { .x1 = HDR_TEX_W, .y1 = hh },
+                .row_pitch = (size_t) HDR_TEX_W * 4 * sizeof(float), .ptr = p->hbuf));
             for (int j = 0; j < nrjobs; j++) {
                 struct rjob *r = &rjobs[j];
-                gc_raster_outline(p, r->base, r->n, r->ax, r->ay, r->w, r->h);
+                gc_raster_outline(p, r->hbase, r->nbands, r->ax, r->ay, r->w, r->h);
             }
         }
     }
@@ -3054,6 +3109,7 @@ static void uninit(struct vo *vo)
     pl_tex_destroy(p->gpu, &p->run_cov_b);
     pl_tex_destroy(p->gpu, &p->glyph_atlas);
     pl_tex_destroy(p->gpu, &p->edge_tex);
+    pl_tex_destroy(p->gpu, &p->hdr_tex);
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
