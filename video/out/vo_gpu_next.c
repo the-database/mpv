@@ -1864,8 +1864,12 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     }
 
     // --- TEMP instrumentation emit (only for non-trivial overlay frames) ---
+    // Gate on total compose time, NOT dbg_parts (which is the legacy-path count,
+    // 0 for outline-mode frames -- the dense ones we actually care about).
     int64_t dbg_total = mp_time_ns() - dbg_t0;
-    if (dbg_total > 2000000 && dbg_parts > 0) {
+    int64_t dbg_stage_sum = p->dbg_raster + p->dbg_combine + p->dbg_resfix +
+                            p->dbg_blur2 + p->dbg_clip2 + p->dbg_emit;
+    if (dbg_total > 2000000 || dbg_stage_sum > 2000000) {
         MP_STATS(vo, "value %f osd-total-ms",  dbg_total  / 1e6);
         MP_STATS(vo, "value %f osd-upload-ms", dbg_upload / 1e6);
         MP_STATS(vo, "value %f osd-blur-ms",   dbg_blur   / 1e6);
