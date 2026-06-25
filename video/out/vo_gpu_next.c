@@ -934,7 +934,16 @@ static const char *const osd_raster_body =
     "    float X0 = xa + (xb - xa) * (y0 - ya) * inv;\n"
     "    float X1 = xa + (xb - xa) * (y1 - ya) * inv;\n"
     "    float f0 = px + 1.0 - X0, f1 = px + 1.0 - X1, L = y1 - y0, area;\n"
-    "    if (abs(f1 - f0) < 1e-6) area = L * clamp(0.5 * (f0 + f1), 0.0, 1.0);\n"
+    // Handle the fully-covered / fully-uncovered spans exactly. The general
+    // (Hc(f1)-Hc(f0))/(f1-f0) form catastrophically cancels for pixels deep
+    // inside a shape (f0,f1 both large & nearly equal): Hc(f)=f-0.5 there, so
+    // the subtraction loses all precision and the interior coverage drifts off
+    // 1.0 -- visible on hardware that rounds the FMA differently (NVIDIA), where
+    // it let masked content bleed through. clamp(min,max) avoids the division.
+    "    float lo = min(f0, f1), hi = max(f0, f1);\n"
+    "    if (lo >= 1.0) area = L;\n"
+    "    else if (hi <= 0.0) area = 0.0;\n"
+    "    else if (hi - lo < 1e-6) area = L * clamp(0.5 * (f0 + f1), 0.0, 1.0);\n"
     "    else area = L * (Hc(f1) - Hc(f0)) / (f1 - f0);\n"
     "    acc += dir * area;\n"
     "}\n"
