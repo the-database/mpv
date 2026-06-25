@@ -958,6 +958,7 @@ static void gc_apply_clip(struct priv *p, pl_tex cov, int bw, int bh, int sox, i
 #define RUN_FLAG_CLIP_INVERSE 0x4  // the clip mask is inverse (\iclip)
 #define RUN_FLAG_KF_WIPE      0x8  // \kf fill: fill_color left of wipe_x, fill_color2 right
 #define RUN_FLAG_RECT_INVERSE 0x10 // \iclip rect: the clip rect is EXCLUDED, not visible
+#define RUN_FLAG_SHADOW       0x20 // drop shadow: draw behind border+fill
 static const char *const osd_raster_prelude =
     "float Hc(float t){ if (t<=0.0) return 0.0; if (t>=1.0) return t-0.5; return 0.5*t*t; }\n";
 // One dispatch for ALL glyphs: one 16x16 workgroup per work-list tile (avoids the
@@ -1422,46 +1423,49 @@ gc_restart:
     }
     #undef REG_BWBH
 
-    // Emit one monochrome overlay; parts in z-order: border (1) then fill (0)
-    // across all runs (deferred runs never carry a shadow).
+    // Emit one monochrome overlay preserving libass's z-order: regions in
+    // emission order (each event's shadow region precedes its text region), and
+    // within a region border under fill. (Global border-then-fill passes would
+    // mislayer overlapping shadowed events -- the shadow must stay behind its
+    // own border yet a later event's shadow above an earlier event's fill.)
     entry->num_run_parts = 0;
-    for (int pass = 1; pass >= 0; pass--) {
-        for (int i = 0; i < nregs; i++) {
-            struct gc_region *r = &regs[i];
-            int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
-            int ax, ay; uint32_t c;
-            if (pass == 1 && r->nbord) { ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
-            else if (pass == 0 && r->nfill) { ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
-            else continue;
-            int dx0 = r->x0 - r->margin, dy0 = r->y0 - r->margin;
-            int dx1 = r->x1 + r->margin, dy1 = r->y1 + r->margin;
-            // Rectangular \clip on the screen dst (no shader, a plain rect crop):
-            // normal \clip keeps one visible rect (the intersection); inverse
-            // \iclip subtracts the excluded rect, leaving up to 4 visible strips.
-            int vr[4][4]; int nvr = 0;
-            if (r->run_flags & RUN_FLAG_RECT_INVERSE) {
-                int ex0 = MPMAX(dx0, r->rcx0), ey0 = MPMAX(dy0, r->rcy0);
-                int ex1 = MPMIN(dx1, r->rcx1), ey1 = MPMIN(dy1, r->rcy1);
-                if (ex0 >= ex1 || ey0 >= ey1) {     // dst clear of the hole
-                    vr[nvr][0]=dx0; vr[nvr][1]=dy0; vr[nvr][2]=dx1; vr[nvr][3]=dy1; nvr++;
-                } else {
-                    if (dy0 < ey0) { vr[nvr][0]=dx0; vr[nvr][1]=dy0; vr[nvr][2]=dx1; vr[nvr][3]=ey0; nvr++; }
-                    if (ey1 < dy1) { vr[nvr][0]=dx0; vr[nvr][1]=ey1; vr[nvr][2]=dx1; vr[nvr][3]=dy1; nvr++; }
-                    if (dx0 < ex0) { vr[nvr][0]=dx0; vr[nvr][1]=ey0; vr[nvr][2]=ex0; vr[nvr][3]=ey1; nvr++; }
-                    if (ex1 < dx1) { vr[nvr][0]=ex1; vr[nvr][1]=ey0; vr[nvr][2]=dx1; vr[nvr][3]=ey1; nvr++; }
-                }
+    for (int i = 0; i < nregs; i++) {
+        struct gc_region *r = &regs[i];
+        bool is_shadow = r->run_flags & RUN_FLAG_SHADOW;
+        int dx0 = r->x0 - r->margin, dy0 = r->y0 - r->margin;
+        int dx1 = r->x1 + r->margin, dy1 = r->y1 + r->margin;
+        // Rectangular \clip on the screen dst (no shader, a plain rect crop):
+        // normal \clip keeps one visible rect (the intersection); inverse
+        // \iclip subtracts the excluded rect, leaving up to 4 visible strips.
+        int vr[4][4]; int nvr = 0;
+        if (r->run_flags & RUN_FLAG_RECT_INVERSE) {
+            int ex0 = MPMAX(dx0, r->rcx0), ey0 = MPMAX(dy0, r->rcy0);
+            int ex1 = MPMIN(dx1, r->rcx1), ey1 = MPMIN(dy1, r->rcy1);
+            if (ex0 >= ex1 || ey0 >= ey1) {     // dst clear of the hole
+                vr[nvr][0]=dx0; vr[nvr][1]=dy0; vr[nvr][2]=dx1; vr[nvr][3]=dy1; nvr++;
             } else {
-                int cx0 = MPMAX(dx0, r->rcx0), cy0 = MPMAX(dy0, r->rcy0);
-                int cx1 = MPMIN(dx1, r->rcx1), cy1 = MPMIN(dy1, r->rcy1);
-                if (cx0 < cx1 && cy0 < cy1) { vr[0][0]=cx0; vr[0][1]=cy0; vr[0][2]=cx1; vr[0][3]=cy1; nvr=1; }
+                if (dy0 < ey0) { vr[nvr][0]=dx0; vr[nvr][1]=dy0; vr[nvr][2]=dx1; vr[nvr][3]=ey0; nvr++; }
+                if (ey1 < dy1) { vr[nvr][0]=dx0; vr[nvr][1]=ey1; vr[nvr][2]=dx1; vr[nvr][3]=dy1; nvr++; }
+                if (dx0 < ex0) { vr[nvr][0]=dx0; vr[nvr][1]=ey0; vr[nvr][2]=ex0; vr[nvr][3]=ey1; nvr++; }
+                if (ex1 < dx1) { vr[nvr][0]=ex1; vr[nvr][1]=ey0; vr[nvr][2]=dx1; vr[nvr][3]=ey1; nvr++; }
             }
+        } else {
+            int cx0 = MPMAX(dx0, r->rcx0), cy0 = MPMAX(dy0, r->rcy0);
+            int cx1 = MPMIN(dx1, r->rcx1), cy1 = MPMIN(dy1, r->rcy1);
+            if (cx0 < cx1 && cy0 < cy1) { vr[0][0]=cx0; vr[0][1]=cy0; vr[0][2]=cx1; vr[0][3]=cy1; nvr=1; }
+        }
+        // border (under) then fill (over); a shadow region is fill-only.
+        for (int layer = 0; layer < 2; layer++) {
+            int ax, ay; uint32_t c;
+            if (layer == 0) { if (!r->nbord) continue; ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
+            else            { if (!r->nfill) continue; ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
             for (int v = 0; v < nvr; v++) {
                 int cx0 = vr[v][0], cy0 = vr[v][1], cx1 = vr[v][2], cy1 = vr[v][3];
                 // \kf karaoke: split the fill at wipe_x into sung (fill_color,
                 // left) and unsung (fill_color2, right). Else one segment.
                 int sx0[2] = { cx0, 0 }, sx1[2] = { cx1, 0 };
                 uint32_t sc[2] = { c, 0 }; int nseg = 1;
-                if (pass == 0 && (r->run_flags & RUN_FLAG_KF_WIPE)) {
+                if (layer == 1 && !is_shadow && (r->run_flags & RUN_FLAG_KF_WIPE)) {
                     int w = MPMAX(cx0, MPMIN(cx1, r->wipe_x));
                     sx0[0] = cx0; sx1[0] = w;   sc[0] = r->fill_color;
                     sx0[1] = w;   sx1[1] = cx1; sc[1] = r->fill_color2;
