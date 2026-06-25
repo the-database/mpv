@@ -1773,8 +1773,8 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     };
     for (int i = 0; i < MP_ARRAY_SIZE(path_opts); i++) {
         if (path_opts[i].src && path_opts[i].src[0])
-            *path_opts[i].dst = mp_get_user_path(p, f->global,
-                                                 path_opts[i].src);
+            *path_opts[i].dst = mp_normalize_user_path(p, f->global,
+                                                       path_opts[i].src);
     }
 
     // Not fatal: on non-NVIDIA machines the D3D11/DirectML path carries
