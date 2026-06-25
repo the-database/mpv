@@ -79,6 +79,10 @@ struct sub_bitmap {
             // px (same space as the part's dst). The consumer intersects the
             // run's drawn area with it; equals the full frame when unclipped.
             int32_t clip_rx0, clip_ry0, clip_rx1, clip_ry1;
+            // Outline-mode \kf karaoke wipe (run_flags bit 3): color left of
+            // screen-x wipe_x, color2 to its right.
+            uint32_t color2;
+            int32_t wipe_x;
         } libass;
         struct {
             const struct sbr_output_image *image;
