@@ -150,7 +150,7 @@ struct priv {
     // Deferred composite (SUBBITMAP_LIBASS_GLYPHS): r32f combine accumulator
     // format + reusable scratch. The composited per-run coverage goes into the
     // per-entry result atlas (entry->result_tex).
-    pl_fmt osd_acc_fmt;        // r32f (storable) for the combine accumulator
+    pl_fmt osd_acc_fmt;        // r32f (storable) for the (legacy) per-region accumulator
     pl_tex run_acc;            // r32f combine accumulator (sized to max run)
     pl_tex run_tmp;            // r8 blur temp
     pl_tex run_cov_f, run_cov_b; // r8 per-run fill/border coverage (pre-copy)
@@ -176,6 +176,8 @@ struct priv {
     pl_tex result_tmp;                       // r8 atlas-wide blur intermediate
     pl_tex blurwork_tex;                     // batched blur: one 16x16 tile per workgroup
     float *bwbuf; int bwbuf_cap;             // CPU blur work-list scratch (vec4 units)
+    pl_tex combwork_tex;                     // batched single-part combine work-list
+    float *cwbuf; int cwbuf_cap;             // CPU combine work-list scratch
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -794,6 +796,47 @@ static void gc_blur_batch(struct priv *p, pl_tex src, pl_tex dst, int ntiles,
         pl_dispatch_abort(p->osd_dp, &sh);
 }
 
+// Batched combine for single-part slots: one dispatch over a part-tile work-list,
+// plain imageStore (no overlap within a single-part slot, so no atomics needed).
+// Multi-glyph runs still go through the serialized per-part read-add path.
+static const char *const osd_combine_batch_body =
+    "int wi = int(gl_WorkGroupID.y)*gridx + int(gl_WorkGroupID.x);\n"
+    "if (wi >= ntiles) return;\n"
+    "int w0 = 2*wi;\n"
+    "vec4 t0 = texelFetch(cw, ivec2(w0%ww, w0/ww), 0);\n"
+    "vec4 t1 = texelFetch(cw, ivec2((w0+1)%ww, (w0+1)/ww), 0);\n"
+    "int sax=int(t0.x), say=int(t0.y), dx=int(t1.x), dy=int(t1.y), w=int(t1.z), h=int(t1.w);\n"
+    "int lx=int(t0.z)+int(gl_LocalInvocationID.x), ly=int(t0.w)+int(gl_LocalInvocationID.y);\n"
+    "if (lx>=w || ly>=h) return;\n"
+    "float cov = texelFetch(src, ivec2(sax+lx, say+ly), 0).r;\n"
+    "imageStore(acc, ivec2(dx+lx, dy+ly), vec4(cov, 0.0, 0.0, 0.0));\n";
+static void gc_combine_batch(struct priv *p, pl_tex atlas, pl_tex acc, int ntiles)
+{
+    int ww = BLURWORK_W, gridx = MPMIN(ntiles, 32768), gridy = (ntiles+gridx-1)/gridx;
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 }, .binding={.object=atlas} },
+        { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=1,
+                    .access=PL_DESC_ACCESS_WRITEONLY }, .binding={.object=acc} },
+        { .desc = { .name="cw", .type=PL_DESC_SAMPLED_TEX, .binding=2 },
+          .binding={.object=p->combwork_tex} },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("ntiles"), .data=&ntiles }, { .var = pl_var_int("gridx"), .data=&gridx },
+        { .var = pl_var_int("ww"), .data=&ww },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 3,
+        .variables = vars, .num_variables = 3, .body = osd_combine_batch_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { gridx, gridy, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
 // fix_outline between two slots of the same result atlas (border -= fill/2).
 static const char *const osd_fixoutline_slot_body =
     "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
@@ -1345,17 +1388,61 @@ gc_restart:
     // dispatches over a slot-tile work-list.
     #define REG_BWBH struct gc_region *r = &regs[i]; \
         int bw = r->x1 - r->x0 + 2*r->margin, bh = r->y1 - r->y0 + 2*r->margin
-    // 1. clear accumulator + combine all glyphs into their slots.
+    // 1. clear the f32 accumulator. Single-part slots (drawings, single glyphs)
+    //    batch into ONE imageStore dispatch (no overlap within a slot -> no
+    //    atomics); multi-glyph run slots keep the serialized per-part read-add.
     osd_clear(p, p->result_acc, atlas_w, atlas_h);
+    int cnt = 0;
     for (int i = 0; i < nregs; i++) {
-        REG_BWBH; (void)bw; (void)bh;
-        for (int k = 0; k < r->nfill; k++) {
+        struct gc_region *r = &regs[i];
+        if (r->nfill == 1) { const struct sub_bitmap *b = &item->parts[r->fill[0]];
+            cnt += ((b->w+15)/16) * ((b->h+15)/16); }
+        if (r->nbord == 1) { const struct sub_bitmap *b = &item->parts[r->bord[0]];
+            cnt += ((b->w+15)/16) * ((b->h+15)/16); }
+    }
+    if (cnt) {
+        int cwh = (2*cnt + BLURWORK_W - 1) / BLURWORK_W;
+        size_t need = (size_t) BLURWORK_W * cwh * 4;
+        if ((size_t) p->cwbuf_cap < need) {
+            p->cwbuf_cap = need; p->cwbuf = talloc_realloc(p, p->cwbuf, float, p->cwbuf_cap);
+        }
+        int ci = 0;
+        #define ADD_COMB(SAX, SAY, DX, DY, W, H) do {                          \
+            int txs=((W)+15)/16, tys=((H)+15)/16;                              \
+            for (int ty=0; ty<tys; ty++) for (int tx=0; tx<txs; tx++) {        \
+                float *w0 = &p->cwbuf[(2*ci)*4];                              \
+                w0[0]=(SAX); w0[1]=(SAY); w0[2]=tx*16; w0[3]=ty*16;            \
+                w0[4]=(DX);  w0[5]=(DY);  w0[6]=(W);   w0[7]=(H); ci++; } } while (0)
+        for (int i = 0; i < nregs; i++) {
+            struct gc_region *r = &regs[i];
+            if (r->nfill == 1) { const struct sub_bitmap *b = &item->parts[r->fill[0]];
+                ADD_COMB(cpos[r->fill[0]].ax, cpos[r->fill[0]].ay,
+                         r->fill_ax + b->x - r->x0 + r->margin,
+                         r->fill_ay + b->y - r->y0 + r->margin, b->w, b->h); }
+            if (r->nbord == 1) { const struct sub_bitmap *b = &item->parts[r->bord[0]];
+                ADD_COMB(cpos[r->bord[0]].ax, cpos[r->bord[0]].ay,
+                         r->bord_ax + b->x - r->x0 + r->margin,
+                         r->bord_ay + b->y - r->y0 + r->margin, b->w, b->h); }
+        }
+        #undef ADD_COMB
+        pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
+        if (ef && gc_ensure(gpu, &p->combwork_tex, ef, BLURWORK_W, cwh, false, true, false, false, true)) {
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->combwork_tex,
+                .rc = { .x1 = BLURWORK_W, .y1 = cwh },
+                .row_pitch = (size_t) BLURWORK_W * 4 * sizeof(float), .ptr = p->cwbuf));
+            gc_combine_batch(p, p->glyph_atlas, p->result_acc, cnt);
+        }
+    }
+    // multi-glyph run slots (>1 part overlap): serialized per-part read-add.
+    for (int i = 0; i < nregs; i++) {
+        struct gc_region *r = &regs[i];
+        if (r->nfill > 1) for (int k = 0; k < r->nfill; k++) {
             const struct sub_bitmap *b = &item->parts[r->fill[k]];
             osd_combine_part(p, p->glyph_atlas, p->result_acc, cpos[r->fill[k]].ax,
                 cpos[r->fill[k]].ay, r->fill_ax + b->x - r->x0 + r->margin,
                 r->fill_ay + b->y - r->y0 + r->margin, b->w, b->h);
         }
-        for (int k = 0; k < r->nbord; k++) {
+        if (r->nbord > 1) for (int k = 0; k < r->nbord; k++) {
             const struct sub_bitmap *b = &item->parts[r->bord[k]];
             osd_combine_part(p, p->glyph_atlas, p->result_acc, cpos[r->bord[k]].ax,
                 cpos[r->bord[k]].ay, r->bord_ax + b->x - r->x0 + r->margin,
@@ -3518,6 +3605,7 @@ static void uninit(struct vo *vo)
     pl_tex_destroy(p->gpu, &p->result_acc);
     pl_tex_destroy(p->gpu, &p->result_tmp);
     pl_tex_destroy(p->gpu, &p->blurwork_tex);
+    pl_tex_destroy(p->gpu, &p->combwork_tex);
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
