@@ -373,12 +373,29 @@ static void clear_ring(struct mp_filter *vf)
     p->ring_n = 0;
 }
 
+static void drain_backend(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    if (!p->aji)
+        return;
+
+    uint64_t ticket = p->api.flush(p->aji, p->stream);
+    if (ticket && p->api.wait(p->aji, ticket) != AJI_OK) {
+        MP_WARN(vf, "backend drain failed during reset: %s\n",
+                p->api.last_error(p->aji));
+    }
+}
+
 static void flush_frames(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
     // GPU reads of the queued input frames must finish before the
     // refqueue drops them
     clear_ring(vf);
+    // RIFE-first also uses immediate resize/interp work that is not tracked
+    // in the upscaler ring. Drain the backend before releasing frame pools on
+    // seek/reset so old work cannot contend with the post-seek chain.
+    drain_backend(vf);
     mp_refqueue_flush(p->queue);
     mp_image_unrefp(&p->rife_prev);
     for (int i = 0; i < p->outq_n; i++)
@@ -386,6 +403,15 @@ static void flush_frames(struct mp_filter *vf)
     p->outq_n = p->outq_pos = 0;
     // the output grid restarts at the next frame (= a source frame)
     p->rife_acc = p->rife_den;
+
+    if (p->rife_first) {
+        av_buffer_unref(&p->src_pool);
+        av_buffer_unref(&p->work_pool);
+    }
+#if HAVE_D3D11
+    p->d3d_stage_next = 0;
+#endif
+    p->decode_evt_next = 0;
 }
 
 static void write_stats(struct mp_filter *vf)
