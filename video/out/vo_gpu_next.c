@@ -703,6 +703,8 @@ struct gc_region {
     uint8_t single_layer;        // 0xff for a run; else the singleton's layer
     uint32_t clip_id;            // vector \clip mask to multiply by (0 = none)
     int rcx0, rcy0, rcx1, rcy1;  // rectangular \clip; visible screen rect
+    uint32_t fill_color2;        // \kf wipe: fill colour right of wipe_x
+    int wipe_x;                  // \kf wipe boundary (screen x); used iff KF_WIPE
 };
 
 // Combine a region's glyph list (saturating add) into run_acc at run-local
@@ -900,6 +902,7 @@ static void gc_apply_clip(struct priv *p, pl_tex cov, int bw, int bh, int sox, i
 #define RASTER_BAND_H 8   // Y-band height (px): a pixel only tests edges crossing its band.
 #define RUN_FLAG_CLIP_MASK    0x2  // libass ABI: this part is a vector-clip mask
 #define RUN_FLAG_CLIP_INVERSE 0x4  // the clip mask is inverse (\iclip)
+#define RUN_FLAG_KF_WIPE      0x8  // \kf fill: fill_color left of wipe_x, fill_color2 right
 static const char *const osd_raster_prelude =
     "float Hc(float t){ if (t<=0.0) return 0.0; if (t>=1.0) return t-0.5; return 0.5*t*t; }\n";
 // One dispatch for ALL glyphs: one 16x16 workgroup per work-list tile (avoids the
@@ -1160,11 +1163,6 @@ gc_restart:
             gc_raster_batch(p, ntiles);
         }
     }
-    // DIAGNOSTIC (MPV_RASTER_SYNC=1): force the GPU to finish the raster before the
-    // combine reads the atlas. Heavy (full stall) -- only to test whether the
-    // intermittent real-GPU coverage corruption is a raster->combine sync gap.
-    if (getenv("MPV_RASTER_SYNC"))
-        pl_gpu_finish(p->gpu);
 
     // Flush the misses: tight-repack into a CPU scratch, one async buffer write,
     // then per-glyph async texture uploads (buffer-backed = no VO-thread stall).
@@ -1244,6 +1242,11 @@ gc_restart:
         } else {
             r->fill_color = b->libass.color;
             r->blur_f = b->libass.blur_x;
+            r->fill_color2 = b->libass.color2;
+            r->wipe_x = b->libass.wipe_x;
+            // KF_WIPE lives on the fill part; the region's run_flags came from
+            // whichever part appeared first (the border), so OR it in here.
+            r->run_flags |= b->libass.run_flags & RUN_FLAG_KF_WIPE;
             MP_TARRAY_APPEND(tmp, r->fill, r->nfill, i);
         }
     }
@@ -1374,14 +1377,28 @@ gc_restart:
             int cx1 = MPMIN(dx1, r->rcx1), cy1 = MPMIN(dy1, r->rcy1);
             if (cx0 >= cx1 || cy0 >= cy1)
                 continue;   // fully clipped away
-            struct pl_overlay_part part = {
-                .src = { ax + (cx0 - dx0), ay + (cy0 - dy0),
-                         ax + (cx1 - dx0), ay + (cy1 - dy0) },
-                .dst = { cx0, cy0, cx1, cy1 },
-                .color = { (c >> 24) / 255.0f, ((c >> 16) & 0xFF) / 255.0f,
-                           ((c >> 8) & 0xFF) / 255.0f, (255 - (c & 0xFF)) / 255.0f },
-            };
-            MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
+            // \kf karaoke: split the fill at wipe_x into sung (fill_color, left)
+            // and unsung (fill_color2, right). Other runs emit one segment.
+            int sx0[2] = { cx0, 0 }, sx1[2] = { cx1, 0 };
+            uint32_t sc[2] = { c, 0 }; int nseg = 1;
+            if (pass == 0 && (r->run_flags & RUN_FLAG_KF_WIPE)) {
+                int w = MPMAX(cx0, MPMIN(cx1, r->wipe_x));
+                sx0[0] = cx0; sx1[0] = w;   sc[0] = r->fill_color;
+                sx0[1] = w;   sx1[1] = cx1; sc[1] = r->fill_color2;
+                nseg = 2;
+            }
+            for (int s = 0; s < nseg; s++) {
+                if (sx0[s] >= sx1[s]) continue;
+                uint32_t sg = sc[s];
+                struct pl_overlay_part part = {
+                    .src = { ax + (sx0[s] - dx0), ay + (cy0 - dy0),
+                             ax + (sx1[s] - dx0), ay + (cy1 - dy0) },
+                    .dst = { sx0[s], cy0, sx1[s], cy1 },
+                    .color = { (sg >> 24) / 255.0f, ((sg >> 16) & 0xFF) / 255.0f,
+                               ((sg >> 8) & 0xFF) / 255.0f, (255 - (sg & 0xFF)) / 255.0f },
+                };
+                MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
+            }
         }
     }
     talloc_free(tmp);
