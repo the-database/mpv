@@ -40,7 +40,7 @@ static const char osd_font_pfb[] =
 #define ASS_USE_OSD_FONT "{\\fnmpv-osd-symbols}"
 
 static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
-                       ASS_Image **img_list, bool *changed);
+                       ASS_Image **img_list, bool *changed, int format);
 
 static void create_ass_renderer(struct osd_state *osd, struct ass_state *ass)
 {
@@ -635,7 +635,8 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
         }
 
         ASS_Image *img_list = NULL;
-        append_ass(&entry->ass, &vo_res, &img_list, NULL);
+        // Bounds probe only (out_rc): use plain CPU raster, not the GPU path.
+        append_ass(&entry->ass, &vo_res, &img_list, NULL, SUBBITMAP_LIBASS);
 
         mp_ass_get_bb(img_list, entry->ass.track, &vo_res, ov->out_rc);
     }
@@ -661,7 +662,7 @@ void osd_set_external_remove_owner(struct osd_state *osd, void *owner)
 }
 
 static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
-                       ASS_Image **img_list, bool *changed)
+                       ASS_Image **img_list, bool *changed, int format)
 {
     if (!ass->render || !ass->track) {
         *img_list = NULL;
@@ -672,6 +673,15 @@ static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
 
     ass_set_frame_size(ass->render, res->w, res->h);
     ass_set_pixel_aspect(ass->render, res->display_par);
+
+    // GPU-deferred output (see osd.c render_object): emit outline segments /
+    // uncombined coverage + per-part blur for the VO to rasterize, instead of
+    // CPU-rasterizing and packing a full-screen atlas every redraw.
+    bool outlines = format == SUBBITMAP_LIBASS_OUTLINES;
+    bool comp = format == SUBBITMAP_LIBASS_GLYPHS || outlines;
+    ass_set_composite_deferred(ass->render, comp);
+    ass_set_outline_deferred(ass->render, outlines);
+    ass_set_blur_deferred(ass->render, comp);
 
     int ass_changed;
     *img_list = ass_render_frame(ass->render, ass->track, 0, &ass_changed);
@@ -701,14 +711,14 @@ struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
 
     MP_TARRAY_GROW(obj, obj->ass_imgs, obj->num_externals + 1);
 
-    append_ass(&obj->ass, &obj->vo_res, &obj->ass_imgs[0], &obj->changed);
+    append_ass(&obj->ass, &obj->vo_res, &obj->ass_imgs[0], &obj->changed, format);
     for (int n = 0; n < obj->num_externals; n++) {
         if (obj->externals[n]->ov.hidden) {
             update_playres(&obj->externals[n]->ass, &obj->vo_res);
             obj->ass_imgs[n + 1] = NULL;
         } else {
             append_ass(&obj->externals[n]->ass, &obj->vo_res,
-                       &obj->ass_imgs[n + 1], &obj->changed);
+                       &obj->ass_imgs[n + 1], &obj->changed, format);
         }
     }
 
