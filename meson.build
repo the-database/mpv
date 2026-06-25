@@ -473,9 +473,15 @@ features += {'rfork': cc.has_header_symbol('unistd.h', 'rfork_thread')}
 # Use a compile-only declaration check rather than has_function(): the latter
 # links a probe, which can spuriously fail against a static libass whose
 # transitive deps aren't all on the probe link line (e.g. mingw cross builds),
-# silently compiling out the call.
-features += {'ass-render-thread-count': cc.has_header_symbol('ass/ass.h', 'ass_set_render_thread_count',
-                                                             dependencies: libass)}
+# silently compiling out the call. Meson compiler checks only accept external
+# dependencies here; internal fallback libass is the upstream subproject and
+# does not currently expose this extension.
+ass_render_thread_count = false
+if libass.type_name() != 'internal'
+    ass_render_thread_count = cc.has_header_symbol('ass/ass.h', 'ass_set_render_thread_count',
+                                                  dependencies: libass)
+endif
+features += {'ass-render-thread-count': ass_render_thread_count}
 
 optical_devices = {
     'windows': 'D:',
