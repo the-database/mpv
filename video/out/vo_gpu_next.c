@@ -705,6 +705,7 @@ struct gc_region {
     int rcx0, rcy0, rcx1, rcy1;  // rectangular \clip; visible screen rect
     uint32_t fill_color2;        // \kf wipe: fill colour right of wipe_x
     int wipe_x;                  // \kf wipe boundary (screen x); used iff KF_WIPE
+    int be;                      // \be: iterations of the [1,2,1]/4 box blur
 };
 
 // Combine a region's glyph list (saturating add) into run_acc at run-local
@@ -826,6 +827,59 @@ static void gc_fixoutline_slot(struct priv *p, pl_tex res, int box, int boy,
             .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
     else
         pl_dispatch_abort(p->osd_dp, &sh);
+}
+
+// \be edge-blur: one separable [1,2,1]/4 box pass over a result slot (outside the
+// slot reads 0, matching libass's be_blur edges). horiz!=0 = x pass, else y.
+static const char *const osd_be_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < bw && g.y < bh) {\n"
+    "    ivec2 b = ivec2(ax, ay);\n"
+    "    float c = imageLoad(src, b + g).r;\n"
+    "    float l, r;\n"
+    "    if (horiz != 0) {\n"
+    "        l = g.x > 0    ? imageLoad(src, b + ivec2(g.x-1, g.y)).r : 0.0;\n"
+    "        r = g.x < bw-1 ? imageLoad(src, b + ivec2(g.x+1, g.y)).r : 0.0;\n"
+    "    } else {\n"
+    "        l = g.y > 0    ? imageLoad(src, b + ivec2(g.x, g.y-1)).r : 0.0;\n"
+    "        r = g.y < bh-1 ? imageLoad(src, b + ivec2(g.x, g.y+1)).r : 0.0;\n"
+    "    }\n"
+    "    imageStore(dst, b + g, vec4((l + 2.0*c + r) * 0.25, 0.0, 0.0, 0.0));\n"
+    "}\n";
+static void gc_be_pass(struct priv *p, pl_tex src, pl_tex dst,
+                       int ax, int ay, int bw, int bh, int horiz)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="src", .type=PL_DESC_STORAGE_IMG, .binding=0,
+                    .access=PL_DESC_ACCESS_READONLY }, .binding={.object=src} },
+        { .desc = { .name="dst", .type=PL_DESC_STORAGE_IMG, .binding=1,
+                    .access=PL_DESC_ACCESS_WRITEONLY }, .binding={.object=dst} },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("ax"), .data=&ax }, { .var = pl_var_int("ay"), .data=&ay },
+        { .var = pl_var_int("bw"), .data=&bw }, { .var = pl_var_int("bh"), .data=&bh },
+        { .var = pl_var_int("horiz"), .data=&horiz },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 5, .body = osd_be_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (bw+15)/16, (bh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+// `be` iterations of the box blur on a result slot, ping-ponging through tmp.
+static void gc_be_blur(struct priv *p, pl_tex res, pl_tex tmp,
+                       int ax, int ay, int bw, int bh, int be)
+{
+    for (int i = 0; i < be; i++) {
+        gc_be_pass(p, res, tmp, ax, ay, bw, bh, 1);   // x pass: res -> tmp
+        gc_be_pass(p, tmp, res, ax, ay, bw, bh, 0);   // y pass: tmp -> res
+    }
 }
 
 // A vector-\clip mask, rasterized into the glyph atlas (like a glyph) at (ax,ay)
@@ -1231,7 +1285,8 @@ gc_restart:
                 .run_flags = b->libass.run_flags, .single_layer = 0xff,
                 .clip_id = b->libass.clip_id,
                 .rcx0 = b->libass.clip_rx0, .rcy0 = b->libass.clip_ry0,
-                .rcx1 = b->libass.clip_rx1, .rcy1 = b->libass.clip_ry1 };
+                .rcx1 = b->libass.clip_rx1, .rcy1 = b->libass.clip_ry1,
+                .be = b->libass.be };
         }
         r = &regs[ri];
         r->x0 = MPMIN(r->x0, b->x); r->y0 = MPMIN(r->y0, b->y);
@@ -1269,7 +1324,7 @@ gc_restart:
         struct gc_region *r = &regs[i];
         // Deferred runs are raw (unexpanded) per-glyph coverage, so they need
         // the blur halo padding (libass's exact expand amount).
-        r->margin = blur_expand_pad(MPMAX(r->blur_f, r->blur_b));
+        r->margin = blur_expand_pad(MPMAX(r->blur_f, r->blur_b)) + r->be;
         int rw = r->x1 - r->x0 + 2 * r->margin, rh = r->y1 - r->y0 + 2 * r->margin;
         if (r->nfill) ALLOC_REGION(r->fill_ax, r->fill_ay, rw, rh);
         if (r->nbord) ALLOC_REGION(r->bord_ax, r->bord_ay, rw, rh);
@@ -1349,6 +1404,14 @@ gc_restart:
             gc_blur_batch(p, entry->result_tex, p->result_tmp, ntiles, osd_blur_batch_h);
             gc_blur_batch(p, p->result_tmp, entry->result_tex, ntiles, osd_blur_batch_v);
         }
+    }
+    // 4b. \be edge-blur per be-region, on the result slots (after the gaussian,
+    // matching libass's gaussian-then-be order). Rare, so per-region not batched.
+    for (int i = 0; i < nregs; i++) {
+        REG_BWBH;
+        if (r->be <= 0) continue;
+        if (r->nfill) gc_be_blur(p, entry->result_tex, p->result_tmp, r->fill_ax, r->fill_ay, bw, bh, r->be);
+        if (r->nbord) gc_be_blur(p, entry->result_tex, p->result_tmp, r->bord_ax, r->bord_ay, bw, bh, r->be);
     }
     // 5. vector clip per clipped region, on the result slots (after blur).
     for (int i = 0; i < nregs; i++) {

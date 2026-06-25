@@ -83,6 +83,8 @@ struct sub_bitmap {
             // screen-x wipe_x, color2 to its right.
             uint32_t color2;
             int32_t wipe_x;
+            // Outline-mode \be: iterations of the [1,2,1]/4 box blur (0 = none).
+            int32_t be;
         } libass;
         struct {
             const struct sbr_output_image *image;
