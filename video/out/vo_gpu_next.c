@@ -903,6 +903,7 @@ static void gc_apply_clip(struct priv *p, pl_tex cov, int bw, int bh, int sox, i
 #define RUN_FLAG_CLIP_MASK    0x2  // libass ABI: this part is a vector-clip mask
 #define RUN_FLAG_CLIP_INVERSE 0x4  // the clip mask is inverse (\iclip)
 #define RUN_FLAG_KF_WIPE      0x8  // \kf fill: fill_color left of wipe_x, fill_color2 right
+#define RUN_FLAG_RECT_INVERSE 0x10 // \iclip rect: the clip rect is EXCLUDED, not visible
 static const char *const osd_raster_prelude =
     "float Hc(float t){ if (t<=0.0) return 0.0; if (t>=1.0) return t-0.5; return 0.5*t*t; }\n";
 // One dispatch for ALL glyphs: one 16x16 workgroup per work-list tile (avoids the
@@ -1369,35 +1370,52 @@ gc_restart:
             if (pass == 1 && r->nbord) { ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
             else if (pass == 0 && r->nfill) { ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
             else continue;
-            // Rectangular \clip: intersect the screen dst with the clip rect and
-            // shift src to match (no shader -- a plain rect crop on the overlay).
             int dx0 = r->x0 - r->margin, dy0 = r->y0 - r->margin;
             int dx1 = r->x1 + r->margin, dy1 = r->y1 + r->margin;
-            int cx0 = MPMAX(dx0, r->rcx0), cy0 = MPMAX(dy0, r->rcy0);
-            int cx1 = MPMIN(dx1, r->rcx1), cy1 = MPMIN(dy1, r->rcy1);
-            if (cx0 >= cx1 || cy0 >= cy1)
-                continue;   // fully clipped away
-            // \kf karaoke: split the fill at wipe_x into sung (fill_color, left)
-            // and unsung (fill_color2, right). Other runs emit one segment.
-            int sx0[2] = { cx0, 0 }, sx1[2] = { cx1, 0 };
-            uint32_t sc[2] = { c, 0 }; int nseg = 1;
-            if (pass == 0 && (r->run_flags & RUN_FLAG_KF_WIPE)) {
-                int w = MPMAX(cx0, MPMIN(cx1, r->wipe_x));
-                sx0[0] = cx0; sx1[0] = w;   sc[0] = r->fill_color;
-                sx0[1] = w;   sx1[1] = cx1; sc[1] = r->fill_color2;
-                nseg = 2;
+            // Rectangular \clip on the screen dst (no shader, a plain rect crop):
+            // normal \clip keeps one visible rect (the intersection); inverse
+            // \iclip subtracts the excluded rect, leaving up to 4 visible strips.
+            int vr[4][4]; int nvr = 0;
+            if (r->run_flags & RUN_FLAG_RECT_INVERSE) {
+                int ex0 = MPMAX(dx0, r->rcx0), ey0 = MPMAX(dy0, r->rcy0);
+                int ex1 = MPMIN(dx1, r->rcx1), ey1 = MPMIN(dy1, r->rcy1);
+                if (ex0 >= ex1 || ey0 >= ey1) {     // dst clear of the hole
+                    vr[nvr][0]=dx0; vr[nvr][1]=dy0; vr[nvr][2]=dx1; vr[nvr][3]=dy1; nvr++;
+                } else {
+                    if (dy0 < ey0) { vr[nvr][0]=dx0; vr[nvr][1]=dy0; vr[nvr][2]=dx1; vr[nvr][3]=ey0; nvr++; }
+                    if (ey1 < dy1) { vr[nvr][0]=dx0; vr[nvr][1]=ey1; vr[nvr][2]=dx1; vr[nvr][3]=dy1; nvr++; }
+                    if (dx0 < ex0) { vr[nvr][0]=dx0; vr[nvr][1]=ey0; vr[nvr][2]=ex0; vr[nvr][3]=ey1; nvr++; }
+                    if (ex1 < dx1) { vr[nvr][0]=ex1; vr[nvr][1]=ey0; vr[nvr][2]=dx1; vr[nvr][3]=ey1; nvr++; }
+                }
+            } else {
+                int cx0 = MPMAX(dx0, r->rcx0), cy0 = MPMAX(dy0, r->rcy0);
+                int cx1 = MPMIN(dx1, r->rcx1), cy1 = MPMIN(dy1, r->rcy1);
+                if (cx0 < cx1 && cy0 < cy1) { vr[0][0]=cx0; vr[0][1]=cy0; vr[0][2]=cx1; vr[0][3]=cy1; nvr=1; }
             }
-            for (int s = 0; s < nseg; s++) {
-                if (sx0[s] >= sx1[s]) continue;
-                uint32_t sg = sc[s];
-                struct pl_overlay_part part = {
-                    .src = { ax + (sx0[s] - dx0), ay + (cy0 - dy0),
-                             ax + (sx1[s] - dx0), ay + (cy1 - dy0) },
-                    .dst = { sx0[s], cy0, sx1[s], cy1 },
-                    .color = { (sg >> 24) / 255.0f, ((sg >> 16) & 0xFF) / 255.0f,
-                               ((sg >> 8) & 0xFF) / 255.0f, (255 - (sg & 0xFF)) / 255.0f },
-                };
-                MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
+            for (int v = 0; v < nvr; v++) {
+                int cx0 = vr[v][0], cy0 = vr[v][1], cx1 = vr[v][2], cy1 = vr[v][3];
+                // \kf karaoke: split the fill at wipe_x into sung (fill_color,
+                // left) and unsung (fill_color2, right). Else one segment.
+                int sx0[2] = { cx0, 0 }, sx1[2] = { cx1, 0 };
+                uint32_t sc[2] = { c, 0 }; int nseg = 1;
+                if (pass == 0 && (r->run_flags & RUN_FLAG_KF_WIPE)) {
+                    int w = MPMAX(cx0, MPMIN(cx1, r->wipe_x));
+                    sx0[0] = cx0; sx1[0] = w;   sc[0] = r->fill_color;
+                    sx0[1] = w;   sx1[1] = cx1; sc[1] = r->fill_color2;
+                    nseg = 2;
+                }
+                for (int s = 0; s < nseg; s++) {
+                    if (sx0[s] >= sx1[s]) continue;
+                    uint32_t sg = sc[s];
+                    struct pl_overlay_part part = {
+                        .src = { ax + (sx0[s] - dx0), ay + (cy0 - dy0),
+                                 ax + (sx1[s] - dx0), ay + (cy1 - dy0) },
+                        .dst = { sx0[s], cy0, sx1[s], cy1 },
+                        .color = { (sg >> 24) / 255.0f, ((sg >> 16) & 0xFF) / 255.0f,
+                                   ((sg >> 8) & 0xFF) / 255.0f, (255 - (sg & 0xFF)) / 255.0f },
+                    };
+                    MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
+                }
             }
         }
     }
