@@ -162,7 +162,6 @@ struct osd_state *osd_create(struct mpv_global *global)
     struct osd_state *osd = talloc_zero(NULL, struct osd_state);
     *osd = (struct osd_state) {
         .opts_cache = m_config_cache_alloc(osd, global, &mp_osd_render_sub_opts),
-        .sub_opts_cache = m_config_cache_alloc(osd, global, &mp_subtitle_sub_opts),
         .global = global,
         .log = mp_log_new(osd, global->log, "osd"),
         .force_video_pts = MP_NOPTS_VALUE,
@@ -170,7 +169,6 @@ struct osd_state *osd_create(struct mpv_global *global)
     };
     mp_mutex_init(&osd->lock);
     osd->opts = osd->opts_cache->opts;
-    osd->sub_opts = osd->sub_opts_cache->opts;
 
     for (int n = 0; n < MAX_OSD_PARTS; n++) {
         struct osd_object *obj = talloc(osd, struct osd_object);
@@ -322,13 +320,10 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
     int format = SUBBITMAP_LIBASS;
     // Prefer GPU-friendly output when the VO advertises it (sd_ass falls back to
     // plain LIBASS if the matching --sub-gpu-* option is off). Outlines are the
-    // most capable (GPU also rasterizes), then per-glyph coverage. For subtitles
-    // this follows --sub-gpu-raster via sd_ass; the OSD/OSC renderer (osd_libass)
-    // is put into the matching deferred mode directly when --sub-gpu-raster is on,
-    // so a heavy OSD (e.g. the 8K stats overlay) emits cheap outlines instead of
-    // re-rasterizing and re-uploading a full-screen atlas every redraw.
-    bool want_gpu = obj->is_sub || osd->sub_opts->sub_gpu_raster;
-    if (want_gpu && !osd->opts->force_rgba_osd) {
+    // most capable (GPU also rasterizes), then per-glyph coverage. ONLY for
+    // subtitles: the OSD/OSC renderer (osd_libass) runs in normal CPU-raster mode
+    // and carries no outline/glyph data, so it must stay on plain LIBASS.
+    if (obj->is_sub && !osd->opts->force_rgba_osd) {
         if (sub_formats[SUBBITMAP_LIBASS_GLYPHS])
             format = SUBBITMAP_LIBASS_GLYPHS;
         if (sub_formats[SUBBITMAP_LIBASS_OUTLINES])
@@ -524,7 +519,6 @@ void osd_changed(struct osd_state *osd)
     osd->want_redraw_notification = true;
     // Done here for a lack of a better place.
     m_config_cache_update(osd->opts_cache);
-    m_config_cache_update(osd->sub_opts_cache);
     mp_mutex_unlock(&osd->lock);
 }
 
