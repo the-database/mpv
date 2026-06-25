@@ -439,6 +439,7 @@ const struct m_sub_options mp_osd_render_sub_opts = {
         {"osd-selected-color", OPT_COLOR(osd_selected_color)},
         {"osd-selected-outline-color", OPT_COLOR(osd_selected_outline_color)},
         {"force-rgba-osd-rendering", OPT_BOOL(force_rgba_osd)},
+        {"osd-render-res-cap", OPT_INT(osd_render_res_cap), M_RANGE(0, 4320)},
         {"osd-prune-delay", OPT_DOUBLE(osd_ass_prune_delay), M_RANGE(-1.0, 10000.0)},
         {"osd-glyph-limit", OPT_INT(osd_glyph_limit)},
         {"osd-bitmap-max-size", OPT_INT(osd_bitmap_max_size)},
