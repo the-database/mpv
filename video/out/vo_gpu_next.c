@@ -151,7 +151,6 @@ struct priv {
     // format + reusable scratch. The composited per-run coverage goes into the
     // per-entry result atlas (entry->result_tex).
     pl_fmt osd_acc_fmt;        // r32f (storable) for the (legacy) per-region accumulator
-    pl_fmt osd_acc_ui;         // r32u for the atomic-add batched combine accumulator
     pl_tex run_acc;            // r32f combine accumulator (sized to max run)
     pl_tex run_tmp;            // r8 blur temp
     pl_tex run_cov_f, run_cov_b; // r8 per-run fill/border coverage (pre-copy)
@@ -711,6 +710,8 @@ struct gc_region {
     uint32_t fill_color2;        // \kf wipe: fill colour right of wipe_x
     int wipe_x;                  // \kf wipe boundary (screen x); used iff KF_WIPE
     int be;                      // \be: iterations of the [1,2,1]/4 box blur
+    int fill_gbase, fill_gcount; // multi-glyph run: glyph block in combwork_tex
+    int bord_gbase, bord_gcount;
 };
 
 // Combine a region's glyph list (saturating add) into run_acc at run-local
@@ -799,10 +800,8 @@ static void gc_blur_batch(struct priv *p, pl_tex src, pl_tex dst, int ntiles,
         pl_dispatch_abort(p->osd_dp, &sh);
 }
 
-// Batched combine: ONE dispatch over a part-tile work-list for ALL parts. Each
-// glyph's coverage is atomic-added (16-bit fixed point) into the uint accumulator,
-// so overlapping glyphs in a run accumulate correctly in a single dispatch -- no
-// per-part serialized dispatches (the recording cost that spiked dense frames).
+// Batched single-part combine: one dispatch over a part-tile work-list, plain
+// imageStore (single-part slots never overlap, so no read-add needed).
 static const char *const osd_combine_batch_body =
     "int wi = int(gl_WorkGroupID.y)*gridx + int(gl_WorkGroupID.x);\n"
     "if (wi >= ntiles) return;\n"
@@ -813,7 +812,7 @@ static const char *const osd_combine_batch_body =
     "int lx=int(t0.z)+int(gl_LocalInvocationID.x), ly=int(t0.w)+int(gl_LocalInvocationID.y);\n"
     "if (lx>=w || ly>=h) return;\n"
     "float cov = texelFetch(src, ivec2(sax+lx, say+ly), 0).r;\n"
-    "if (cov > 0.0) imageAtomicAdd(acc, ivec2(dx+lx, dy+ly), uint(cov*65535.0 + 0.5));\n";
+    "imageStore(acc, ivec2(dx+lx, dy+ly), vec4(cov, 0.0, 0.0, 0.0));\n";
 static void gc_combine_batch(struct priv *p, pl_tex atlas, pl_tex acc, int ntiles)
 {
     int ww = BLURWORK_W, gridx = MPMIN(ntiles, 32768), gridy = (ntiles+gridx-1)/gridx;
@@ -821,7 +820,7 @@ static void gc_combine_batch(struct priv *p, pl_tex atlas, pl_tex acc, int ntile
     struct pl_shader_desc descs[] = {
         { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 }, .binding={.object=atlas} },
         { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=1,
-                    .access=PL_DESC_ACCESS_READWRITE }, .binding={.object=acc} },
+                    .access=PL_DESC_ACCESS_WRITEONLY }, .binding={.object=acc} },
         { .desc = { .name="cw", .type=PL_DESC_SAMPLED_TEX, .binding=2 },
           .binding={.object=p->combwork_tex} },
     };
@@ -840,53 +839,49 @@ static void gc_combine_batch(struct priv *p, pl_tex atlas, pl_tex acc, int ntile
     else
         pl_dispatch_abort(p->osd_dp, &sh);
 }
-// Clear the uint accumulator, and resolve it to r8 coverage (sum/65535, clamped).
-static const char *const osd_clear_ui_body =
+// Per-run combine: ONE dispatch per multi-glyph run slot. Each output pixel loops
+// over the run's glyphs (block [gbase, gbase+gcount) in the glyph texture) and
+// sums their coverage -- one write per pixel, no atomics (replaces gcount
+// serialized read-add dispatches; the recording cost that spiked dense frames).
+static const char *const osd_combine_run_body =
     "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
-    "if (g.x < rw && g.y < rh) imageStore(acc, g, uvec4(0u));\n";
-static const char *const osd_resolve_ui_body =
-    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
-    "if (g.x < rw && g.y < rh)\n"
-    "    imageStore(dst, g, vec4(min(float(imageLoad(acc, g).r)/65535.0, 1.0), 0.0, 0.0, 0.0));\n";
-static void gc_clear_ui(struct priv *p, pl_tex acc, int rw, int rh)
+    "if (g.x >= bw || g.y >= bh) return;\n"
+    "float acc = 0.0;\n"
+    "for (int i = 0; i < gcount; i++) {\n"
+    "  int e = 2*(gbase+i);\n"
+    "  vec4 q0 = texelFetch(gl, ivec2(e%ww, e/ww), 0);\n"
+    "  vec4 q1 = texelFetch(gl, ivec2((e+1)%ww, (e+1)/ww), 0);\n"
+    "  int sax=int(q0.x), say=int(q0.y), dox=int(q0.z), doy=int(q0.w), w=int(q1.x), h=int(q1.y);\n"
+    "  int lx=g.x-dox, ly=g.y-doy;\n"
+    "  if (lx>=0 && ly>=0 && lx<w && ly<h) acc += texelFetch(src, ivec2(sax+lx, say+ly), 0).r;\n"
+    "}\n"
+    "imageStore(dst, ivec2(ax+g.x, ay+g.y), vec4(acc, 0.0, 0.0, 0.0));\n";
+static void gc_combine_run(struct priv *p, pl_tex atlas, pl_tex acc, int ax, int ay,
+                           int bw, int bh, int gbase, int gcount)
 {
+    int ww = BLURWORK_W;
     pl_shader sh = pl_dispatch_begin(p->osd_dp);
     struct pl_shader_desc descs[] = {
-        { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=0,
-                    .access=PL_DESC_ACCESS_WRITEONLY }, .binding={.object=acc} },
-    };
-    struct pl_shader_var vars[] = {
-        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
-    };
-    struct pl_custom_shader cs = {
-        .compute = true, .compute_group_size = {16, 16}, .descriptors = descs,
-        .num_descriptors = 1, .variables = vars, .num_variables = 2, .body = osd_clear_ui_body,
-    };
-    if (pl_shader_custom(sh, &cs))
-        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
-            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
-    else
-        pl_dispatch_abort(p->osd_dp, &sh);
-}
-static void gc_resolve_ui(struct priv *p, pl_tex acc, pl_tex dst, int rw, int rh)
-{
-    pl_shader sh = pl_dispatch_begin(p->osd_dp);
-    struct pl_shader_desc descs[] = {
-        { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=0,
-                    .access=PL_DESC_ACCESS_READONLY }, .binding={.object=acc} },
+        { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 }, .binding={.object=atlas} },
         { .desc = { .name="dst", .type=PL_DESC_STORAGE_IMG, .binding=1,
-                    .access=PL_DESC_ACCESS_WRITEONLY }, .binding={.object=dst} },
+                    .access=PL_DESC_ACCESS_WRITEONLY }, .binding={.object=acc} },
+        { .desc = { .name="gl", .type=PL_DESC_SAMPLED_TEX, .binding=2 },
+          .binding={.object=p->combwork_tex} },
     };
     struct pl_shader_var vars[] = {
-        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
+        { .var = pl_var_int("ax"), .data=&ax }, { .var = pl_var_int("ay"), .data=&ay },
+        { .var = pl_var_int("bw"), .data=&bw }, { .var = pl_var_int("bh"), .data=&bh },
+        { .var = pl_var_int("gbase"), .data=&gbase }, { .var = pl_var_int("gcount"), .data=&gcount },
+        { .var = pl_var_int("ww"), .data=&ww },
     };
     struct pl_custom_shader cs = {
-        .compute = true, .compute_group_size = {16, 16}, .descriptors = descs,
-        .num_descriptors = 2, .variables = vars, .num_variables = 2, .body = osd_resolve_ui_body,
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 3,
+        .variables = vars, .num_variables = 7, .body = osd_combine_run_body,
     };
     if (pl_shader_custom(sh, &cs))
         pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
-            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+            .shader = &sh, .dispatch_size = { (bw+15)/16, (bh+15)/16, 1 }));
     else
         pl_dispatch_abort(p->osd_dp, &sh);
 }
@@ -1151,7 +1146,6 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     pl_gpu gpu = p->gpu;
     pl_fmt r8 = p->osd_fmt[SUBBITMAP_LIBASS];
     if (!r8 || !p->osd_acc_fmt || !(p->osd_acc_fmt->caps & PL_FMT_CAP_STORABLE) ||
-        !p->osd_acc_ui || !(p->osd_acc_ui->caps & PL_FMT_CAP_STORABLE) ||
         !(r8->caps & PL_FMT_CAP_STORABLE))
         return;
     int64_t _ts = mp_time_ns();
@@ -1434,7 +1428,7 @@ gc_restart:
     int atlas_w = MPMAX(max_w, 1), atlas_h = MPMAX(shelf_y + shelf_h, 1);
 
     if (!gc_ensure(gpu, &entry->result_tex, r8, atlas_w, atlas_h, true, true, false, false, false) ||
-        !gc_ensure(gpu, &p->result_acc, p->osd_acc_ui, atlas_w, atlas_h, true, false, false, false, false) ||
+        !gc_ensure(gpu, &p->result_acc, p->osd_acc_fmt, atlas_w, atlas_h, true, false, false, false, false) ||
         !gc_ensure(gpu, &p->result_tmp, r8, atlas_w, atlas_h, true, true, false, false, false)) {
         talloc_free(tmp);
         return;
@@ -1446,26 +1440,31 @@ gc_restart:
     // dispatches over a slot-tile work-list.
     #define REG_BWBH struct gc_region *r = &regs[i]; \
         int bw = r->x1 - r->x0 + 2*r->margin, bh = r->y1 - r->y0 + 2*r->margin
-    // 1. clear the uint accumulator, then atomic-add EVERY part into its slot in
-    //    ONE batched dispatch over a part-tile work-list (overlapping glyphs in a
-    //    run accumulate atomically -- no per-part serialized dispatches).
-    gc_clear_ui(p, p->result_acc, atlas_w, atlas_h);
-    int cnt = 0;
+    // 1. clear the accumulator. Single-part slots batch into ONE imageStore
+    //    dispatch (no overlap). Multi-glyph runs get ONE per-run dispatch each
+    //    that sums their glyphs per pixel (no atomics, no per-part dispatches).
+    //    Both layouts share combwork_tex: [single-part tiles][run glyph entries].
+    osd_clear(p, p->result_acc, atlas_w, atlas_h);
+    // count single-part tiles + total multi-glyph parts (each = one tex pair).
+    int ntiles_sp = 0, nglyph = 0;
     for (int i = 0; i < nregs; i++) {
         struct gc_region *r = &regs[i];
-        for (int k = 0; k < r->nfill; k++) { const struct sub_bitmap *b = &item->parts[r->fill[k]];
-            cnt += ((b->w+15)/16) * ((b->h+15)/16); }
-        for (int k = 0; k < r->nbord; k++) { const struct sub_bitmap *b = &item->parts[r->bord[k]];
-            cnt += ((b->w+15)/16) * ((b->h+15)/16); }
+        int nf = r->nfill, nb = r->nbord;
+        if (nf == 1) { const struct sub_bitmap *b = &item->parts[r->fill[0]];
+            ntiles_sp += ((b->w+15)/16)*((b->h+15)/16); } else nglyph += nf;
+        if (nb == 1) { const struct sub_bitmap *b = &item->parts[r->bord[0]];
+            ntiles_sp += ((b->w+15)/16)*((b->h+15)/16); } else nglyph += nb;
     }
-    if (cnt) {
-        int cwh = (2*cnt + BLURWORK_W - 1) / BLURWORK_W;
+    int total_pairs = ntiles_sp + nglyph;
+    if (total_pairs) {
+        int cwh = (2*total_pairs + BLURWORK_W - 1) / BLURWORK_W;
         size_t need = (size_t) BLURWORK_W * cwh * 4;
         if ((size_t) p->cwbuf_cap < need) {
             p->cwbuf_cap = need; p->cwbuf = talloc_realloc(p, p->cwbuf, float, p->cwbuf_cap);
         }
+        // [0, ntiles_sp): single-part tiles. [ntiles_sp, total): run glyph entries.
         int ci = 0;
-        #define ADD_COMB(SAX, SAY, DX, DY, W, H) do {                          \
+        #define ADD_TILE(SAX, SAY, DX, DY, W, H) do {                          \
             int txs=((W)+15)/16, tys=((H)+15)/16;                              \
             for (int ty=0; ty<tys; ty++) for (int tx=0; tx<txs; tx++) {        \
                 float *w0 = &p->cwbuf[(2*ci)*4];                              \
@@ -1473,27 +1472,56 @@ gc_restart:
                 w0[4]=(DX);  w0[5]=(DY);  w0[6]=(W);   w0[7]=(H); ci++; } } while (0)
         for (int i = 0; i < nregs; i++) {
             struct gc_region *r = &regs[i];
-            for (int k = 0; k < r->nfill; k++) { const struct sub_bitmap *b = &item->parts[r->fill[k]];
-                ADD_COMB(cpos[r->fill[k]].ax, cpos[r->fill[k]].ay,
+            if (r->nfill == 1) { const struct sub_bitmap *b = &item->parts[r->fill[0]];
+                ADD_TILE(cpos[r->fill[0]].ax, cpos[r->fill[0]].ay,
                          r->fill_ax + b->x - r->x0 + r->margin,
                          r->fill_ay + b->y - r->y0 + r->margin, b->w, b->h); }
-            for (int k = 0; k < r->nbord; k++) { const struct sub_bitmap *b = &item->parts[r->bord[k]];
-                ADD_COMB(cpos[r->bord[k]].ax, cpos[r->bord[k]].ay,
+            if (r->nbord == 1) { const struct sub_bitmap *b = &item->parts[r->bord[0]];
+                ADD_TILE(cpos[r->bord[0]].ax, cpos[r->bord[0]].ay,
                          r->bord_ax + b->x - r->x0 + r->margin,
                          r->bord_ay + b->y - r->y0 + r->margin, b->w, b->h); }
         }
-        #undef ADD_COMB
+        #undef ADD_TILE
+        // glyph entries for multi-glyph runs; record each run's [gbase, gcount).
+        int gi = ntiles_sp;
+        #define ADD_GLYPH(SAX, SAY, DOX, DOY, W, H) do {                       \
+            float *w0 = &p->cwbuf[(2*gi)*4];                                  \
+            w0[0]=(SAX); w0[1]=(SAY); w0[2]=(DOX); w0[3]=(DOY);               \
+            w0[4]=(W);   w0[5]=(H);   w0[6]=0;     w0[7]=0; gi++; } while (0)
+        for (int i = 0; i < nregs; i++) {
+            struct gc_region *r = &regs[i];
+            if (r->nfill > 1) { r->fill_gbase = gi; r->fill_gcount = r->nfill;
+                for (int k = 0; k < r->nfill; k++) { const struct sub_bitmap *b = &item->parts[r->fill[k]];
+                    ADD_GLYPH(cpos[r->fill[k]].ax, cpos[r->fill[k]].ay,
+                              b->x - r->x0 + r->margin, b->y - r->y0 + r->margin, b->w, b->h); } }
+            if (r->nbord > 1) { r->bord_gbase = gi; r->bord_gcount = r->nbord;
+                for (int k = 0; k < r->nbord; k++) { const struct sub_bitmap *b = &item->parts[r->bord[k]];
+                    ADD_GLYPH(cpos[r->bord[k]].ax, cpos[r->bord[k]].ay,
+                              b->x - r->x0 + r->margin, b->y - r->y0 + r->margin, b->w, b->h); } }
+        }
+        #undef ADD_GLYPH
         pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
         if (ef && gc_ensure(gpu, &p->combwork_tex, ef, BLURWORK_W, cwh, false, true, false, false, true)) {
             pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->combwork_tex,
                 .rc = { .x1 = BLURWORK_W, .y1 = cwh },
                 .row_pitch = (size_t) BLURWORK_W * 4 * sizeof(float), .ptr = p->cwbuf));
-            gc_combine_batch(p, p->glyph_atlas, p->result_acc, cnt);
+            if (ntiles_sp)
+                gc_combine_batch(p, p->glyph_atlas, p->result_acc, ntiles_sp);
+            for (int i = 0; i < nregs; i++) {
+                REG_BWBH;
+                if (r->nfill > 1)
+                    gc_combine_run(p, p->glyph_atlas, p->result_acc, r->fill_ax, r->fill_ay,
+                                   bw, bh, r->fill_gbase, r->fill_gcount);
+                if (r->nbord > 1)
+                    gc_combine_run(p, p->glyph_atlas, p->result_acc, r->bord_ax, r->bord_ay,
+                                   bw, bh, r->bord_gbase, r->bord_gcount);
+            }
         }
     }
     STAGE(dbg_combine);
     // 2. resolve the whole accumulator to r8 coverage in one dispatch.
-    gc_resolve_ui(p, p->result_acc, entry->result_tex, atlas_w, atlas_h);
+    osd_unop(p, p->result_acc, entry->result_tex, atlas_w, atlas_h,
+             "acc", false, "dst", osd_resolve_body);
     // 3. fix_outline per bordered region (few), on the result slots.
     for (int i = 0; i < nregs; i++) {
         REG_BWBH;
@@ -3763,7 +3791,6 @@ static int preinit(struct vo *vo)
     p->osd_fmt[SUBBITMAP_LIBASS_GLYPHS] = p->osd_fmt[SUBBITMAP_LIBASS];
     p->osd_fmt[SUBBITMAP_LIBASS_OUTLINES] = p->osd_fmt[SUBBITMAP_LIBASS];
     p->osd_acc_fmt = pl_find_named_fmt(p->gpu, "r32f");
-    p->osd_acc_ui = pl_find_named_fmt(p->gpu, "r32u");
     p->osd_sync = 1;
 
     p->pars = pl_options_alloc(p->pllog);
