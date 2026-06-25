@@ -1151,6 +1151,11 @@ gc_restart:
             gc_raster_batch(p, ntiles);
         }
     }
+    // DIAGNOSTIC (MPV_RASTER_SYNC=1): force the GPU to finish the raster before the
+    // combine reads the atlas. Heavy (full stall) -- only to test whether the
+    // intermittent real-GPU coverage corruption is a raster->combine sync gap.
+    if (getenv("MPV_RASTER_SYNC"))
+        pl_gpu_finish(p->gpu);
 
     // Flush the misses: tight-repack into a CPU scratch, one async buffer write,
     // then per-glyph async texture uploads (buffer-backed = no VO-thread stall).
