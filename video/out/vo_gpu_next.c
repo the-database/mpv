@@ -178,8 +178,6 @@ struct priv {
     float *bwbuf; int bwbuf_cap;             // CPU blur work-list scratch (vec4 units)
     pl_tex combwork_tex;                     // batched single-part combine work-list
     float *cwbuf; int cwbuf_cap;             // CPU combine work-list scratch
-    // TEMP per-stage compose timers (ns), accumulated across items, emitted as MP_STATS.
-    int64_t dbg_raster, dbg_combine, dbg_resfix, dbg_blur2, dbg_clip2, dbg_emit;
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -1148,8 +1146,6 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     if (!r8 || !p->osd_acc_fmt || !(p->osd_acc_fmt->caps & PL_FMT_CAP_STORABLE) ||
         !(r8->caps & PL_FMT_CAP_STORABLE))
         return;
-    int64_t _ts = mp_time_ns();
-    #define STAGE(field) do { int64_t _n = mp_time_ns(); p->field += _n - _ts; _ts = _n; } while (0)
 
     // Persistent glyph cache: ensure the atlas + map, reset if near-full, then
     // upload only the cache-miss glyphs (the per-frame bandwidth win).
@@ -1359,7 +1355,6 @@ gc_restart:
     int max_run = 0;
     for (int i = 0; i < item->num_parts; i++)
         max_run = MPMAX(max_run, (int) item->parts[i].libass.run_id);
-    STAGE(dbg_raster);
     int *idx = talloc_array(tmp, int, max_run + 1);
     for (int i = 0; i <= max_run; i++) idx[i] = -1;
 
@@ -1518,7 +1513,6 @@ gc_restart:
             }
         }
     }
-    STAGE(dbg_combine);
     // 2. resolve the whole accumulator to r8 coverage in one dispatch.
     osd_unop(p, p->result_acc, entry->result_tex, atlas_w, atlas_h,
              "acc", false, "dst", osd_resolve_body);
@@ -1529,7 +1523,6 @@ gc_restart:
             gc_fixoutline_slot(p, entry->result_tex, r->bord_ax, r->bord_ay,
                                r->fill_ax, r->fill_ay, bw, bh);
     }
-    STAGE(dbg_resfix);
     // 4. batched separable blur: one slot-tile work-list, two dispatches.
     int ntiles = 0;
     for (int i = 0; i < nregs; i++) {
@@ -1572,7 +1565,6 @@ gc_restart:
         if (r->nfill) gc_be_blur(p, entry->result_tex, p->result_tmp, r->fill_ax, r->fill_ay, bw, bh, r->be);
         if (r->nbord) gc_be_blur(p, entry->result_tex, p->result_tmp, r->bord_ax, r->bord_ay, bw, bh, r->be);
     }
-    STAGE(dbg_blur2);
     // 5. vector clip per clipped region, on the result slots (after blur).
     for (int i = 0; i < nregs; i++) {
         REG_BWBH;
@@ -1580,7 +1572,6 @@ gc_restart:
         if (r->nbord) gc_apply_clip(p, entry->result_tex, bw, bh, r->bord_ax, r->bord_ay, r, clips, nclips);
         if (r->nfill) gc_apply_clip(p, entry->result_tex, bw, bh, r->fill_ax, r->fill_ay, r, clips, nclips);
     }
-    STAGE(dbg_clip2);
     #undef REG_BWBH
 
     // Emit one monochrome overlay preserving libass's z-order: regions in
@@ -1657,8 +1648,6 @@ gc_restart:
     };
     if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
         ol->color = src->params.color;
-    STAGE(dbg_emit);
-    #undef STAGE
 }
 
 static void update_overlays(struct vo *vo, struct mp_osd_res res,
@@ -1687,8 +1676,6 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     int64_t dbg_t0 = mp_time_ns();
     int64_t dbg_upload = 0, dbg_blur = 0;
     int64_t dbg_area = 0, dbg_parts = 0, dbg_aw = 0, dbg_ah = 0;
-    p->dbg_raster = p->dbg_combine = p->dbg_resfix = 0;
-    p->dbg_blur2 = p->dbg_clip2 = p->dbg_emit = 0;
 
     for (int n = 0; n < subs->num_items; n++) {
         const struct sub_bitmaps *item = subs->items[n];
@@ -1927,24 +1914,14 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         }
     }
 
-    // --- TEMP instrumentation emit (only for non-trivial overlay frames) ---
-    // Gate on total compose time, NOT dbg_parts (which is the legacy-path count,
-    // 0 for outline-mode frames -- the dense ones we actually care about).
+    // --- overlay timing emit (only for non-trivial overlay frames) ---
     int64_t dbg_total = mp_time_ns() - dbg_t0;
-    int64_t dbg_stage_sum = p->dbg_raster + p->dbg_combine + p->dbg_resfix +
-                            p->dbg_blur2 + p->dbg_clip2 + p->dbg_emit;
-    if (dbg_total > 2000000 || dbg_stage_sum > 2000000) {
+    if (dbg_total > 2000000) {
         MP_STATS(vo, "value %f osd-total-ms",  dbg_total  / 1e6);
         MP_STATS(vo, "value %f osd-upload-ms", dbg_upload / 1e6);
         MP_STATS(vo, "value %f osd-blur-ms",   dbg_blur   / 1e6);
         MP_STATS(vo, "value %f osd-parts",     (double) dbg_parts);
         MP_STATS(vo, "value %f osd-atlas-mpx", (double) dbg_aw * dbg_ah / 1e6);
-        MP_STATS(vo, "value %f osd-raster-ms",  p->dbg_raster  / 1e6);
-        MP_STATS(vo, "value %f osd-combine-ms", p->dbg_combine / 1e6);
-        MP_STATS(vo, "value %f osd-resfix-ms",  p->dbg_resfix  / 1e6);
-        MP_STATS(vo, "value %f osd-gblur-ms",   p->dbg_blur2   / 1e6);
-        MP_STATS(vo, "value %f osd-vclip-ms",   p->dbg_clip2   / 1e6);
-        MP_STATS(vo, "value %f osd-emit-ms",    p->dbg_emit    / 1e6);
     }
 
     talloc_free(subs);
