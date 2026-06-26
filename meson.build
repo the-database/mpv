@@ -474,9 +474,9 @@ features += {'rfork': cc.has_header_symbol('unistd.h', 'rfork_thread')}
 # links a probe, which can spuriously fail against a static libass whose
 # transitive deps aren't all on the probe link line (e.g. mingw cross builds),
 # silently compiling out the call. Meson compiler checks only accept external
-# dependencies here; internal fallback libass is the upstream subproject and
-# does not currently expose this extension.
-ass_render_thread_count = false
+# dependencies here; the internal fallback is the project libass fork and
+# carries this extension.
+ass_render_thread_count = libass.type_name() == 'internal'
 if libass.type_name() != 'internal'
     ass_render_thread_count = cc.has_header_symbol('ass/ass.h', 'ass_set_render_thread_count',
                                                   dependencies: libass)
