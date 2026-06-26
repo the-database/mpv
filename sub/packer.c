@@ -329,9 +329,10 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->libass.wipe_x = img->wipe_x;
             b->libass.be = img->be;
             if (format == SUBBITMAP_LIBASS_OUTLINES && img->n_outline > 0) {
-                // Own a copy: the libass segment data is only valid for this frame.
+                // Own a copy: the tile-export blob is only valid for this frame.
+                // n_outline is the int32 count of the blob ([n_tiles, n_segs, ...]).
                 b->libass.outline = ta_memdup(p->seg_ctx, (void *) img->outline,
-                                              (size_t) img->n_outline * 4 * sizeof(int32_t));
+                                              (size_t) img->n_outline * sizeof(int32_t));
                 b->libass.n_outline = img->n_outline;
                 b->bitmap = NULL;
                 b->stride = 0;
