@@ -1828,14 +1828,20 @@ major = client_h_define.split('|')[0].split('<<')[0].strip('() ')
 minor = client_h_define.split('|')[1].strip('() ')
 client_api_version = major + '.' + minor + '.0'
 
-libmpv = library('mpv', sources, dependencies: dependencies, gnu_symbol_visibility: 'hidden',
-                 include_directories: incdir_public,
-                 link_args: cc.get_supported_link_arguments(['-Wl,-Bsymbolic']),
-                 version: client_api_version, install: get_option('libmpv'),
-                 build_by_default: get_option('libmpv'))
+libmpv_static = static_library('mpv-internal', sources, dependencies: dependencies,
+                               gnu_symbol_visibility: 'hidden',
+                               include_directories: incdir_public,
+                               build_by_default: get_option('cplayer'))
 
 
 if get_option('libmpv')
+    libmpv = shared_library('mpv', sources, dependencies: dependencies,
+                            gnu_symbol_visibility: 'hidden',
+                            include_directories: incdir_public,
+                            link_args: cc.get_supported_link_arguments(['-Wl,-Bsymbolic']),
+                            version: client_api_version, install: true,
+                            build_by_default: true)
+
     pkg = import('pkgconfig')
     pkg.generate(libmpv, version: client_api_version,
                  description: 'mpv media player client library')
@@ -1880,7 +1886,7 @@ if get_option('cplayer')
     install_data('etc/mpv-symbolic.svg', install_tag: 'xdg',
                  install_dir: join_paths(hicolor_dir, 'symbolic', 'apps'))
 
-    mpv = executable('mpv', main_fn_source, objects: libmpv.extract_all_objects(recursive: true), dependencies: dependencies,
+    mpv = executable('mpv', main_fn_source, objects: libmpv_static.extract_all_objects(recursive: true), dependencies: dependencies,
                      win_subsystem: get_option('win32-subsystem'), install: true)
 
     if win32

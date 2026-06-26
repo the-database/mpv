@@ -301,7 +301,7 @@ clone-recursive = true
 
 meson setup build `
     --wrap-mode=forcefallback `
-    -Ddefault_library=both `
+    -Ddefault_library=static `
     -Dc_args="-I$amfExtractPath" `
     -Dlibmpv=true `
     -Dtests=true `
