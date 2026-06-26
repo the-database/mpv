@@ -1071,15 +1071,9 @@ static const char *const osd_raster_body =
     "vec4 hd = texelFetch(hdrs, ivec2(h % hw, h / hw), 0);\n"
     "int off = int(hd.x), cnt = int(hd.y);\n"
     "float acc = 0.0;\n"
-    "bool corner = false;\n"
     "for (int i = 0; i < cnt; i++) {\n"
     "    int e = off + i;\n"
     "    vec4 ed = texelFetch(edges, ivec2(e % ew, e / ew), 0);\n"
-    // A vertex (edge endpoint) inside this pixel marks a corner: that's where
-    // the per-edge analytic area mis-estimates non-zero-winding coverage.
-    "    if ((ed.x >= px && ed.x < px + 1.0 && ed.y >= py && ed.y < py + 1.0) ||\n"
-    "        (ed.z >= px && ed.z < px + 1.0 && ed.w >= py && ed.w < py + 1.0))\n"
-    "        corner = true;\n"
     "    float ya = ed.y, yb = ed.w;\n"
     "    if (ya == yb) continue;\n"
     "    float dir = yb > ya ? 1.0 : -1.0;\n"
@@ -1102,37 +1096,7 @@ static const char *const osd_raster_body =
     "    else area = L * (Hc(f1) - Hc(f0)) / (f1 - f0);\n"
     "    acc += dir * area;\n"
     "}\n"
-    // The per-edge analytic area is exact on smooth edges and solid corners, but
-    // where two edges meet inside one pixel and bound a *thin* region (a border's
-    // inner corner, a counter apex) the winding subtraction mis-estimates by up
-    // to ~18/255 -- a visible notch on thin high-contrast outlines. Resolve those
-    // vertex pixels (rare, ~one per corner) by 8x8 supersampled inside-test; the
-    // smooth-edge analytic path is untouched. Matches libass to <=2/255.
-    // Only resolve a corner pixel when its analytic coverage is actually partial:
-    // a vertex pixel that's already fully covered or fully empty (interior of a
-    // thick fill, overlapping drawings) is correct as-is, so skip the 8x8 work
-    // there. Bounds the cost to partial-coverage corner pixels.
-    "float cov = clamp(abs(acc), 0.0, 1.0);\n"
-    "if (corner && cov > 0.004 && cov < 0.996) {\n"
-    "    int ins = 0;\n"
-    "    for (int sj = 0; sj < 8; sj++)\n"
-    "    for (int si = 0; si < 8; si++) {\n"
-    "        float sx = px + (float(si) + 0.5) * 0.125;\n"
-    "        float sy = py + (float(sj) + 0.5) * 0.125;\n"
-    "        int wind = 0;\n"
-    "        for (int i = 0; i < cnt; i++) {\n"
-    "            int e = off + i;\n"
-    "            vec4 ed = texelFetch(edges, ivec2(e % ew, e / ew), 0);\n"
-    "            float ya = ed.y, yb = ed.w;\n"
-    "            if ((ya <= sy) == (yb <= sy)) continue;\n"
-    "            float xc = ed.x + (ed.z - ed.x) * (sy - ya) / (yb - ya);\n"
-    "            if (sx < xc) wind += yb > ya ? 1 : -1;\n"
-    "        }\n"
-    "        if (wind != 0) ins++;\n"
-    "    }\n"
-    "    cov = float(ins) * (1.0 / 64.0);\n"
-    "}\n"
-    "imageStore(dst, ivec2(ax + lpx, ay + lpy), vec4(cov, 0.0, 0.0, 0.0));\n";
+    "imageStore(dst, ivec2(ax + lpx, ay + lpy), vec4(clamp(abs(acc), 0.0, 1.0), 0.0, 0.0, 0.0));\n";
 
 // Rasterize ALL collected glyphs in one dispatch: ntiles 16x16 work-list tiles.
 static void gc_raster_batch(struct priv *p, int ntiles)
