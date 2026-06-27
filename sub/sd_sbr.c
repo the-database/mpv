@@ -170,7 +170,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
 }
 
 static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
-                                       int format, double pts)
+                                       int format, double pts, int draw_flags)
 {
     struct sd_sbr_priv *ctx = sd->priv;
     struct mp_subtitle_opts *opts = sd->opts;
