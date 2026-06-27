@@ -2805,6 +2805,26 @@ Subtitles
     canvas size. Can be useful to test broken subtitles, which often happen
     when the video was transcoded, while attempting to keep the old subtitles.
 
+``--sub-render-res-limit=<0-16384>``
+    Cap the resolution at which text (ASS/SRT) subtitles are rasterized, given as
+    the maximum length in pixels of the *shorter* output dimension (default: 0,
+    meaning no limit). For standard landscape video the shorter dimension is the
+    height, so e.g. ``--sub-render-res-limit=2160`` rasterizes subtitles as if the
+    output were 2160p tall, regardless of the real display size.
+
+    When the output is larger than the limit, subtitles are rendered at the capped
+    (smaller) resolution and the resulting overlay is upscaled to the display size
+    by the GPU. Because rasterization cost scales with pixel area, this can greatly
+    reduce subtitle rendering cost on very high resolution outputs (e.g. 8K), at the
+    expense of slightly softer subtitle edges. The downscale is uniform, so the
+    aspect ratio is always preserved.
+
+    This only affects the subtitle overlay drawn with ``--blend-subtitles=no`` (the
+    default). With ``--blend-subtitles=yes`` or ``=video`` (and subtitles rendered
+    into the video by the ``sub`` video filter), subtitles are rendered at full
+    resolution as before. The limit also has no effect when the output's shorter
+    dimension is already at or below it (e.g. a 4K display with a limit of 2160).
+
 ``--image-subs-hdr-peak=<sdr|video|video-static|video-dynamic|10-10000>``
     Controls the image subtitle diffuse white level in cd/m² (nits) for HDR
     videos (default: 1000). ``sdr`` is 203 cd/m² for standard SDR white,
