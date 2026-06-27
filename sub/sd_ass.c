@@ -723,7 +723,7 @@ static long long find_timestamp(struct sd *sd, double pts)
 #undef END
 
 static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
-                                       int format, double pts)
+                                       int format, double pts, int draw_flags)
 {
     struct sd_ass_priv *ctx = sd->priv;
     struct mp_subtitle_opts *opts = sd->opts;
@@ -735,9 +735,31 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     ASS_Renderer *renderer = ctx->ass_renderer;
     struct sub_bitmaps *res = &(struct sub_bitmaps){0};
 
-    // Always update the osd_res
+    // Optionally cap the rasterization resolution and let the consumer GPU-upscale
+    // the overlay (rasterization cost scales with area). Only free/safe for the plain
+    // sub overlay (--blend-subtitles=no); skip when subs are pre-blended into the video
+    // (OSD_DRAW_SUB_ONLY: blend-subtitles=yes/video and the vf=sub filter).
+    struct mp_osd_res rdim = dim;
+    bool capped = false;
+    int limit = opts->sub_render_res_limit;
+    if (limit > 0 && !(draw_flags & OSD_DRAW_SUB_ONLY)) {
+        int shortest = MPMIN(dim.w, dim.h);
+        if (shortest > limit) {
+            double s = (double)limit / shortest;
+            rdim.w  = MPMAX(1, lrint(dim.w  * s));
+            rdim.h  = MPMAX(1, lrint(dim.h  * s));
+            rdim.ml = lrint(dim.ml * s);
+            rdim.mr = lrint(dim.mr * s);
+            rdim.mt = lrint(dim.mt * s);
+            rdim.mb = lrint(dim.mb * s);
+            capped = true;
+        }
+    }
+
+    // Always update the osd_res (store the render dims, so a change of either the
+    // display size or the resolution cap triggers an ass reconfigure below).
     struct mp_osd_res old_osd = ctx->osd;
-    ctx->osd = dim;
+    ctx->osd = rdim;
 
     if (pts == MP_NOPTS_VALUE || !renderer)
         goto done;
@@ -760,7 +782,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
             scale *= par;
     }
     if (!ctx->ass_configured || !osd_res_equals(old_osd, ctx->osd)) {
-        configure_ass(sd, &dim, converted, track);
+        configure_ass(sd, &rdim, converted, track);
         ctx->ass_configured = true;
     }
     ass_set_pixel_aspect(renderer, scale);
@@ -783,6 +805,16 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
 done:
     // mangle_colors() modifies the color field, so copy the thing _before_.
     res = sub_bitmaps_copy(&ctx->copy_cache, res);
+
+    // Upscale the overlay rendered at the capped resolution back to the display
+    // size. Operate on the fresh copy (not the packer's cached parts) to avoid
+    // compounding the scale across frames. Pure uniform resize: no PAR
+    // compensation and zero margins (libass already baked the scaled margins in).
+    if (res && capped) {
+        osd_rescale_bitmaps(res, rdim.w, rdim.h,
+            (struct mp_osd_res){ .w = dim.w, .h = dim.h,
+                                 .display_par = dim.display_par }, 0);
+    }
 
     if (!converted && res)
         mangle_colors(sd, res);
