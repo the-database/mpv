@@ -309,6 +309,7 @@ const struct m_sub_options mp_subtitle_sub_opts = {
         {"stretch-dvd-subs", OPT_BOOL(stretch_dvd_subs)},
         {"stretch-image-subs-to-screen", OPT_BOOL(stretch_image_subs)},
         {"image-subs-video-resolution", OPT_BOOL(image_subs_video_res)},
+        {"sub-render-res-limit", OPT_INT(sub_render_res_limit), M_RANGE(0, 16384)},
         {"sub-fix-timing", OPT_BOOL(sub_fix_timing)},
         {"sub-fix-timing-threshold", OPT_INT(sub_fix_timing_threshold)},
         {"sub-fix-timing-keep", OPT_INT(sub_fix_timing_keep)},
