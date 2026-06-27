@@ -315,6 +315,7 @@ void osd_resize(struct osd_state *osd, struct mp_osd_res res)
 static struct sub_bitmaps *render_object(struct osd_state *osd,
                                          struct osd_object *obj,
                                          struct mp_osd_res osdres, double video_pts,
+                                         int draw_flags,
                                          const bool sub_formats[SUBBITMAP_COUNT])
 {
     int format = SUBBITMAP_LIBASS;
@@ -327,10 +328,10 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
 
     if (obj->type == OSDTYPE_SUB) {
         if (obj->sub && sub_is_primary_visible(obj->sub))
-            res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
+            res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts, draw_flags);
     } else if (obj->type == OSDTYPE_SUB2) {
         if (obj->sub && sub_is_secondary_visible(obj->sub))
-            res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
+            res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts, draw_flags);
     } else if (obj->type == OSDTYPE_EXTERNAL2) {
         if (obj->external2 && obj->external2->format) {
             res = sub_bitmaps_copy(NULL, obj->external2); // need to be owner
@@ -395,7 +396,7 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
         stats_time_start(osd->stats, stat_type_render);
 
         struct sub_bitmaps *imgs =
-            render_object(osd, obj, res, video_pts, formats);
+            render_object(osd, obj, res, video_pts, draw_flags, formats);
 
         stats_time_end(osd->stats, stat_type_render);
 

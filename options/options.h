@@ -102,6 +102,7 @@ struct mp_subtitle_opts {
     bool stretch_dvd_subs;
     bool stretch_image_subs;
     bool image_subs_video_res;
+    int sub_render_res_limit;
     bool sub_fix_timing;
     int sub_fix_timing_threshold;
     int sub_fix_timing_keep;

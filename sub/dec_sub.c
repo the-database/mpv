@@ -420,7 +420,7 @@ void sub_redecode_cached_packets(struct dec_sub *sub)
 
 // Unref sub_bitmaps.rc to free the result. May return NULL.
 struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
-                                    int format, double pts)
+                                    int format, double pts, int draw_flags)
 {
     mp_mutex_lock(&sub->lock);
 
@@ -433,7 +433,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
 
     if (!(sub->end != MP_NOPTS_VALUE && pts >= sub->end) &&
         sub->sd->driver->get_bitmaps)
-        res = sub->sd->driver->get_bitmaps(sub->sd, dim, format, pts);
+        res = sub->sd->driver->get_bitmaps(sub->sd, dim, format, pts, draw_flags);
 
     mp_mutex_unlock(&sub->lock);
     return res;
