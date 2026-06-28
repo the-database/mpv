@@ -182,6 +182,9 @@ struct priv {
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
 
+    // TEMP diagnostic: per-phase CPU wall time of the last draw_frame.
+    int64_t dbg_osd_ns, dbg_render_ns;
+
     struct mp_image_params target_params;
 };
 
@@ -1643,10 +1646,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 #endif
     }
     stats_time_start(p->stats, "osd-update");
+    int64_t dbg_t0 = mp_time_ns();
     update_overlays(vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
                     frame->current ? frame->current->params.stereo3d : 0);
+    p->dbg_osd_ns = mp_time_ns() - dbg_t0;
     stats_time_end(p->stats, "osd-update");
     apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
@@ -1749,11 +1754,29 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     // Render frame
     stats_time_start(p->stats, "render");
+    int64_t dbg_t1 = mp_time_ns();
     bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
+    p->dbg_render_ns = mp_time_ns() - dbg_t1;
     stats_time_end(p->stats, "render");
     if (!render_ok) {
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
+    }
+
+    // TEMP diagnostic: log a per-phase breakdown on slow frames so the 8K OSD
+    // 1/sec drop can be attributed (CPU VO-thread vs GPU). osd-update and
+    // render-submit are CPU wall time on the VO thread; gpu-passes is the
+    // libplacebo-measured GPU time of the main render (a few frames latent).
+    {
+        int64_t gpu_ns = 0;
+        for (int i = 0; i < p->perf_fresh.count; i++)
+            gpu_ns += p->perf_fresh.info[i].last;
+        double osd_ms = p->dbg_osd_ns / 1e6, ren_ms = p->dbg_render_ns / 1e6,
+               gpu_ms = gpu_ns / 1e6;
+        if (osd_ms > 8 || ren_ms > 8 || gpu_ms > 25) {
+            MP_WARN(vo, "[slowframe] osd-update(cpu)=%.1f render-submit(cpu)=%.1f "
+                        "gpu-passes=%.1f ms\n", osd_ms, ren_ms, gpu_ms);
+        }
     }
 
     struct pl_frame ref_frame;
