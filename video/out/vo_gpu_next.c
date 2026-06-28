@@ -71,6 +71,11 @@ struct osd_entry {
     int num_parts;
 };
 
+// Ring of streaming upload buffers cycled across uploads, so a buffer is never
+// reused while its previous async upload is still in flight (which would make
+// pl_buf_write block). Sized well above the in-flight depth.
+#define NUM_OVERLAY_BUFS 16
+
 struct osd_state {
     struct osd_entry entries[MAX_OSD_PARTS];
     struct pl_overlay overlays[MAX_OSD_PARTS];
@@ -134,6 +139,10 @@ struct priv {
     pl_fmt osd_fmt[SUBBITMAP_COUNT];
     pl_tex *sub_tex;
     int num_sub_tex;
+    pl_buf overlay_bufs[NUM_OVERLAY_BUFS]; // ring; see NUM_OVERLAY_BUFS
+    unsigned overlay_buf_idx;
+    pl_tex *sub_scratch;       // recycled blur scratch textures (blur_tex/tmp_tex)
+    int num_sub_scratch;
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -408,10 +417,15 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         pl_fmt tex_fmt = p->osd_fmt[item->format];
         if (!entry->tex)
             MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
+        // Round the OSD texture up and grow it monotonically so it isn't
+        // reallocated every frame as the atlas grows through a dense scene
+        // (each realloc stalls the display thread).
+        int want_w = (item->packed_w + 255) & ~255;
+        int want_h = (item->packed_h + 255) & ~255;
         bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
             .format = tex_fmt,
-            .w = MPMAX(item->packed_w, entry->tex ? entry->tex->params.w : 0),
-            .h = MPMAX(item->packed_h, entry->tex ? entry->tex->params.h : 0),
+            .w = MPMAX(want_w, entry->tex ? entry->tex->params.w : 0),
+            .h = MPMAX(want_h, entry->tex ? entry->tex->params.h : 0),
             .host_writable = true,
             .sampleable = true,
         });
@@ -423,14 +437,37 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             .tex        = entry->tex,
             .rc         = { .x1 = item->packed_w, .y1 = item->packed_h, },
             .row_pitch  = item->packed->stride[0],
-            .ptr        = item->packed->planes[0],
         };
-        // Keep the image alive until it's fully read.
-        if (p->gpu->limits.callbacks) {
-            upload_params.callback = talloc_free;
-            upload_params.priv = mp_image_new_ref(item->packed);
+        // Upload the (large, per-frame) subtitle atlas via a streaming buffer:
+        // libplacebo guarantees buffer transfers are asynchronous even on
+        // backends without upload callbacks (e.g. d3d11), so this no longer
+        // blocks the VO thread the way a synchronous `ptr` upload does.
+        size_t buf_size = (size_t) upload_params.row_pitch * item->packed_h;
+        pl_buf *ring = &p->overlay_bufs[p->overlay_buf_idx++ % NUM_OVERLAY_BUFS];
+        // Reuse the staging buffer whenever it's already big enough; only
+        // (re)allocate on growth, rounded up, so it stops being reallocated as
+        // the atlas grows frame-to-frame through a dense scene (that realloc was
+        // the ~187ms VO-thread stall).
+        bool buf_ok = (*ring) && (*ring)->params.size >= buf_size;
+        if (!buf_ok) {
+            size_t want = (buf_size + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
+            buf_ok = pl_buf_recreate(p->gpu, ring,
+                                     pl_buf_params(.size = want, .host_writable = true));
         }
-        ok = pl_tex_upload(p->gpu, &upload_params);
+        if (buf_ok)
+        {
+            pl_buf_write(p->gpu, *ring, 0, item->packed->planes[0], buf_size);
+            upload_params.buf = *ring;
+            ok = pl_tex_upload(p->gpu, &upload_params);
+        } else {
+            // Fallback to a direct upload if the buffer can't be allocated.
+            upload_params.ptr = item->packed->planes[0];
+            if (p->gpu->limits.callbacks) {
+                upload_params.callback = talloc_free;
+                upload_params.priv = mp_image_new_ref(item->packed);
+            }
+            ok = pl_tex_upload(p->gpu, &upload_params);
+        }
         if (!ok) {
             MP_ERR(vo, "Failed uploading OSD texture!\n");
             talloc_free(upload_params.priv);
@@ -480,6 +517,10 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 int tw = entry->tex->params.w, th = entry->tex->params.h;
                 struct pl_tex_params bp = { .format=tex_fmt, .w=tw, .h=th,
                                             .sampleable=true, .storable=true };
+                if (!entry->blur_tex)
+                    MP_TARRAY_POP(p->sub_scratch, p->num_sub_scratch, &entry->blur_tex);
+                if (!entry->tmp_tex)
+                    MP_TARRAY_POP(p->sub_scratch, p->num_sub_scratch, &entry->tmp_tex);
                 if (pl_tex_recreate(p->gpu, &entry->blur_tex, &bp) &&
                     pl_tex_recreate(p->gpu, &entry->tmp_tex, &bp))
                 {
@@ -998,8 +1039,12 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
         pl_tex tex = fp->subs.entries[i].tex;
         if (tex)
             MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, tex);
-        pl_tex_destroy(p->gpu, &fp->subs.entries[i].blur_tex);
-        pl_tex_destroy(p->gpu, &fp->subs.entries[i].tmp_tex);
+        pl_tex bl = fp->subs.entries[i].blur_tex;
+        if (bl)
+            MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, bl);
+        pl_tex tm = fp->subs.entries[i].tmp_tex;
+        if (tm)
+            MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, tm);
     }
     talloc_free(mpi);
 }
@@ -2332,6 +2377,10 @@ static void uninit(struct vo *vo)
     }
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
+    for (int i = 0; i < p->num_sub_scratch; i++)
+        pl_tex_destroy(p->gpu, &p->sub_scratch[i]);
+    for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
+        pl_buf_destroy(p->gpu, &p->overlay_bufs[i]);
     for (int i = 0; i < p->num_user_hooks; i++)
         pl_mpv_user_shader_destroy(&p->user_hooks[i].hook);
 
