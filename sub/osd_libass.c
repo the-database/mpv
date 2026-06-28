@@ -40,7 +40,6 @@ static const char osd_font_pfb[] =
 #define ASS_USE_OSD_FONT "{\\fnmpv-osd-symbols}"
 
 static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
-                       struct mp_osd_res *frame_res,
                        ASS_Image **img_list, bool *changed);
 
 static void create_ass_renderer(struct osd_state *osd, struct ass_state *ass)
@@ -636,7 +635,7 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
         }
 
         ASS_Image *img_list = NULL;
-        append_ass(&entry->ass, &vo_res, &vo_res, &img_list, NULL);
+        append_ass(&entry->ass, &vo_res, &img_list, NULL);
 
         mp_ass_get_bb(img_list, entry->ass.track, &vo_res, ov->out_rc);
     }
@@ -662,7 +661,6 @@ void osd_set_external_remove_owner(struct osd_state *osd, void *owner)
 }
 
 static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
-                       struct mp_osd_res *frame_res,
                        ASS_Image **img_list, bool *changed)
 {
     if (!ass->render || !ass->track) {
@@ -672,11 +670,7 @@ static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
 
     update_playres(ass, res);
 
-    // frame_res may be a capped (smaller) resolution than res (the playres is
-    // derived from res's aspect, which frame_res preserves), so libass
-    // rasterizes uniformly downscaled; the VO upscales the composited result.
-    // See --sub-render-res-limit and osd_object_get_bitmaps.
-    ass_set_frame_size(ass->render, frame_res->w, frame_res->h);
+    ass_set_frame_size(ass->render, res->w, res->h);
     ass_set_pixel_aspect(ass->render, res->display_par);
 
     int ass_changed;
@@ -693,25 +687,6 @@ static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
 struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
                                            struct osd_object *obj, int format)
 {
-    // Cap the OSD render+composite resolution, reusing --sub-render-res-limit.
-    // A full-screen OSD (e.g. the stats overlay) re-rendered ~once/sec at 8K is
-    // a per-frame spike on the VO thread; rendering it at the capped resolution
-    // and upscaling the composited result (via render_w, like subtitles) makes
-    // that update ~(cap/display)^2 cheaper. Aspect-preserving, so layout is
-    // unchanged; the overlay is just bilinear-upscaled.
-    struct mp_osd_res cres = obj->vo_res;
-    bool capped = false;
-    int limit = osd->sub_opts->sub_render_res_limit;
-    if (limit > 0) {
-        int shortest = MPMIN(obj->vo_res.w, obj->vo_res.h);
-        if (shortest > limit) {
-            double s = (double) limit / shortest;
-            cres.w = MPMAX(1, lrint(obj->vo_res.w * s));
-            cres.h = MPMAX(1, lrint(obj->vo_res.h * s));
-            capped = true;
-        }
-    }
-
     if (obj->type == OSDTYPE_OSD) {
         if (obj->osd_changed) {
             update_osd(osd, obj);
@@ -726,13 +701,13 @@ struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
 
     MP_TARRAY_GROW(obj, obj->ass_imgs, obj->num_externals + 1);
 
-    append_ass(&obj->ass, &obj->vo_res, &cres, &obj->ass_imgs[0], &obj->changed);
+    append_ass(&obj->ass, &obj->vo_res, &obj->ass_imgs[0], &obj->changed);
     for (int n = 0; n < obj->num_externals; n++) {
         if (obj->externals[n]->ov.hidden) {
             update_playres(&obj->externals[n]->ass, &obj->vo_res);
             obj->ass_imgs[n + 1] = NULL;
         } else {
-            append_ass(&obj->externals[n]->ass, &obj->vo_res, &cres,
+            append_ass(&obj->externals[n]->ass, &obj->vo_res,
                        &obj->ass_imgs[n + 1], &obj->changed);
         }
     }
@@ -744,16 +719,5 @@ done:;
 
     obj->changed = false;
 
-    struct sub_bitmaps *res = sub_bitmaps_copy(&obj->copy_cache, &out_imgs);
-
-    // Upscale the capped-resolution atlas to display size via per-part dw/dh
-    // (GPU bilinear in the normal overlay composite). The OSD stays a cheap
-    // main-pass corner overlay; capping just the rasterization shrinks the
-    // once/sec re-render + re-upload spike. (Unlike subtitles, we do NOT set
-    // render_w here: the OSD composite isn't the bottleneck, so there's no need
-    // for the VO's separate capped-composite pass every frame.)
-    if (res && capped)
-        osd_rescale_bitmaps(res, cres.w, cres.h, obj->vo_res, 0);
-
-    return res;
+    return sub_bitmaps_copy(&obj->copy_cache, &out_imgs);
 }
