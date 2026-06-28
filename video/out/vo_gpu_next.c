@@ -67,6 +67,7 @@
 struct osd_entry {
     pl_tex tex;
     pl_tex blur_tex, tmp_tex; // deferred-blur scratch (see osd_blur_part)
+    pl_tex inter_tex; // capped-resolution composite target (see update_overlays)
     struct pl_overlay_part *parts;
     int num_parts;
 };
@@ -132,8 +133,10 @@ struct priv {
     pl_log pllog;
     pl_gpu gpu;
     pl_renderer rr;
+    pl_renderer osd_rr; // dedicated renderer for the capped-res overlay composite
     pl_dispatch osd_dp; // for the deferred-blur compute passes
     bool osd_blur_unsupported; // logged once if the format can't be blurred
+    pl_fmt osd_inter_fmt; // RGBA target for the capped-res overlay composite (NULL = disabled)
     pl_queue queue;
     pl_swapchain sw;
     pl_fmt osd_fmt[SUBBITMAP_COUNT];
@@ -589,6 +592,91 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             ol->mode = PL_OVERLAY_MONOCHROME;
             ol->repr.alpha = PL_ALPHA_INDEPENDENT;
             break;
+        }
+
+        // Capped-resolution composite (see --sub-render-res-limit): the sub
+        // overlay was rasterized at render_w x render_h but its parts are in
+        // display space. Composite the parts into a small intermediate texture
+        // at that resolution, then replace them with a single overlay that the
+        // final render bilinear-upscales onto the (8K) target. This cuts the
+        // per-frame composite fill cost by ~(render/display)^2 for big animated
+        // signs, the dominant cost of blend-subtitles=no at 8K. SDR libass subs
+        // on the target frame only; everything else keeps the direct path.
+        // render_w > 0 is set only by sd_ass for capped subtitle overlays
+        // (OSD/stats and image subs leave it 0), so it both detects the cap and
+        // identifies the sub overlay.
+        if (item->render_w > 0 && item->render_w < subs->w &&
+            coords == PL_OVERLAY_COORDS_DST_FRAME &&
+            item->format == SUBBITMAP_LIBASS &&
+            !item->video_color_space &&
+            !(src && pl_color_transfer_is_hdr(frame->color.transfer)) &&
+            p->osd_inter_fmt && p->osd_rr &&
+            !(div[0] > 1 || div[1] > 1) &&
+            entry->num_parts > 0)
+        {
+            int rw = item->render_w, rh = item->render_h;
+            int iw = (rw + 63) & ~63, ih = (rh + 63) & ~63;
+            bool iok = pl_tex_recreate(p->gpu, &entry->inter_tex, &(struct pl_tex_params) {
+                .format = p->osd_inter_fmt,
+                .w = MPMAX(iw, entry->inter_tex ? entry->inter_tex->params.w : 0),
+                .h = MPMAX(ih, entry->inter_tex ? entry->inter_tex->params.h : 0),
+                .renderable = true,
+                .sampleable = true,
+            });
+            if (iok) {
+                // Display-space bounding box of the parts, so the upscale pass
+                // touches only the sub region (not the whole 8K frame).
+                float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
+                for (int i = 0; i < entry->num_parts; i++) {
+                    struct pl_overlay_part *pp = &entry->parts[i];
+                    bx0 = MPMIN(bx0, pp->dst.x0); by0 = MPMIN(by0, pp->dst.y0);
+                    bx1 = MPMAX(bx1, pp->dst.x1); by1 = MPMAX(by1, pp->dst.y1);
+                }
+                float rx = (float) rw / subs->w, ry = (float) rh / subs->h;
+                for (int i = 0; i < entry->num_parts; i++) {
+                    entry->parts[i].dst.x0 *= rx; entry->parts[i].dst.x1 *= rx;
+                    entry->parts[i].dst.y0 *= ry; entry->parts[i].dst.y1 *= ry;
+                }
+                struct pl_overlay inter_ol = *ol;
+                inter_ol.parts = entry->parts;
+                inter_ol.num_parts = entry->num_parts;
+                inter_ol.coords = PL_OVERLAY_COORDS_DST_FRAME;
+                struct pl_frame inter = {
+                    .num_planes = 1,
+                    .planes[0] = {
+                        .texture = entry->inter_tex,
+                        .components = 4,
+                        .component_mapping = {0, 1, 2, 3},
+                    },
+                    .repr = { .sys = PL_COLOR_SYSTEM_RGB,
+                              .levels = PL_COLOR_LEVELS_FULL,
+                              .alpha = PL_ALPHA_PREMULTIPLIED },
+                    .color = pl_color_space_srgb,
+                    .crop = { 0, 0, rw, rh },
+                    .overlays = &inter_ol,
+                    .num_overlays = 1,
+                };
+                struct pl_render_params op = pl_render_fast_params;
+                op.background = PL_CLEAR_COLOR;
+                op.border = PL_CLEAR_COLOR;
+                op.background_transparency = 1.0f; // clear to transparent
+                pl_render_image(p->osd_rr, NULL, &inter, &op);
+
+                // Replace the N display-space parts with one upscale of the
+                // composited intermediate over the parts' display bounding box.
+                entry->parts[0] = (struct pl_overlay_part) {
+                    .src = { bx0 * rx, by0 * ry, bx1 * rx, by1 * ry },
+                    .dst = { bx0, by0, bx1, by1 },
+                    .color = {1, 1, 1, 1},
+                };
+                entry->num_parts = 1;
+                ol->tex = entry->inter_tex;
+                ol->parts = entry->parts;
+                ol->num_parts = 1;
+                ol->mode = PL_OVERLAY_NORMAL;
+                ol->repr.alpha = PL_ALPHA_PREMULTIPLIED;
+                ol->color = pl_color_space_srgb;
+            }
         }
 
         // Duplicate overlay parts for each eye in stereo 3D modes
@@ -2374,6 +2462,7 @@ static void uninit(struct vo *vo)
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].blur_tex);
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tmp_tex);
+        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].inter_tex);
     }
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
@@ -2406,6 +2495,7 @@ static void uninit(struct vo *vo)
 
     pl_icc_close(&p->icc_profile);
     pl_renderer_destroy(&p->rr);
+    pl_renderer_destroy(&p->osd_rr);
     pl_dispatch_destroy(&p->osd_dp);
 
     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
@@ -2473,6 +2563,17 @@ static int preinit(struct vo *vo)
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
     p->osd_sync = 1;
+
+    // Dedicated renderer + RGBA target for the capped-resolution subtitle
+    // overlay composite (--sub-render-res-limit). A separate renderer keeps the
+    // tiny composite from thrashing the main 8K renderer's caches.
+    p->osd_rr = pl_renderer_create(p->pllog, p->gpu);
+    p->osd_inter_fmt = pl_find_fmt(p->gpu, PL_FMT_UNORM, 4, 8, 0,
+        PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR |
+        PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_BLENDABLE);
+    if (!p->osd_inter_fmt)
+        MP_VERBOSE(vo, "No RGBA composite format; --sub-render-res-limit will "
+                       "only cap subtitle rasterization, not compositing.\n");
 
     p->pars = pl_options_alloc(p->pllog);
     update_render_options(vo);

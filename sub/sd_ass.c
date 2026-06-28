@@ -825,6 +825,11 @@ done:
         osd_rescale_bitmaps(res, rdim.w, rdim.h,
             (struct mp_osd_res){ .w = dim.w, .h = dim.h,
                                  .display_par = dim.display_par }, 0);
+        // Tell the VO the overlay was rendered at this capped resolution, so it
+        // can also composite at that resolution and upscale (the parts above are
+        // in display space). See struct sub_bitmaps.render_w.
+        res->render_w = rdim.w;
+        res->render_h = rdim.h;
     }
 
     if (!converted && res)
