@@ -86,6 +86,13 @@ struct sub_bitmaps {
     int change_id;  // Incremented on each change (0 is never used)
 
     bool video_color_space; // True if the bitmap is in video color space
+
+    // If >0, the overlay content was rasterized for this resolution while the
+    // parts[] coordinates are still in the list's w x h (display) space. A
+    // consumer MAY composite the overlay at render_w x render_h and bilinear-
+    // upscale the result for performance (see --sub-render-res-limit). 0 means
+    // the parts are at full display resolution (no cap).
+    int render_w, render_h;
 };
 
 struct sub_bitmap_list {
