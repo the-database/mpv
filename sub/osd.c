@@ -162,7 +162,6 @@ struct osd_state *osd_create(struct mpv_global *global)
     struct osd_state *osd = talloc_zero(NULL, struct osd_state);
     *osd = (struct osd_state) {
         .opts_cache = m_config_cache_alloc(osd, global, &mp_osd_render_sub_opts),
-        .sub_opts_cache = m_config_cache_alloc(osd, global, &mp_subtitle_sub_opts),
         .global = global,
         .log = mp_log_new(osd, global->log, "osd"),
         .force_video_pts = MP_NOPTS_VALUE,
@@ -170,7 +169,6 @@ struct osd_state *osd_create(struct mpv_global *global)
     };
     mp_mutex_init(&osd->lock);
     osd->opts = osd->opts_cache->opts;
-    osd->sub_opts = osd->sub_opts_cache->opts;
 
     for (int n = 0; n < MAX_OSD_PARTS; n++) {
         struct osd_object *obj = talloc(osd, struct osd_object);
@@ -511,7 +509,6 @@ void osd_changed(struct osd_state *osd)
     osd->want_redraw_notification = true;
     // Done here for a lack of a better place.
     m_config_cache_update(osd->opts_cache);
-    m_config_cache_update(osd->sub_opts_cache);
     mp_mutex_unlock(&osd->lock);
 }
 
