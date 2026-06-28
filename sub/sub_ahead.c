@@ -96,8 +96,6 @@ struct sub_ahead {
     bool have_last_served;
 
     int inline_active;           // VO is inline-rendering; worker must not race it
-
-    long dbg_hits, dbg_miss, dbg_clears;     // TEMP
 };
 
 static double ahead_pts_to_subtitle(struct sub_ahead *a, double pts)
@@ -110,7 +108,6 @@ static double ahead_pts_to_subtitle(struct sub_ahead *a, double pts)
 
 static void ahead_clear(struct sub_ahead *a)
 {
-    a->dbg_clears++;
     for (int n = 0; n < a->ring_len; n++) {
         if (a->ring[n].valid) {
             talloc_free(a->ring[n].bmp);
@@ -248,9 +245,11 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         double sub_pts = ahead_pts_to_subtitle(a, target);
         mp_mutex_unlock(&a->lock);
 
-        // Render on the worker's own sd -- no decoder lock involved.
+        // Render on the worker's own sd -- no decoder lock involved. draw_flags=0
+        // (no OSD_DRAW_SUB_ONLY) so --sub-render-res-limit applies to the worker's
+        // renders exactly as it does on the inline VO path.
         struct sub_bitmaps *bmp =
-            a->worker_sd->driver->get_bitmaps(a->worker_sd, dim, format, sub_pts);
+            a->worker_sd->driver->get_bitmaps(a->worker_sd, dim, format, sub_pts, 0);
         uint64_t content_id = bmp ? bmp->change_id : 0;
 
         mp_mutex_lock(&a->lock);
@@ -309,7 +308,6 @@ void sub_ahead_destroy(struct sub_ahead *a)
         mp_mutex_unlock(&a->lock);
         mp_thread_join(a->thread);
     }
-    MP_WARN(a, "render-ahead: %ld served, %ld inline-fallback, %ld ring-clears\n", a->dbg_hits, a->dbg_miss, a->dbg_clears);
     queue_flush(a);
     ahead_clear(a);
     if (a->worker_sd) {
@@ -421,7 +419,6 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
         ahead_clear(a);
     }
     int idx = ahead_find(a, raw_video_pts, dim, format);
-    if (idx >= 0) a->dbg_hits++; else a->dbg_miss++;
     struct sub_bitmaps *res = NULL;
     if (idx >= 0 && a->ring[idx].bmp) {
         res = sub_bitmaps_copy(NULL, a->ring[idx].bmp);
