@@ -288,6 +288,12 @@ static void assobjects_init(struct sd *sd)
 
     enable_output(sd, true);
     ass_set_cache_limits(ctx->ass_renderer, sd->opts->sub_glyph_limit, sd->opts->sub_bitmap_max_size);
+#if HAVE_ASS_RENDER_THREAD_COUNT
+    // Parallel per-event rendering: 1 = single-threaded, 0 = auto (CPU count).
+    ass_set_render_thread_count(ctx->ass_renderer, sd->opts->sub_ass_render_threads);
+    MP_VERBOSE(sd, "libass render threads: %d\n",
+               ass_get_render_thread_count(ctx->ass_renderer));
+#endif
 }
 
 static void assobjects_destroy(struct sd *sd)
@@ -763,6 +769,11 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
 
     if (pts == MP_NOPTS_VALUE || !renderer)
         goto done;
+
+    // Opt in to libass emitting unblurred coverage + a per-image gaussian
+    // std-dev, so vo_gpu_next can do the (expensive) blur on the GPU. No-op
+    // after the first call unless the option toggles (which empties the cache).
+    ass_set_blur_deferred(renderer, opts->sub_gpu_blur);
 
     // Currently no supported text sub formats support a distinction between forced
     // and unforced lines, so we just assume everything's unforced and discard everything.

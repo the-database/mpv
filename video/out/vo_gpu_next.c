@@ -25,6 +25,7 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/shaders/lut.h>
 #include <libplacebo/shaders/icc.h>
+#include <libplacebo/shaders/custom.h>
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/utils/frame_queue.h>
 
@@ -65,9 +66,15 @@
 
 struct osd_entry {
     pl_tex tex;
+    pl_tex blur_tex, tmp_tex; // deferred-blur scratch (see osd_blur_part)
     struct pl_overlay_part *parts;
     int num_parts;
 };
+
+// Ring of streaming upload buffers cycled across uploads, so a buffer is never
+// reused while its previous async upload is still in flight (which would make
+// pl_buf_write block). Sized well above the in-flight depth.
+#define NUM_OVERLAY_BUFS 16
 
 struct osd_state {
     struct osd_entry entries[MAX_OSD_PARTS];
@@ -125,11 +132,17 @@ struct priv {
     pl_log pllog;
     pl_gpu gpu;
     pl_renderer rr;
+    pl_dispatch osd_dp; // for the deferred-blur compute passes
+    bool osd_blur_unsupported; // logged once if the format can't be blurred
     pl_queue queue;
     pl_swapchain sw;
     pl_fmt osd_fmt[SUBBITMAP_COUNT];
     pl_tex *sub_tex;
     int num_sub_tex;
+    pl_buf overlay_bufs[NUM_OVERLAY_BUFS]; // ring; see NUM_OVERLAY_BUFS
+    unsigned overlay_buf_idx;
+    pl_tex *sub_scratch;       // recycled blur scratch textures (blur_tex/tmp_tex)
+    int num_sub_scratch;
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -312,6 +325,74 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
     return mpi;
 }
 
+// Separable gaussian over one atlas sub-region [ox,oy,rw,rh], clamped to that
+// region (so a blurred part can't read/write its atlas neighbours). sigma == 0
+// degenerates to a copy. Validated against a CPU reference via lavapipe.
+static const char *const osd_blur_body_h =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh) {\n"
+    "    int px = g.x + ox, py = g.y + oy;\n"
+    "    float acc = 0.0, wsum = 0.0;\n"
+    "    for (int t = -radius; t <= radius; t++) {\n"
+    "        int q = px + t;\n"
+    "        if (q >= ox && q < ox+rw) {\n"
+    "            float w = sigma > 0.0 ? exp(-0.5*float(t*t)/(sigma*sigma)) : float(t==0);\n"
+    "            acc += w * texelFetch(src, ivec2(q, py), 0).r; wsum += w;\n"
+    "        }\n"
+    "    }\n"
+    "    imageStore(dst, ivec2(px, py), vec4(acc / wsum, 0.0, 0.0, 0.0));\n"
+    "}\n";
+static const char *const osd_blur_body_v =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh) {\n"
+    "    int px = g.x + ox, py = g.y + oy;\n"
+    "    float acc = 0.0, wsum = 0.0;\n"
+    "    for (int t = -radius; t <= radius; t++) {\n"
+    "        int q = py + t;\n"
+    "        if (q >= oy && q < oy+rh) {\n"
+    "            float w = sigma > 0.0 ? exp(-0.5*float(t*t)/(sigma*sigma)) : float(t==0);\n"
+    "            acc += w * texelFetch(src, ivec2(px, q), 0).r; wsum += w;\n"
+    "        }\n"
+    "    }\n"
+    "    imageStore(dst, ivec2(px, py), vec4(acc / wsum, 0.0, 0.0, 0.0));\n"
+    "}\n";
+
+static void osd_blur_part(struct priv *p, pl_tex src, pl_tex dst,
+                          int ox, int oy, int rw, int rh, float sigma,
+                          const char *body)
+{
+    int radius = (int)(3.0f * sigma + 0.999f); // ~ceil(3*sigma); 0 when sigma==0
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 },
+          .binding = { .object=src } },
+        { .desc = { .name="dst", .type=PL_DESC_STORAGE_IMG, .binding=1,
+                    .access=PL_DESC_ACCESS_WRITEONLY },
+          .binding = { .object=dst } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("ox"),     .data=&ox },
+        { .var = pl_var_int("oy"),     .data=&oy },
+        { .var = pl_var_int("rw"),     .data=&rw },
+        { .var = pl_var_int("rh"),     .data=&rh },
+        { .var = pl_var_int("radius"), .data=&radius },
+        { .var = pl_var_float("sigma"),.data=&sigma },
+    };
+    struct pl_custom_shader cs = {
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE,
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 6,
+        .body = body,
+    };
+    if (pl_shader_custom(sh, &cs)) {
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+    } else {
+        pl_dispatch_abort(p->osd_dp, &sh);
+    }
+}
+
 static void update_overlays(struct vo *vo, struct mp_osd_res res,
                             int flags, enum pl_overlay_coords coords,
                             struct osd_state *state, struct pl_frame *frame,
@@ -336,10 +417,15 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         pl_fmt tex_fmt = p->osd_fmt[item->format];
         if (!entry->tex)
             MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
+        // Round the OSD texture up and grow it monotonically so it isn't
+        // reallocated every frame as the atlas grows through a dense scene
+        // (each realloc stalls the display thread).
+        int want_w = (item->packed_w + 255) & ~255;
+        int want_h = (item->packed_h + 255) & ~255;
         bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
             .format = tex_fmt,
-            .w = MPMAX(item->packed_w, entry->tex ? entry->tex->params.w : 0),
-            .h = MPMAX(item->packed_h, entry->tex ? entry->tex->params.h : 0),
+            .w = MPMAX(want_w, entry->tex ? entry->tex->params.w : 0),
+            .h = MPMAX(want_h, entry->tex ? entry->tex->params.h : 0),
             .host_writable = true,
             .sampleable = true,
         });
@@ -351,14 +437,37 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             .tex        = entry->tex,
             .rc         = { .x1 = item->packed_w, .y1 = item->packed_h, },
             .row_pitch  = item->packed->stride[0],
-            .ptr        = item->packed->planes[0],
         };
-        // Keep the image alive until it's fully read.
-        if (p->gpu->limits.callbacks) {
-            upload_params.callback = talloc_free;
-            upload_params.priv = mp_image_new_ref(item->packed);
+        // Upload the (large, per-frame) subtitle atlas via a streaming buffer:
+        // libplacebo guarantees buffer transfers are asynchronous even on
+        // backends without upload callbacks (e.g. d3d11), so this no longer
+        // blocks the VO thread the way a synchronous `ptr` upload does.
+        size_t buf_size = (size_t) upload_params.row_pitch * item->packed_h;
+        pl_buf *ring = &p->overlay_bufs[p->overlay_buf_idx++ % NUM_OVERLAY_BUFS];
+        // Reuse the staging buffer whenever it's already big enough; only
+        // (re)allocate on growth, rounded up, so it stops being reallocated as
+        // the atlas grows frame-to-frame through a dense scene (that realloc was
+        // the ~187ms VO-thread stall).
+        bool buf_ok = (*ring) && (*ring)->params.size >= buf_size;
+        if (!buf_ok) {
+            size_t want = (buf_size + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
+            buf_ok = pl_buf_recreate(p->gpu, ring,
+                                     pl_buf_params(.size = want, .host_writable = true));
         }
-        ok = pl_tex_upload(p->gpu, &upload_params);
+        if (buf_ok)
+        {
+            pl_buf_write(p->gpu, *ring, 0, item->packed->planes[0], buf_size);
+            upload_params.buf = *ring;
+            ok = pl_tex_upload(p->gpu, &upload_params);
+        } else {
+            // Fallback to a direct upload if the buffer can't be allocated.
+            upload_params.ptr = item->packed->planes[0];
+            if (p->gpu->limits.callbacks) {
+                upload_params.callback = talloc_free;
+                upload_params.priv = mp_image_new_ref(item->packed);
+            }
+            ok = pl_tex_upload(p->gpu, &upload_params);
+        }
         if (!ok) {
             MP_ERR(vo, "Failed uploading OSD texture!\n");
             talloc_free(upload_params.priv);
@@ -384,9 +493,57 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, part);
         }
 
+        // Deferred-blur (see ass_set_blur_deferred): libass emitted unblurred
+        // coverage in pre-expanded bounds plus a per-part gaussian std-dev; do
+        // the blur here on the GPU instead of on the CPU display path.
+        pl_tex overlay_tex = entry->tex;
+        if (item->format == SUBBITMAP_LIBASS) {
+            bool any_blur = false;
+            for (int i = 0; i < item->num_parts; i++) {
+                if (item->parts[i].libass.blur_x > 0 || item->parts[i].libass.blur_y > 0) {
+                    any_blur = true;
+                    break;
+                }
+            }
+            if (any_blur && !(tex_fmt->caps & PL_FMT_CAP_STORABLE)) {
+                if (!p->osd_blur_unsupported) {
+                    MP_WARN(vo, "GPU subtitle blur needs a storable OSD format; "
+                               "falling back to unblurred. Disable --sub-gpu-blur.\n");
+                    p->osd_blur_unsupported = true;
+                }
+                any_blur = false;
+            }
+            if (any_blur) {
+                int tw = entry->tex->params.w, th = entry->tex->params.h;
+                struct pl_tex_params bp = { .format=tex_fmt, .w=tw, .h=th,
+                                            .sampleable=true, .storable=true };
+                if (!entry->blur_tex)
+                    MP_TARRAY_POP(p->sub_scratch, p->num_sub_scratch, &entry->blur_tex);
+                if (!entry->tmp_tex)
+                    MP_TARRAY_POP(p->sub_scratch, p->num_sub_scratch, &entry->tmp_tex);
+                if (pl_tex_recreate(p->gpu, &entry->blur_tex, &bp) &&
+                    pl_tex_recreate(p->gpu, &entry->tmp_tex, &bp))
+                {
+                    for (int i = 0; i < item->num_parts; i++) {
+                        const struct sub_bitmap *b = &item->parts[i];
+                        if (b->w < 1 || b->h < 1)
+                            continue;
+                        // separable: H with blur_x (atlas->tmp), V with blur_y (tmp->blur)
+                        osd_blur_part(p, entry->tex, entry->tmp_tex,
+                                      b->src_x, b->src_y, b->w, b->h,
+                                      b->libass.blur_x, osd_blur_body_h);
+                        osd_blur_part(p, entry->tmp_tex, entry->blur_tex,
+                                      b->src_x, b->src_y, b->w, b->h,
+                                      b->libass.blur_y, osd_blur_body_v);
+                    }
+                    overlay_tex = entry->blur_tex;
+                }
+            }
+        }
+
         struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
         *ol = (struct pl_overlay) {
-            .tex = entry->tex,
+            .tex = overlay_tex,
             .parts = entry->parts,
             .num_parts = entry->num_parts,
             .color = pl_color_space_srgb,
@@ -882,6 +1039,12 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
         pl_tex tex = fp->subs.entries[i].tex;
         if (tex)
             MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, tex);
+        pl_tex bl = fp->subs.entries[i].blur_tex;
+        if (bl)
+            MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, bl);
+        pl_tex tm = fp->subs.entries[i].tmp_tex;
+        if (tm)
+            MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, tm);
     }
     talloc_free(mpi);
 }
@@ -2207,10 +2370,17 @@ static void uninit(struct vo *vo)
         pl_gpu_finish(p->gpu);
 
     pl_queue_destroy(&p->queue); // destroy this first
-    for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
+    for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++) {
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
+        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].blur_tex);
+        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tmp_tex);
+    }
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
+    for (int i = 0; i < p->num_sub_scratch; i++)
+        pl_tex_destroy(p->gpu, &p->sub_scratch[i]);
+    for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
+        pl_buf_destroy(p->gpu, &p->overlay_bufs[i]);
     for (int i = 0; i < p->num_user_hooks; i++)
         pl_mpv_user_shader_destroy(&p->user_hooks[i].hook);
 
@@ -2236,6 +2406,7 @@ static void uninit(struct vo *vo)
 
     pl_icc_close(&p->icc_profile);
     pl_renderer_destroy(&p->rr);
+    pl_dispatch_destroy(&p->osd_dp);
 
     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
         pl_shader_info_deref(&p->perf_fresh.info[i].shader);
@@ -2297,6 +2468,7 @@ static int preinit(struct vo *vo)
 
     pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
     p->rr = pl_renderer_create(p->pllog, p->gpu);
+    p->osd_dp = pl_dispatch_create(p->pllog, p->gpu);
     p->queue = pl_queue_create(p->gpu);
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
