@@ -31,6 +31,11 @@ struct sd {
     struct mp_codec_params *codec;
     const char *lang;
 
+    // Nonzero overrides --sub-ass-render-threads for this sd's libass renderer.
+    // The render-ahead worker sd uses this to cap its thread count separately
+    // from the decoder/VO-fallback sd (which leaves it 0 = use the option).
+    int ass_render_thread_count_override;
+
     // Set to false as soon as the decoder discards old subtitle events.
     // (only needed if sd_functions.accept_packets_in_advance == false)
     bool preload_ok;

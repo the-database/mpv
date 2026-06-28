@@ -136,6 +136,8 @@ struct mp_subtitle_opts {
     int sub_glyph_limit;
     int sub_bitmap_max_size;
     int sub_ass_render_threads;
+    int sub_render_ahead_frames;
+    int sub_render_ahead_threads;
     bool sub_gpu_blur;
     char **sub_avopts;
 };
