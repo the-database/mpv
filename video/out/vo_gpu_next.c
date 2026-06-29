@@ -724,7 +724,10 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // Persistent glyph cache: ensure the atlas + map, reset if near-full, then
     // upload only the cache-miss glyphs (the per-frame bandwidth win).
     if (!p->glyph_atlas) {
-        p->gatlas_w = p->gatlas_h = 4096;
+        // As large as the GPU allows: a dense 8K frame's sign glyphs/drawings
+        // must mostly fit at once or later ones get dropped (signs flashing).
+        // 16384^2 r8 = 256MB. (4096 overflowed even at 1080p.)
+        p->gatlas_w = p->gatlas_h = MPMIN(gpu->limits.max_tex_2d_dim, 16384);
         if (!gc_ensure(gpu, &p->glyph_atlas, r8, p->gatlas_w, p->gatlas_h,
                        false, true, false, false, true))
             return;
@@ -745,14 +748,24 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     int nmiss = 0;
     size_t miss_bytes = 0;
     ptrdiff_t pstride = item->packed->stride[0];
+    // The persistent atlas accumulates glyphs across frames; a dense sign frame
+    // can exhaust it mid-frame and drop its later glyphs (flashing). Nothing is
+    // uploaded until after this loop, so on overflow reset once and rebuild from
+    // empty (every glyph then re-uploads this one frame, which is correct).
+    bool gc_retried = false;
+gc_restart:
+    nmiss = 0;
+    miss_bytes = 0;
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
         cpos[i] = (struct gpos){0, 0};
         if (b->libass.glyph_id == 0)
             continue;
         bool up;
-        if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up))
-            continue;
+        if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up)) {
+            if (!gc_retried) { gcache_reset(p); gc_retried = true; goto gc_restart; }
+            continue;   // already rebuilt from empty: this frame genuinely overflows
+        }
         if (up) {
             const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
                                 + (ptrdiff_t) b->src_y * pstride + b->src_x;
@@ -895,17 +908,21 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         }
     }
 
-    // Emit one monochrome overlay; parts in z-order: border (1) then fill (0)
-    // across all runs (deferred runs never carry a shadow).
+    // Emit the overlay preserving libass's z-order: regions in emission order
+    // (regs[] is ordered by each run's first appearance in item->parts, which is
+    // libass's back-to-front image-list order -- so an event's drop-shadow run
+    // and any background/mask run stay behind later events), and within a region
+    // border (under) then fill (over). A global border-then-fill pass across all
+    // runs mislayered overlapping signs: a later run's fill (a sign's mask) was
+    // painted over an earlier run's text.
     entry->num_run_parts = 0;
-    for (int pass = 1; pass >= 0; pass--) {
-        for (int i = 0; i < nregs; i++) {
-            struct gc_region *r = &regs[i];
-            int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
+    for (int i = 0; i < nregs; i++) {
+        struct gc_region *r = &regs[i];
+        int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
+        for (int layer = 0; layer < 2; layer++) {  // 0 = border (under), 1 = fill (over)
             int ax, ay; uint32_t c;
-            if (pass == 1 && r->nbord) { ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
-            else if (pass == 0 && r->nfill) { ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
-            else continue;
+            if (layer == 0) { if (!r->nbord) continue; ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
+            else            { if (!r->nfill) continue; ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
             // result_tex is composited in capped space; upscale the region back
             // to display coords (gs == 1 when uncapped -> identity). dst is a
             // float rect, so libplacebo bilinear-upscales the sample.
