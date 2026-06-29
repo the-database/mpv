@@ -681,12 +681,16 @@ struct gc_region {
 // match libass's combine -> expand -> fix_outline -> blur order.)
 static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
                          struct gc_region *r, int *parts, int n,
-                         pl_tex cov, int bw, int bh, struct gpos *cpos)
+                         pl_tex cov, int bw, int bh, struct gpos *cpos, double gs)
 {
     osd_clear(p, p->run_acc, bw, bh);
     for (int k = 0; k < n; k++) {
         const struct sub_bitmap *b = &item->parts[parts[k]];
-        int dx = b->x - r->x0 + r->margin, dy = b->y - r->y0 + r->margin;
+        // Glyph coverage (b->w x b->h) is at the capped render resolution; place
+        // it in the run accumulator in that same capped space (gs scales the
+        // display-space part position down to it).
+        int dx = lrint(b->x * gs) - r->x0 + r->margin;
+        int dy = lrint(b->y * gs) - r->y0 + r->margin;
         osd_combine_part(p, p->glyph_atlas, p->run_acc, cpos[parts[k]].ax,
                          cpos[parts[k]].ay, dx, dy, b->w, b->h);
     }
@@ -705,8 +709,12 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
 static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                                struct osd_entry *entry, struct pl_frame *frame,
                                struct osd_state *state, enum pl_overlay_coords coords,
-                               struct mp_image *src)
+                               struct mp_image *src, double gs)
 {
+    // gs = render_w/display (<=1 when --sub-render-res-limit caps the render):
+    // the glyphs are rendered at the capped resolution, so compose the runs in
+    // that capped space and upscale the result_tex region to display in the
+    // final overlay. gs == 1 (uncapped) leaves coords unchanged.
     pl_gpu gpu = p->gpu;
     pl_fmt r8 = p->osd_fmt[SUBBITMAP_LIBASS];
     if (!r8 || !p->osd_acc_fmt || !(p->osd_acc_fmt->caps & PL_FMT_CAP_STORABLE) ||
@@ -813,13 +821,15 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         if (ri < 0) {
             MP_TARRAY_GROW(tmp, regs, nregs);
             ri = idx[b->libass.run_id] = nregs++;
-            regs[ri] = (struct gc_region){ .x0 = b->x, .y0 = b->y,
-                .x1 = b->x + b->dw, .y1 = b->y + b->dh,
+            regs[ri] = (struct gc_region){ .x0 = lrint(b->x * gs), .y0 = lrint(b->y * gs),
+                .x1 = lrint((b->x + b->dw) * gs), .y1 = lrint((b->y + b->dh) * gs),
                 .run_flags = b->libass.run_flags, .single_layer = 0xff };
         }
         r = &regs[ri];
-        r->x0 = MPMIN(r->x0, b->x); r->y0 = MPMIN(r->y0, b->y);
-        r->x1 = MPMAX(r->x1, b->x + b->dw); r->y1 = MPMAX(r->y1, b->y + b->dh);
+        r->x0 = MPMIN(r->x0, (int) lrint(b->x * gs));
+        r->y0 = MPMIN(r->y0, (int) lrint(b->y * gs));
+        r->x1 = MPMAX(r->x1, (int) lrint((b->x + b->dw) * gs));
+        r->y1 = MPMAX(r->y1, (int) lrint((b->y + b->dh) * gs));
         if (b->libass.layer == 1) {
             r->bord_color = b->libass.color;
             r->blur_b = b->libass.blur_x;
@@ -866,9 +876,9 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         struct gc_region *r = &regs[i];
         int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
         if (r->nfill) {
-            gc_build_cov(p, item, r, r->fill, r->nfill, p->run_cov_f, bw, bh, cpos);
+            gc_build_cov(p, item, r, r->fill, r->nfill, p->run_cov_f, bw, bh, cpos, gs);
             if (r->nbord) {
-                gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos);
+                gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos, gs);
                 // fix_outline on the unblurred coverage (libass order), then blur.
                 if (r->run_flags & 1)   // bit 0 = apply fix_outline (see libass)
                     osd_unop(p, p->run_cov_f, p->run_cov_b, bw, bh,
@@ -879,7 +889,7 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             gc_blur(p, p->run_cov_f, bw, bh, r->blur_f);  // σ may be 0 (bordered fill)
             osd_copy(p, p->run_cov_f, entry->result_tex, r->fill_ax, r->fill_ay, bw, bh);
         } else if (r->nbord) {
-            gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos);
+            gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos, gs);
             gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
             osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
         }
@@ -896,10 +906,13 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             if (pass == 1 && r->nbord) { ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
             else if (pass == 0 && r->nfill) { ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
             else continue;
+            // result_tex is composited in capped space; upscale the region back
+            // to display coords (gs == 1 when uncapped -> identity). dst is a
+            // float rect, so libplacebo bilinear-upscales the sample.
             struct pl_overlay_part part = {
                 .src = { ax, ay, ax + bw, ay + bh },
-                .dst = { r->x0 - r->margin, r->y0 - r->margin,
-                         r->x1 + r->margin, r->y1 + r->margin },
+                .dst = { (r->x0 - r->margin) / gs, (r->y0 - r->margin) / gs,
+                         (r->x1 + r->margin) / gs, (r->y1 + r->margin) / gs },
                 .color = { (c >> 24) / 255.0f, ((c >> 16) & 0xFF) / 255.0f,
                            ((c >> 8) & 0xFF) / 255.0f, (255 - (c & 0xFF)) / 255.0f },
             };
@@ -947,7 +960,11 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             continue;
         struct osd_entry *entry = &state->entries[item->render_index];
         if (item->format == SUBBITMAP_LIBASS_GLYPHS) {
-            compose_glyph_runs(p, item, entry, frame, state, coords, src);
+            // Glyph coverage is rendered at the (capped) render_w; compose the
+            // runs in that space and upscale to display. gs == 1 when uncapped.
+            double gs = item->render_w > 0 && subs->w > 0
+                      ? (double) item->render_w / subs->w : 1.0;
+            compose_glyph_runs(p, item, entry, frame, state, coords, src, gs);
             // Already-combined fallback parts (shadow/karaoke runs, glyph_id 0)
             // go through the legacy path below; skip it if there are none.
             bool has_fallback = false;
