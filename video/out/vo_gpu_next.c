@@ -183,6 +183,7 @@ struct priv {
     struct frame_info perf_redraw;
 
     int64_t dbg_osd_ns; // TEMP diagnostic: osd-update CPU wall time
+    int64_t dbg_subrender_ns, dbg_capcomp_ns, dbg_blur_ns;
 
     struct mp_image_params target_params;
 };
@@ -409,7 +410,11 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     mp_get_3d_side_by_side(stereo_mode, div);
     res.w /= div[0];
     res.h /= div[1];
+    p->dbg_capcomp_ns = 0;
+    p->dbg_blur_ns = 0;
+    int64_t dbg_sr0 = mp_time_ns();
     struct sub_bitmap_list *subs = osd_render(vo->osd, res, pts, flags, mp_draw_sub_formats);
+    p->dbg_subrender_ns = mp_time_ns() - dbg_sr0;
 
     frame->overlays = state->overlays;
     frame->num_overlays = 0;
@@ -529,6 +534,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 if (pl_tex_recreate(p->gpu, &entry->blur_tex, &bp) &&
                     pl_tex_recreate(p->gpu, &entry->tmp_tex, &bp))
                 {
+                    int64_t dbg_bl0 = mp_time_ns();
                     for (int i = 0; i < item->num_parts; i++) {
                         const struct sub_bitmap *b = &item->parts[i];
                         if (b->w < 1 || b->h < 1)
@@ -541,6 +547,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                                       b->src_x, b->src_y, b->w, b->h,
                                       b->libass.blur_y, osd_blur_body_v);
                     }
+                    p->dbg_blur_ns += mp_time_ns() - dbg_bl0;
                     overlay_tex = entry->blur_tex;
                 }
             }
@@ -662,7 +669,9 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 op.background = PL_CLEAR_COLOR;
                 op.border = PL_CLEAR_COLOR;
                 op.background_transparency = 1.0f; // clear to transparent
+                int64_t dbg_cc0 = mp_time_ns();
                 pl_render_image(p->osd_rr, NULL, &inter, &op);
+                p->dbg_capcomp_ns += mp_time_ns() - dbg_cc0;
 
                 // Replace the N display-space parts with one upscale of the
                 // composited intermediate over the parts' display bounding box.
@@ -1765,9 +1774,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         for (int i = 0; i < p->perf_fresh.count; i++)
             gpu_ns += p->perf_fresh.info[i].last;
         double osd_ms = p->dbg_osd_ns / 1e6, gpu_ms = gpu_ns / 1e6;
+        double sr_ms = p->dbg_subrender_ns / 1e6, cc_ms = p->dbg_capcomp_ns / 1e6,
+               bl_ms = p->dbg_blur_ns / 1e6;
+        double other_ms = osd_ms - sr_ms - cc_ms - bl_ms; // upload + overlay build
         if (osd_ms > 8 || gpu_ms > 25)
-            MP_WARN(vo, "[slowframe] osd-update=%.1f gpu-passes=%.1f ms\n",
-                    osd_ms, gpu_ms);
+            MP_WARN(vo, "[slowframe] osd-update=%.1f (subrender=%.1f capcomp=%.1f "
+                    "blur=%.1f other=%.1f) gpu-passes=%.1f ms\n",
+                    osd_ms, sr_ms, cc_ms, bl_ms, other_ms, gpu_ms);
     }
 
     struct pl_frame ref_frame;
