@@ -70,6 +70,9 @@ struct osd_entry {
     pl_tex inter_tex; // capped-resolution composite target (see update_overlays)
     struct pl_overlay_part *parts;
     int num_parts;
+    pl_tex result_tex;        // deferred-composite result atlas (compose_glyph_runs)
+    struct pl_overlay_part *run_parts;
+    int num_run_parts;
 };
 
 // Ring of streaming upload buffers cycled across uploads, so a buffer is never
@@ -147,6 +150,25 @@ struct priv {
     pl_tex *sub_scratch;       // recycled blur scratch textures (blur_tex/tmp_tex)
     int num_sub_scratch;
 
+    // Deferred composite (SUBBITMAP_LIBASS_GLYPHS): r32f combine accumulator
+    // format + reusable scratch. The composited per-run coverage goes into the
+    // per-entry result atlas (entry->result_tex).
+    pl_fmt osd_acc_fmt;        // r32f (storable) for the combine accumulator
+    pl_tex run_acc;            // r32f combine accumulator (sized to max run)
+    pl_tex run_tmp;            // r8 blur temp
+    pl_tex run_cov_f, run_cov_b; // r8 per-run fill/border coverage (pre-copy)
+
+    // Persistent GPU glyph cache (Stage B): each unique glyph (keyed by libass
+    // cache_id) is uploaded once into glyph_atlas, so the per-frame upload is
+    // just the cache misses instead of the whole packed atlas.
+    pl_tex glyph_atlas;
+    struct gcache_slot { uint64_t id; int ax, ay, w, h; } *gcache;
+    int gcache_cap, gcache_count;            // open-addressed table (cap = pow2)
+    int gatlas_w, gatlas_h, gsx, gsy, growh; // skyline allocator cursor
+    pl_buf glyph_stage[3];                   // async upload staging ring (no VO stall)
+    unsigned glyph_stage_idx;
+    uint8_t *gstage_cpu; size_t gstage_cpu_sz; // tight-repack scratch for misses
+
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
     struct osd_state osd_state;
@@ -182,8 +204,6 @@ struct priv {
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
 
-    int64_t dbg_osd_ns; // TEMP diagnostic: osd-update CPU wall time
-    int64_t dbg_subrender_ns, dbg_capcomp_ns, dbg_blur_ns;
 
     struct mp_image_params target_params;
 };
@@ -399,6 +419,519 @@ static void osd_blur_part(struct priv *p, pl_tex src, pl_tex dst,
     }
 }
 
+// ---- Deferred composite (SUBBITMAP_LIBASS_GLYPHS) GPU passes ----------------
+// libass emits uncombined per-glyph coverage; we reproduce its per-run pipeline
+// on the GPU: combine (saturating add) -> blur -> fix_outline -> alpha-over,
+// integer-exact, so the result matches the CPU-combined path bit for bit.
+
+// Add one glyph's atlas coverage into the run's f32 accumulator. Read-add-write;
+// pl_dispatch serializes overlapping parts via its texture-dependency tracking,
+// so this is the (associative, commutative) sum the CPU computes -- the final
+// clamp happens once at resolve, which is identical to the CPU's per-glyph
+// min(dst+src,255) because coverage is non-negative and saturation is sticky.
+static const char *const osd_combine_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh) {\n"
+    "    float cov = texelFetch(src, ivec2(sx+g.x, sy+g.y), 0).r;\n"
+    "    ivec2 d = ivec2(dx+g.x, dy+g.y);\n"
+    "    float a = imageLoad(acc, d).r;\n"
+    "    imageStore(acc, d, vec4(a + cov, 0.0, 0.0, 0.0));\n"
+    "}\n";
+// Resolve the f32 sum to r8 coverage with a single saturating clamp.
+static const char *const osd_resolve_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh)\n"
+    "    imageStore(dst, g, vec4(min(imageLoad(acc, g).r, 1.0), 0.0, 0.0, 0.0));\n";
+// fix_outline: border = border>fill ? border - fill/2 : 0, in 0..255 integers
+// (matching ass_fix_outline's integer floor division), in place on B.
+static const char *const osd_fixoutline_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh) {\n"
+    "    float bb = floor(imageLoad(bord, g).r * 255.0 + 0.5);\n"
+    "    float ff = floor(texelFetch(fill, g, 0).r * 255.0 + 0.5);\n"
+    "    float o = bb > ff ? bb - floor(ff * 0.5) : 0.0;\n"
+    "    imageStore(bord, g, vec4(o / 255.0, 0.0, 0.0, 0.0));\n"
+    "}\n";
+
+static void osd_combine_part(struct priv *p, pl_tex atlas, pl_tex acc,
+                             int sx, int sy, int dx, int dy, int rw, int rh)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 },
+          .binding = { .object=atlas } },
+        { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=1,
+                    .access=PL_DESC_ACCESS_READWRITE },
+          .binding = { .object=acc } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("sx"), .data=&sx }, { .var = pl_var_int("sy"), .data=&sy },
+        { .var = pl_var_int("dx"), .data=&dx }, { .var = pl_var_int("dy"), .data=&dy },
+        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 6, .body = osd_combine_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
+// One r/w-storage + one sampled/storage helper for resolve and fix_outline.
+static void osd_unop(struct priv *p, pl_tex a, pl_tex b, int rw, int rh,
+                     const char *aname, bool a_sampled, const char *bname,
+                     const char *body)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name=aname,
+                    .type = a_sampled ? PL_DESC_SAMPLED_TEX : PL_DESC_STORAGE_IMG,
+                    .binding=0,
+                    .access = a_sampled ? 0 : PL_DESC_ACCESS_READWRITE },
+          .binding = { .object=a } },
+        { .desc = { .name=bname, .type=PL_DESC_STORAGE_IMG, .binding=1,
+                    .access = PL_DESC_ACCESS_READWRITE },
+          .binding = { .object=b } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 2, .body = body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
+// Copy src[0..rw,0..rh] -> dst[dx..,dy..] (r8 isn't blittable everywhere, so a
+// compute copy instead of pl_tex_blit).
+static const char *const osd_copy_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh)\n"
+    "    imageStore(dst, ivec2(dx+g.x, dy+g.y), vec4(texelFetch(src, g, 0).r,0.0,0.0,0.0));\n";
+
+static void osd_copy(struct priv *p, pl_tex src, pl_tex dst, int dx, int dy,
+                     int rw, int rh)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 },
+          .binding = { .object=src } },
+        { .desc = { .name="dst", .type=PL_DESC_STORAGE_IMG, .binding=1,
+                    .access=PL_DESC_ACCESS_WRITEONLY },
+          .binding = { .object=dst } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("dx"), .data=&dx }, { .var = pl_var_int("dy"), .data=&dy },
+        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 4, .body = osd_copy_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
+// Zero a storage image region via compute (pl_tex_clear needs a blittable
+// texture, which r32f/r8 storage scratch isn't on all backends).
+static const char *const osd_clear_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < rw && g.y < rh) imageStore(acc, g, vec4(0.0));\n";
+
+static void osd_clear(struct priv *p, pl_tex acc, int rw, int rh)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=0,
+                    .access=PL_DESC_ACCESS_WRITEONLY }, .binding = { .object=acc } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 1,
+        .variables = vars, .num_variables = 2, .body = osd_clear_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
+static bool gc_ensure(pl_gpu gpu, pl_tex *t, pl_fmt fmt, int w, int h,
+                      bool storable, bool sampleable, bool blit_src,
+                      bool blit_dst, bool host_writable)
+{
+    return pl_tex_recreate(gpu, t, pl_tex_params(
+        .format = fmt,
+        .w = MPMAX(w, *t ? (*t)->params.w : 0),
+        .h = MPMAX(h, *t ? (*t)->params.h : 0),
+        .storable = storable, .sampleable = sampleable,
+        .blit_src = blit_src, .blit_dst = blit_dst, .host_writable = host_writable));
+}
+
+// Match libass's deferred-blur expand padding (ass_blur_expand_only): the blur
+// runs over coverage padded by this many pixels per side, and osd_blur_part's
+// edge renormalization depends on it, so the margin must equal it for a
+// bit-exact match. Mirrors find_best_method() + the shift formula.
+static int blur_expand_pad(float sigma)
+{
+    double r2 = (double) sigma * sigma;
+    if (r2 <= 0.001)
+        return 0;
+    int level, radius;
+    if (r2 < 0.5) {
+        level = 0; radius = 4;
+    } else {
+        double frac = frexp(sqrt(0.11569 * r2 + 0.20591047), &level);
+        double mul = pow(0.25, level);
+        radius = 8 - (int)((10.1525 + 0.8335 * mul) * (1 - frac));
+        if (radius < 4) radius = 4;
+    }
+    return ((radius + 4) << level) - 4;
+}
+
+struct gpos { int ax, ay; };   // a glyph's position in the persistent atlas
+
+static struct gcache_slot *gcache_find(struct priv *p, uint64_t id)
+{
+    if (!p->gcache_cap)
+        return NULL;
+    uint64_t h = id & (p->gcache_cap - 1);
+    while (p->gcache[h].id) {
+        if (p->gcache[h].id == id)
+            return &p->gcache[h];
+        h = (h + 1) & (p->gcache_cap - 1);
+    }
+    return NULL;
+}
+
+static void gcache_reset(struct priv *p)
+{
+    if (p->gcache)
+        memset(p->gcache, 0, p->gcache_cap * sizeof(p->gcache[0]));
+    p->gcache_count = 0;
+    p->gsx = p->gsy = p->growh = 0;
+}
+
+// Locate a glyph in the persistent atlas, uploading it from `src` on a miss
+// (skyline-packed, 1px pad). Returns false if it can't be placed this frame.
+// Reserve a glyph's slot in the persistent atlas. Cache hit: *upload stays
+// false. Miss: a skyline slot is allocated + the id inserted, *upload set true
+// (the caller uploads the pixels asynchronously, batched, to avoid a VO stall).
+// Returns false only if the glyph can't be placed this frame (atlas full).
+static bool gcache_reserve(struct priv *p, uint64_t id, int w, int h,
+                           struct gpos *out, bool *upload)
+{
+    *upload = false;
+    struct gcache_slot *s = gcache_find(p, id);
+    if (s && s->w == w && s->h == h) {
+        out->ax = s->ax; out->ay = s->ay;
+        return true;
+    }
+    int nw = w + 1, nh = h + 1;     // 1px pad against bilinear bleed
+    if (p->gsx + nw > p->gatlas_w) { p->gsy += p->growh; p->gsx = 0; p->growh = 0; }
+    if (p->gsy + nh > p->gatlas_h)
+        return false;               // atlas full this frame (reset happens at frame start)
+    int gx = p->gsx, gy = p->gsy;
+    p->gsx += nw;
+    if (nh > p->growh) p->growh = nh;
+    uint64_t hh = id & (p->gcache_cap - 1);
+    while (p->gcache[hh].id) hh = (hh + 1) & (p->gcache_cap - 1);
+    p->gcache[hh] = (struct gcache_slot){ id, gx, gy, w, h };
+    p->gcache_count++;
+    out->ax = gx; out->ay = gy;
+    *upload = true;
+    return true;
+}
+
+// One grouped composite unit: a deferred run (run_id != 0) carries its fill and
+// border glyph lists separately and gets combine+blur+fix_outline; a fallback
+// singleton (glyph_id == 0) is already-combined coverage that only needs blur.
+struct gc_region {
+    int x0, y0, x1, y1;          // screen bbox of all member parts (pre-margin)
+    int margin;                  // blur halo padding added on every side
+    float blur_f, blur_b;        // fill / border gaussian std-dev (0 = no blur)
+    uint32_t run_flags;
+    int *fill, nfill;            // part indices (layer 0 / singleton)
+    int *bord, nbord;            // part indices (layer 1)
+    uint32_t fill_color, bord_color;
+    int fill_ax, fill_ay, bord_ax, bord_ay;  // result-atlas positions
+    uint8_t single_layer;        // 0xff for a run; else the singleton's layer
+};
+
+// Combine a region's glyph list (saturating add) into run_acc at run-local
+// coords and resolve to cov. (Blur happens later -- after fix_outline -- to
+// match libass's combine -> expand -> fix_outline -> blur order.)
+static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
+                         struct gc_region *r, int *parts, int n,
+                         pl_tex cov, int bw, int bh, struct gpos *cpos, double gs)
+{
+    osd_clear(p, p->run_acc, bw, bh);
+    for (int k = 0; k < n; k++) {
+        const struct sub_bitmap *b = &item->parts[parts[k]];
+        // Glyph coverage (b->w x b->h) is at the capped render resolution; place
+        // it in the run accumulator in that same capped space (gs scales the
+        // display-space part position down to it).
+        int dx = lrint(b->x * gs) - r->x0 + r->margin;
+        int dy = lrint(b->y * gs) - r->y0 + r->margin;
+        osd_combine_part(p, p->glyph_atlas, p->run_acc, cpos[parts[k]].ax,
+                         cpos[parts[k]].ay, dx, dy, b->w, b->h);
+    }
+    osd_unop(p, p->run_acc, cov, bw, bh, "acc", false, "dst", osd_resolve_body);
+}
+
+static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
+{
+    osd_blur_part(p, cov, p->run_tmp, 0, 0, bw, bh, sigma, osd_blur_body_h);
+    osd_blur_part(p, p->run_tmp, cov, 0, 0, bw, bh, sigma, osd_blur_body_v);
+}
+
+// Composite a SUBBITMAP_LIBASS_GLYPHS item: reproduce libass's per-run combine
+// + blur + fix_outline on the GPU into entry->tex (a result atlas), then emit a
+// single monochrome overlay whose parts reference each run's coverage region.
+static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
+                               struct osd_entry *entry, struct pl_frame *frame,
+                               struct osd_state *state, enum pl_overlay_coords coords,
+                               struct mp_image *src, double gs)
+{
+    // gs = render_w/display (<=1 when --sub-render-res-limit caps the render):
+    // the glyphs are rendered at the capped resolution, so compose the runs in
+    // that capped space and upscale the result_tex region to display in the
+    // final overlay. gs == 1 (uncapped) leaves coords unchanged.
+    pl_gpu gpu = p->gpu;
+    pl_fmt r8 = p->osd_fmt[SUBBITMAP_LIBASS];
+    if (!r8 || !p->osd_acc_fmt || !(p->osd_acc_fmt->caps & PL_FMT_CAP_STORABLE) ||
+        !(r8->caps & PL_FMT_CAP_STORABLE))
+        return;
+
+    // Persistent glyph cache: ensure the atlas + map, reset if near-full, then
+    // upload only the cache-miss glyphs (the per-frame bandwidth win).
+    if (!p->glyph_atlas) {
+        p->gatlas_w = p->gatlas_h = 4096;
+        if (!gc_ensure(gpu, &p->glyph_atlas, r8, p->gatlas_w, p->gatlas_h,
+                       false, true, false, false, true))
+            return;
+        p->gcache_cap = 1 << 15;
+        p->gcache = talloc_zero_array(p, struct gcache_slot, p->gcache_cap);
+    }
+    if (p->gsy > p->gatlas_h - 256 || p->gcache_count * 10 > p->gcache_cap * 7)
+        gcache_reset(p);
+
+    void *tmp = talloc_new(NULL);
+
+    // Resolve every deferred glyph to its atlas position, collecting cache
+    // misses to upload in one async batch (a synchronous per-glyph .ptr upload
+    // stalls the VO thread on d3d11; see the staging-buffer note below).
+    struct gpos *cpos = talloc_array(tmp, struct gpos, item->num_parts);
+    struct gmiss { int ax, ay, w, h; const uint8_t *src; };
+    struct gmiss *miss = NULL;
+    int nmiss = 0;
+    size_t miss_bytes = 0;
+    ptrdiff_t pstride = item->packed->stride[0];
+    for (int i = 0; i < item->num_parts; i++) {
+        const struct sub_bitmap *b = &item->parts[i];
+        cpos[i] = (struct gpos){0, 0};
+        if (b->libass.glyph_id == 0)
+            continue;
+        bool up;
+        if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up))
+            continue;
+        if (up) {
+            const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
+                                + (ptrdiff_t) b->src_y * pstride + b->src_x;
+            MP_TARRAY_APPEND(tmp, miss, nmiss,
+                ((struct gmiss){ cpos[i].ax, cpos[i].ay, b->w, b->h, gsrc }));
+            miss_bytes += (size_t) b->w * b->h;
+        }
+    }
+
+    // Flush the misses: tight-repack into a CPU scratch, one async buffer write,
+    // then per-glyph async texture uploads (buffer-backed = no VO-thread stall).
+    if (nmiss) {
+        if (p->gstage_cpu_sz < miss_bytes) {
+            p->gstage_cpu = talloc_realloc(p, p->gstage_cpu, uint8_t, miss_bytes);
+            p->gstage_cpu_sz = miss_bytes;
+        }
+        pl_buf *ring = &p->glyph_stage[p->glyph_stage_idx++ % 3];
+        bool buf_ok = (*ring) && (*ring)->params.size >= miss_bytes;
+        if (!buf_ok) {
+            size_t want = (miss_bytes + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);
+            buf_ok = pl_buf_recreate(gpu, ring,
+                                     pl_buf_params(.size = want, .host_writable = true));
+        }
+        size_t off = 0;
+        size_t *offs = talloc_array(tmp, size_t, nmiss);
+        for (int m = 0; m < nmiss; m++) {           // repack tight into the scratch
+            struct gmiss *g = &miss[m];
+            offs[m] = off;
+            for (int row = 0; row < g->h; row++)
+                memcpy(p->gstage_cpu + off + (size_t) row * g->w,
+                       g->src + (ptrdiff_t) row * pstride, g->w);
+            off += (size_t) g->w * g->h;
+        }
+        if (buf_ok) {
+            pl_buf_write(gpu, *ring, 0, p->gstage_cpu, miss_bytes);
+            for (int m = 0; m < nmiss; m++) {
+                struct gmiss *g = &miss[m];
+                pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
+                    .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
+                    .row_pitch = g->w, .buf = *ring, .buf_offset = offs[m]));
+            }
+        } else {                                    // fallback: synchronous
+            for (int m = 0; m < nmiss; m++) {
+                struct gmiss *g = &miss[m];
+                pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
+                    .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
+                    .row_pitch = g->w, .ptr = p->gstage_cpu + offs[m]));
+            }
+        }
+    }
+
+    int max_run = 0;
+    for (int i = 0; i < item->num_parts; i++)
+        max_run = MPMAX(max_run, (int) item->parts[i].libass.run_id);
+    int *idx = talloc_array(tmp, int, max_run + 1);
+    for (int i = 0; i <= max_run; i++) idx[i] = -1;
+
+    struct gc_region *regs = NULL;
+    int nregs = 0;
+    for (int i = 0; i < item->num_parts; i++) {
+        const struct sub_bitmap *b = &item->parts[i];
+        struct gc_region *r;
+        if (b->libass.glyph_id == 0)
+            continue;   // already-combined fallback parts go via the legacy path
+        int ri = idx[b->libass.run_id];
+        if (ri < 0) {
+            MP_TARRAY_GROW(tmp, regs, nregs);
+            ri = idx[b->libass.run_id] = nregs++;
+            regs[ri] = (struct gc_region){ .x0 = lrint(b->x * gs), .y0 = lrint(b->y * gs),
+                .x1 = lrint((b->x + b->dw) * gs), .y1 = lrint((b->y + b->dh) * gs),
+                .run_flags = b->libass.run_flags, .single_layer = 0xff };
+        }
+        r = &regs[ri];
+        r->x0 = MPMIN(r->x0, (int) lrint(b->x * gs));
+        r->y0 = MPMIN(r->y0, (int) lrint(b->y * gs));
+        r->x1 = MPMAX(r->x1, (int) lrint((b->x + b->dw) * gs));
+        r->y1 = MPMAX(r->y1, (int) lrint((b->y + b->dh) * gs));
+        if (b->libass.layer == 1) {
+            r->bord_color = b->libass.color;
+            r->blur_b = b->libass.blur_x;
+            MP_TARRAY_APPEND(tmp, r->bord, r->nbord, i);
+        } else {
+            r->fill_color = b->libass.color;
+            r->blur_f = b->libass.blur_x;
+            MP_TARRAY_APPEND(tmp, r->fill, r->nfill, i);
+        }
+    }
+
+    if (!nregs) { talloc_free(tmp); return; }   // no deferred runs in this item
+
+    const int AW = 4096;
+    int shelf_x = 0, shelf_y = 0, shelf_h = 0, max_w = 0;
+    int run_acc_w = 0, run_acc_h = 0;
+    #define ALLOC_REGION(AX, AY, RW, RH) do {                               \
+        if (shelf_x + (RW) > AW) { shelf_y += shelf_h; shelf_x = 0; shelf_h = 0; } \
+        (AX) = shelf_x; (AY) = shelf_y; shelf_x += (RW);                    \
+        shelf_h = MPMAX(shelf_h, (RH)); max_w = MPMAX(max_w, shelf_x);      \
+        run_acc_w = MPMAX(run_acc_w, (RW)); run_acc_h = MPMAX(run_acc_h, (RH)); \
+    } while (0)
+    for (int i = 0; i < nregs; i++) {
+        struct gc_region *r = &regs[i];
+        // Deferred runs are raw (unexpanded) per-glyph coverage, so they need
+        // the blur halo padding (libass's exact expand amount).
+        r->margin = blur_expand_pad(MPMAX(r->blur_f, r->blur_b));
+        int rw = r->x1 - r->x0 + 2 * r->margin, rh = r->y1 - r->y0 + 2 * r->margin;
+        if (r->nfill) ALLOC_REGION(r->fill_ax, r->fill_ay, rw, rh);
+        if (r->nbord) ALLOC_REGION(r->bord_ax, r->bord_ay, rw, rh);
+    }
+    int atlas_w = MPMAX(max_w, 1), atlas_h = MPMAX(shelf_y + shelf_h, 1);
+
+    if (!gc_ensure(gpu, &entry->result_tex, r8, atlas_w, atlas_h, true, true, false, false, false) ||
+        !gc_ensure(gpu, &p->run_acc, p->osd_acc_fmt, run_acc_w, run_acc_h, true, false, false, false, false) ||
+        !gc_ensure(gpu, &p->run_tmp, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
+        !gc_ensure(gpu, &p->run_cov_f, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
+        !gc_ensure(gpu, &p->run_cov_b, r8, run_acc_w, run_acc_h, true, true, false, false, false)) {
+        talloc_free(tmp);
+        return;
+    }
+
+    for (int i = 0; i < nregs; i++) {
+        struct gc_region *r = &regs[i];
+        int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
+        if (r->nfill) {
+            gc_build_cov(p, item, r, r->fill, r->nfill, p->run_cov_f, bw, bh, cpos, gs);
+            if (r->nbord) {
+                gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos, gs);
+                // fix_outline on the unblurred coverage (libass order), then blur.
+                if (r->run_flags & 1)   // bit 0 = apply fix_outline (see libass)
+                    osd_unop(p, p->run_cov_f, p->run_cov_b, bw, bh,
+                             "fill", true, "bord", osd_fixoutline_body);
+                gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
+                osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
+            }
+            gc_blur(p, p->run_cov_f, bw, bh, r->blur_f);  // σ may be 0 (bordered fill)
+            osd_copy(p, p->run_cov_f, entry->result_tex, r->fill_ax, r->fill_ay, bw, bh);
+        } else if (r->nbord) {
+            gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos, gs);
+            gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
+            osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
+        }
+    }
+
+    // Emit one monochrome overlay; parts in z-order: border (1) then fill (0)
+    // across all runs (deferred runs never carry a shadow).
+    entry->num_run_parts = 0;
+    for (int pass = 1; pass >= 0; pass--) {
+        for (int i = 0; i < nregs; i++) {
+            struct gc_region *r = &regs[i];
+            int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
+            int ax, ay; uint32_t c;
+            if (pass == 1 && r->nbord) { ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
+            else if (pass == 0 && r->nfill) { ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
+            else continue;
+            // result_tex is composited in capped space; upscale the region back
+            // to display coords (gs == 1 when uncapped -> identity). dst is a
+            // float rect, so libplacebo bilinear-upscales the sample.
+            struct pl_overlay_part part = {
+                .src = { ax, ay, ax + bw, ay + bh },
+                .dst = { (r->x0 - r->margin) / gs, (r->y0 - r->margin) / gs,
+                         (r->x1 + r->margin) / gs, (r->y1 + r->margin) / gs },
+                .color = { (c >> 24) / 255.0f, ((c >> 16) & 0xFF) / 255.0f,
+                           ((c >> 8) & 0xFF) / 255.0f, (255 - (c & 0xFF)) / 255.0f },
+            };
+            MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
+        }
+    }
+    talloc_free(tmp);
+
+    struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
+    *ol = (struct pl_overlay){
+        .tex = entry->result_tex, .parts = entry->run_parts,
+        .num_parts = entry->num_run_parts,
+        .mode = PL_OVERLAY_MONOCHROME, .coords = coords,
+        .color = pl_color_space_srgb, .repr.alpha = PL_ALPHA_INDEPENDENT,
+    };
+    if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
+        ol->color = src->params.color;
+}
+
 static void update_overlays(struct vo *vo, struct mp_osd_res res,
                             int flags, enum pl_overlay_coords coords,
                             struct osd_state *state, struct pl_frame *frame,
@@ -410,11 +943,13 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     mp_get_3d_side_by_side(stereo_mode, div);
     res.w /= div[0];
     res.h /= div[1];
-    p->dbg_capcomp_ns = 0;
-    p->dbg_blur_ns = 0;
-    int64_t dbg_sr0 = mp_time_ns();
-    struct sub_bitmap_list *subs = osd_render(vo->osd, res, pts, flags, mp_draw_sub_formats);
-    p->dbg_subrender_ns = mp_time_ns() - dbg_sr0;
+    // Advertise the deferred-composite format too; sd_ass only emits it when
+    // --sub-gpu-composite is set, otherwise it falls back to plain LIBASS.
+    static const bool gpu_sub_formats[SUBBITMAP_COUNT] = {
+        [SUBBITMAP_LIBASS] = true, [SUBBITMAP_BGRA] = true,
+        [SUBBITMAP_LIBASS_GLYPHS] = true,
+    };
+    struct sub_bitmap_list *subs = osd_render(vo->osd, res, pts, flags, gpu_sub_formats);
 
     frame->overlays = state->overlays;
     frame->num_overlays = 0;
@@ -424,6 +959,20 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         if (!item->num_parts || !item->packed)
             continue;
         struct osd_entry *entry = &state->entries[item->render_index];
+        if (item->format == SUBBITMAP_LIBASS_GLYPHS) {
+            // Glyph coverage is rendered at the (capped) render_w; compose the
+            // runs in that space and upscale to display. gs == 1 when uncapped.
+            double gs = item->render_w > 0 && subs->w > 0
+                      ? (double) item->render_w / subs->w : 1.0;
+            compose_glyph_runs(p, item, entry, frame, state, coords, src, gs);
+            // Already-combined fallback parts (shadow/karaoke runs, glyph_id 0)
+            // go through the legacy path below; skip it if there are none.
+            bool has_fallback = false;
+            for (int i = 0; i < item->num_parts; i++)
+                if (item->parts[i].libass.glyph_id == 0) { has_fallback = true; break; }
+            if (!has_fallback)
+                continue;
+        }
         pl_fmt tex_fmt = p->osd_fmt[item->format];
         if (!entry->tex)
             MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
@@ -489,6 +1038,8 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             const struct sub_bitmap *b = &item->parts[i];
             if (b->dw == 0 || b->dh == 0)
                 continue;
+            if (item->format == SUBBITMAP_LIBASS_GLYPHS && b->libass.glyph_id)
+                continue;   // deferred runs are handled by compose_glyph_runs
             uint32_t c = b->libass.color;
             struct pl_overlay_part part = {
                 .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
@@ -507,9 +1058,12 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         // coverage in pre-expanded bounds plus a per-part gaussian std-dev; do
         // the blur here on the GPU instead of on the CPU display path.
         pl_tex overlay_tex = entry->tex;
-        if (item->format == SUBBITMAP_LIBASS) {
+        if (item->format == SUBBITMAP_LIBASS ||
+            item->format == SUBBITMAP_LIBASS_GLYPHS) {
             bool any_blur = false;
             for (int i = 0; i < item->num_parts; i++) {
+                if (item->format == SUBBITMAP_LIBASS_GLYPHS && item->parts[i].libass.glyph_id)
+                    continue;   // deferred parts blurred by compose_glyph_runs
                 if (item->parts[i].libass.blur_x > 0 || item->parts[i].libass.blur_y > 0) {
                     any_blur = true;
                     break;
@@ -534,10 +1088,11 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 if (pl_tex_recreate(p->gpu, &entry->blur_tex, &bp) &&
                     pl_tex_recreate(p->gpu, &entry->tmp_tex, &bp))
                 {
-                    int64_t dbg_bl0 = mp_time_ns();
                     for (int i = 0; i < item->num_parts; i++) {
                         const struct sub_bitmap *b = &item->parts[i];
                         if (b->w < 1 || b->h < 1)
+                            continue;
+                        if (item->format == SUBBITMAP_LIBASS_GLYPHS && b->libass.glyph_id)
                             continue;
                         // separable: H with blur_x (atlas->tmp), V with blur_y (tmp->blur)
                         osd_blur_part(p, entry->tex, entry->tmp_tex,
@@ -547,7 +1102,6 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                                       b->src_x, b->src_y, b->w, b->h,
                                       b->libass.blur_y, osd_blur_body_v);
                     }
-                    p->dbg_blur_ns += mp_time_ns() - dbg_bl0;
                     overlay_tex = entry->blur_tex;
                 }
             }
@@ -590,6 +1144,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 }
             }
             break;
+        case SUBBITMAP_LIBASS_GLYPHS:   // the fallback singletons, same as LIBASS
         case SUBBITMAP_LIBASS:
             if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
                 ol->color = src->params.color;
@@ -669,9 +1224,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 op.background = PL_CLEAR_COLOR;
                 op.border = PL_CLEAR_COLOR;
                 op.background_transparency = 1.0f; // clear to transparent
-                int64_t dbg_cc0 = mp_time_ns();
                 pl_render_image(p->osd_rr, NULL, &inter, &op);
-                p->dbg_capcomp_ns += mp_time_ns() - dbg_cc0;
 
                 // Replace the N display-space parts with one upscale of the
                 // composited intermediate over the parts' display bounding box.
@@ -1654,12 +2207,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 #endif
     }
     stats_time_start(p->stats, "osd-update");
-    int64_t dbg_t0 = mp_time_ns();
     update_overlays(vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
                     frame->current ? frame->current->params.stereo3d : 0);
-    p->dbg_osd_ns = mp_time_ns() - dbg_t0;
     stats_time_end(p->stats, "osd-update");
     apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
@@ -1767,20 +2318,6 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     if (!render_ok) {
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
-    }
-
-    {
-        int64_t gpu_ns = 0;
-        for (int i = 0; i < p->perf_fresh.count; i++)
-            gpu_ns += p->perf_fresh.info[i].last;
-        double osd_ms = p->dbg_osd_ns / 1e6, gpu_ms = gpu_ns / 1e6;
-        double sr_ms = p->dbg_subrender_ns / 1e6, cc_ms = p->dbg_capcomp_ns / 1e6,
-               bl_ms = p->dbg_blur_ns / 1e6;
-        double other_ms = osd_ms - sr_ms - cc_ms - bl_ms; // upload + overlay build
-        if (osd_ms > 8 || gpu_ms > 25)
-            MP_WARN(vo, "[slowframe] osd-update=%.1f (subrender=%.1f capcomp=%.1f "
-                    "blur=%.1f other=%.1f) gpu-passes=%.1f ms\n",
-                    osd_ms, sr_ms, cc_ms, bl_ms, other_ms, gpu_ms);
     }
 
     struct pl_frame ref_frame;
@@ -2490,11 +3027,19 @@ static void uninit(struct vo *vo)
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].blur_tex);
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tmp_tex);
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].inter_tex);
+        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].result_tex);
     }
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
     for (int i = 0; i < p->num_sub_scratch; i++)
         pl_tex_destroy(p->gpu, &p->sub_scratch[i]);
+    pl_tex_destroy(p->gpu, &p->run_acc);
+    pl_tex_destroy(p->gpu, &p->run_tmp);
+    pl_tex_destroy(p->gpu, &p->run_cov_f);
+    pl_tex_destroy(p->gpu, &p->run_cov_b);
+    pl_tex_destroy(p->gpu, &p->glyph_atlas);
+    for (int i = 0; i < 3; i++)
+        pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
         pl_buf_destroy(p->gpu, &p->overlay_bufs[i]);
     for (int i = 0; i < p->num_user_hooks; i++)
@@ -2589,6 +3134,8 @@ static int preinit(struct vo *vo)
     p->queue = pl_queue_create(p->gpu);
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
+    p->osd_fmt[SUBBITMAP_LIBASS_GLYPHS] = p->osd_fmt[SUBBITMAP_LIBASS];
+    p->osd_acc_fmt = pl_find_named_fmt(p->gpu, "r32f");
     p->osd_sync = 1;
 
     // Dedicated renderer + RGBA target for the capped-resolution subtitle
