@@ -97,7 +97,6 @@ struct sub_ahead {
 
     int inline_active;           // VO is inline-rendering; worker must not race it
 
-    long dbg_served, dbg_empty, dbg_miss; // TEMP diagnostic
 };
 
 static double ahead_pts_to_subtitle(struct sub_ahead *a, double pts)
@@ -310,8 +309,6 @@ void sub_ahead_destroy(struct sub_ahead *a)
         mp_mutex_unlock(&a->lock);
         mp_thread_join(a->thread);
     }
-    MP_WARN(a, "[render-ahead] served=%ld empty=%ld miss=%ld\n",
-            a->dbg_served, a->dbg_empty, a->dbg_miss);
     queue_flush(a);
     ahead_clear(a);
     if (a->worker_sd) {
@@ -423,9 +420,6 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
         ahead_clear(a);
     }
     int idx = ahead_find(a, raw_video_pts, dim, format);
-    if (idx < 0) a->dbg_miss++;
-    else if (a->ring[idx].bmp) a->dbg_served++;
-    else a->dbg_empty++;
     struct sub_bitmaps *res = NULL;
     if (idx >= 0 && a->ring[idx].bmp) {
         res = sub_bitmaps_copy(NULL, a->ring[idx].bmp);
