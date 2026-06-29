@@ -361,6 +361,7 @@ const struct m_sub_options mp_subtitle_sub_opts = {
         {"sub-render-ahead-threads", OPT_INT(sub_render_ahead_threads), M_RANGE(0, 64),
             .flags = UPDATE_SUB_HARD},
         {"sub-gpu-blur", OPT_BOOL(sub_gpu_blur), .flags = UPDATE_SUB_HARD},
+        {"sub-gpu-composite", OPT_BOOL(sub_gpu_composite), .flags = UPDATE_SUB_HARD},
         {0}
     },
     .size = sizeof(OPT_BASE_STRUCT),
