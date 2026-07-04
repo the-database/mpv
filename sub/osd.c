@@ -337,7 +337,28 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
 
     struct sub_bitmaps *res = NULL;
 
-    check_obj_resize(osd, osdres, obj);
+    // Cap OSD render resolution (--osd-render-res-cap): a full-screen overlay
+    // such as the stats display, re-rendered and re-uploaded on each redraw at
+    // 8K, contends with heavy subtitle frames and tips them over the frame
+    // budget. Render non-subtitle OSD objects at a capped height and let the GPU
+    // upscale the result — far smaller atlas, upload and composite. The OSD is
+    // text/UI so the slight softening is acceptable; subtitles are never capped
+    // (they have --sub-render-res-limit with a proper capped-composite path).
+    struct mp_osd_res render_res = osdres;
+    int cap = osd->opts->osd_render_res_cap;
+    bool capped = cap > 0 && osdres.h > cap && !obj->is_sub &&
+                  obj->type != OSDTYPE_EXTERNAL2 && !osd->opts->force_rgba_osd;
+    if (capped) {
+        double s = (double) cap / osdres.h;
+        render_res.w  = lrint(osdres.w  * s);
+        render_res.h  = cap;
+        render_res.ml = lrint(osdres.ml * s);
+        render_res.mr = lrint(osdres.mr * s);
+        render_res.mt = lrint(osdres.mt * s);
+        render_res.mb = lrint(osdres.mb * s);
+    }
+
+    check_obj_resize(osd, render_res, obj);
 
     if (obj->type == OSDTYPE_SUB) {
         if (obj->sub && sub_is_primary_visible(obj->sub))
@@ -352,6 +373,20 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
         }
     } else {
         res = osd_object_get_bitmaps(osd, obj, format);
+    }
+
+    // Scale the capped-resolution OSD parts back up to the real output size; the
+    // small packed atlas is sampled into larger dst rects (GPU bilinear upscale).
+    if (res && capped) {
+        double sx = (double) osdres.w / render_res.w;
+        double sy = (double) osdres.h / render_res.h;
+        for (int i = 0; i < res->num_parts; i++) {
+            struct sub_bitmap *b = &res->parts[i];
+            b->x  = lrint(b->x * sx);
+            b->y  = lrint(b->y * sy);
+            b->dw = lrint(b->w * sx);
+            b->dh = lrint(b->h * sy);
+        }
     }
 
     if (obj->vo_had_output != !!res) {
