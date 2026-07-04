@@ -63,7 +63,7 @@ struct sd_ass_priv {
     bool check_animated;
     // One-shot "built without forked-libass deferred API" warnings (only used
     // when the corresponding HAVE_ASS_*_DEFERRED guard is off; harmless otherwise).
-    bool warned_gpu_blur, warned_gpu_composite;
+    bool warned_gpu_blur, warned_gpu_composite, warned_gpu_raster;
 };
 
 struct seen_packet {
@@ -789,8 +789,25 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     // The VO advertises SUBBITMAP_LIBASS_GLYPHS when it has the GPU compositor;
     // honor it only when --sub-gpu-composite is set, else fall back to combined
     // LIBASS so a VO that requested glyphs still gets drawable output.
+    // --sub-gpu-raster: emit glyph outlines for GPU rasterization (implies the
+    // GPU composite). The VO advertises OUTLINES/GLYPHS; honor each only when
+    // the matching option is set, else fall back to combined LIBASS.
+#if HAVE_ASS_OUTLINE_DEFERRED
+    bool raster = format == SUBBITMAP_LIBASS_OUTLINES && opts->sub_gpu_raster;
+#else
+    // Built against a libass without the deferred-outline API: never advertise
+    // the raster path, so an OUTLINES-capable VO still gets drawable output.
+    bool raster = false;
+    if (opts->sub_gpu_raster && !ctx->warned_gpu_raster) {
+        MP_WARN(sd, "built without forked-libass deferred API; ignoring --sub-gpu-raster\n");
+        ctx->warned_gpu_raster = true;
+    }
+#endif
+    if (format == SUBBITMAP_LIBASS_OUTLINES && !raster)
+        format = SUBBITMAP_LIBASS;
 #if HAVE_ASS_COMPOSITE_DEFERRED
-    bool comp = format == SUBBITMAP_LIBASS_GLYPHS && opts->sub_gpu_composite;
+    bool comp = (format == SUBBITMAP_LIBASS_GLYPHS && opts->sub_gpu_composite) ||
+                raster;
 #else
     // Built against a libass without the deferred-composite API: never advertise
     // the glyph path, so a GLYPHS-capable VO still gets drawable combined output.
@@ -812,6 +829,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
 #endif
 #if HAVE_ASS_COMPOSITE_DEFERRED
     ass_set_composite_deferred(renderer, comp);
+#endif
+#if HAVE_ASS_OUTLINE_DEFERRED
+    ass_set_outline_deferred(renderer, raster);
 #endif
 
     // Currently no supported text sub formats support a distinction between forced
