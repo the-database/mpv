@@ -2674,6 +2674,24 @@ Subtitles
 
     Default: no.
 
+``--sub-gpu-raster=<yes|no>``
+    Experimental. Rasterize ASS/SSA subtitle glyphs on the GPU: libass emits
+    each glyph's transformed coverage outline (pre-split into tiles) instead of
+    a rasterized bitmap, and ``--vo=gpu-next`` rasterizes it into a persistent
+    GPU glyph cache with a compute pass — only on a cache miss, so glyphs that
+    merely move (motion-tracked typesetting) cost no CPU rasterization and no
+    upload at all. The GPU also performs the per-run combine, blur and
+    composite (this option implies the deferred composite, and with it the
+    deferred blur). Vector and rectangular ``\clip``/``\iclip``, ``\kf``
+    karaoke wipes, ``\be`` box blur and drop shadows are reproduced on the GPU.
+
+    Requires a libass build with deferred-outline support and ``--vo=gpu-next``
+    with compute shaders and a storable OSD texture format; otherwise it is
+    ignored (with a warning). Coverage matches the CPU rasterizer's analytic
+    anti-aliasing.
+
+    Default: no.
+
 ``--sub-glyph-atlas-height=<0-16384>``
     Debug/development only. Caps the size (in pixels) of the ``--vo=gpu-next``
     persistent GPU glyph atlas at creation. 0 (the default) uses the GPU maximum
@@ -3742,6 +3760,20 @@ Window
     ``vdpau``, ``direct3d``), this can be slightly faster or slower,
     depending on GPU drivers and hardware. For other VOs, this just makes
     rendering slower.
+
+``--osd-render-res-cap=<0-4320>``
+    Experimental. Cap the height (in pixels) at which non-subtitle OSD
+    overlays (the OSD/OSC, the stats display, external overlays except
+    ``overlay-add``) are rendered. When the output is taller than the cap,
+    the OSD is rendered at the capped height (width scaled to keep the
+    aspect) and GPU-upscaled to the output size. A full-screen overlay such
+    as the stats display, re-rendered and re-uploaded on every redraw at
+    very high output resolutions (8K), can otherwise contend with heavy
+    subtitle frames. The OSD is text/UI, so the slight softening is usually
+    acceptable. Subtitles are never affected by this option (see
+    ``--sub-render-res-limit`` for those).
+
+    Default: 0 (no cap).
 
 ``--force-render``
     Forces mpv to always render frames regardless of the visibility of the
