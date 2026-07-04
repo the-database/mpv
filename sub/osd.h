@@ -33,6 +33,9 @@ enum sub_bitmap_format {
                         // SUBBITMAP_BGRA during packing
     SUBBITMAP_LIBASS_GLYPHS, // like LIBASS but uncombined per-glyph parts, to be
                         // combined + composited on the GPU (deferred composite)
+    SUBBITMAP_LIBASS_OUTLINES, // like GLYPHS but each part carries the glyph's
+                        // coverage OUTLINE (a tile/segment blob), rasterized on
+                        // the GPU instead of the CPU (deferred outline)
 
     SUBBITMAP_COUNT
 };
@@ -63,6 +66,27 @@ struct sub_bitmap {
             uint32_t run_id;     // coverage-combine within a run, over across
             uint32_t run_flags;  // run FilterDesc flags (fix_outline/shadow)
             uint8_t layer;       // 0=fill, 1=outline, 2=shadow (ASS_Image.type)
+            // Deferred-outline mode (SUBBITMAP_LIBASS_OUTLINES): the glyph's
+            // coverage as a libass tile-export blob of n_outline int32 values
+            // ([n_tiles, n_segs, tiles x 11, segs x 8]; float fields stored
+            // bit-for-bit -- see ASS_Image.outline), to rasterize on the GPU.
+            // bitmap is NULL.
+            const int32_t *outline;
+            int32_t n_outline;
+            // Outline-mode vector \clip: run_flags bit 1 marks a clip-mask part
+            // (its outline rasterizes to a mask; bit 2 = inverse \iclip). A
+            // clipped part carries clip_id == the mask part's run_id (0 = none).
+            uint32_t clip_id;
+            // Outline-mode rectangular \clip: the visible rectangle in storage
+            // px (same space as the part's dst). The consumer intersects the
+            // run's drawn area with it; equals the full frame when unclipped.
+            int32_t clip_rx0, clip_ry0, clip_rx1, clip_ry1;
+            // Outline-mode \kf karaoke wipe (run_flags bit 3): color left of
+            // screen-x wipe_x, color2 to its right.
+            uint32_t color2;
+            int32_t wipe_x;
+            // Outline-mode \be: iterations of the [1,2,1]/4 box blur (0 = none).
+            int32_t be;
         } libass;
         struct {
             const struct sbr_output_image *image;
