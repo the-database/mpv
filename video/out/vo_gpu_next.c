@@ -204,6 +204,21 @@ struct priv {
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
 
+    // Permanent perf instrumentation (WP-A3); zero-cost when --dump-stats/-v off.
+    // cnt_* are live counters (plain int64 increments); stat_* hold the last
+    // value emitted as an MP_STATS "value" line (emit-on-change). stat_* are
+    // seeded to -1 in preinit so the first frame always emits a baseline sample
+    // (so e.g. gcache-flush==0 is assertable). first_frame_drawn gates the
+    // vo-alloc-after-first-frame aggregate.
+    int64_t cnt_gcache_flush, cnt_atlas_overflow, cnt_staging_grow;
+    int64_t cnt_overlay_buf_grow, cnt_tex_realloc, cnt_vo_alloc_after_first;
+    int64_t stat_gcache_flush, stat_atlas_overflow, stat_staging_grow;
+    int64_t stat_overlay_buf_grow, stat_tex_realloc, stat_vo_alloc_after_first;
+    bool first_frame_drawn;
+    // Phase wall-times (ns) for the MSGL_V [slowframe] line; only computed when
+    // MSGL_V is active. The phase start/end dump-stats events themselves come
+    // from stats_time_*() and are independent of these timers.
+    int64_t dbg_subrender_ns, dbg_capcomp_ns, dbg_blur_ns;
 
     struct mp_image_params target_params;
 };
@@ -225,6 +240,7 @@ struct gl_next_opts {
     int target_hint;
     int target_hint_mode;
     bool target_hint_strict;
+    int sub_glyph_atlas_height; // WP-A3 debug knob; 0 = default (see option below)
     char **raw_opts;
 };
 
@@ -261,6 +277,12 @@ const struct m_sub_options gl_next_conf = {
         {"target-colorspace-hint-mode", OPT_CHOICE(target_hint_mode, {"target", 0}, {"source", 1}, {"source-dynamic", 2})},
         {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
         // No `target-lut-type` because we don't support non-RGB targets
+        // DEBUG/dev only: cap the GPU glyph atlas size (pixels) at creation.
+        // 0 = default (GPU max, up to 16384). A small value (e.g. 256) shrinks
+        // the atlas to N x N and forces glyph-atlas overflow / cache-flush storms
+        // so the perf counters (atlas-overflow, gcache-flush) can be exercised in
+        // tests. Not for normal use -- a low cap makes dense subtitle frames flash.
+        {"sub-glyph-atlas-height", OPT_INT(sub_glyph_atlas_height), M_RANGE(0, 16384)},
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
     },
@@ -630,6 +652,28 @@ static void gcache_reset(struct priv *p)
     p->gsx = p->gsy = p->growh = 0;
 }
 
+// WP-A3: bump a growth/realloc counter and, when it happens after the first
+// successfully drawn frame, also the aggregate vo-alloc-after-first-frame
+// counter. These are the VO-thread stalls the 8K effort chased (buffer/texture
+// reallocs, cache flushes, atlas rebuilds -- see the post-mortem tail spikes).
+static void vo_alloc_bump(struct priv *p, int64_t *counter)
+{
+    (*counter)++;
+    if (p->first_frame_drawn)
+        p->cnt_vo_alloc_after_first++;
+}
+
+// WP-A3: emit "value <n> <name>" to --dump-stats, but only when the counter
+// changed since the last emission (MP_STATS no-ops unless --dump-stats is
+// active; the caller seeds *last = -1 so one baseline sample is always emitted).
+static void emit_counter(struct vo *vo, const char *name, int64_t cur, int64_t *last)
+{
+    if (cur != *last) {
+        *last = cur;
+        MP_STATS(vo, "value %lld %s", (long long) cur, name);
+    }
+}
+
 // Locate a glyph in the persistent atlas, uploading it from `src` on a miss
 // (skyline-packed, 1px pad). Returns false if it can't be placed this frame.
 // Reserve a glyph's slot in the persistent atlas. Cache hit: *upload stays
@@ -699,8 +743,10 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
 
 static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
 {
+    stats_time_start(p->stats, "sub-blur");   // WP-A3: GPU blur pass (composite path)
     osd_blur_part(p, cov, p->run_tmp, 0, 0, bw, bh, sigma, osd_blur_body_h);
     osd_blur_part(p, p->run_tmp, cov, 0, 0, bw, bh, sigma, osd_blur_body_v);
+    stats_time_end(p->stats, "sub-blur");
 }
 
 // Composite a SUBBITMAP_LIBASS_GLYPHS item: reproduce libass's per-run combine
@@ -728,14 +774,27 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         // must mostly fit at once or later ones get dropped (signs flashing).
         // 16384^2 r8 = 256MB. (4096 overflowed even at 1080p.)
         p->gatlas_w = p->gatlas_h = MPMIN(gpu->limits.max_tex_2d_dim, 16384);
+        // WP-A3 debug override (--sub-glyph-atlas-height): shrink the atlas so
+        // tests can force overflow / flush storms. Clamp BOTH dims to the cap:
+        // packing is row-major (width-first), so a tall/wide-but-short atlas
+        // would never advance the packing cursor past the small height, and no
+        // overflow would occur. The atlas is otherwise square, so an N x N cap
+        // makes the height the reachable binding constraint. 0 = no cap.
+        if (p->next_opts->sub_glyph_atlas_height > 0) {
+            int cap = p->next_opts->sub_glyph_atlas_height;
+            p->gatlas_h = MPMIN(p->gatlas_h, cap);
+            p->gatlas_w = MPMIN(p->gatlas_w, cap);
+        }
         if (!gc_ensure(gpu, &p->glyph_atlas, r8, p->gatlas_w, p->gatlas_h,
                        false, true, false, false, true))
             return;
         p->gcache_cap = 1 << 15;
         p->gcache = talloc_zero_array(p, struct gcache_slot, p->gcache_cap);
     }
-    if (p->gsy > p->gatlas_h - 256 || p->gcache_count * 10 > p->gcache_cap * 7)
-        gcache_reset(p);
+    if (p->gsy > p->gatlas_h - 256 || p->gcache_count * 10 > p->gcache_cap * 7) {
+        gcache_reset(p);            // WP-A3: watermark flush (near-full cache)
+        vo_alloc_bump(p, &p->cnt_gcache_flush);
+    }
 
     void *tmp = talloc_new(NULL);
 
@@ -763,7 +822,14 @@ gc_restart:
             continue;
         bool up;
         if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up)) {
-            if (!gc_retried) { gcache_reset(p); gc_retried = true; goto gc_restart; }
+            if (!gc_retried) {
+                // WP-A3: atlas overflow -> rebuild-from-empty retry (a flush too).
+                gcache_reset(p);
+                vo_alloc_bump(p, &p->cnt_gcache_flush);
+                vo_alloc_bump(p, &p->cnt_atlas_overflow);
+                gc_retried = true;
+                goto gc_restart;
+            }
             continue;   // already rebuilt from empty: this frame genuinely overflows
         }
         if (up) {
@@ -778,6 +844,7 @@ gc_restart:
     // Flush the misses: tight-repack into a CPU scratch, one async buffer write,
     // then per-glyph async texture uploads (buffer-backed = no VO-thread stall).
     if (nmiss) {
+        stats_time_start(p->stats, "sub-upload");   // WP-A3: glyph atlas upload
         if (p->gstage_cpu_sz < miss_bytes) {
             p->gstage_cpu = talloc_realloc(p, p->gstage_cpu, uint8_t, miss_bytes);
             p->gstage_cpu_sz = miss_bytes;
@@ -788,6 +855,7 @@ gc_restart:
             size_t want = (miss_bytes + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);
             buf_ok = pl_buf_recreate(gpu, ring,
                                      pl_buf_params(.size = want, .host_writable = true));
+            vo_alloc_bump(p, &p->cnt_staging_grow);   // WP-A3: glyph staging grow
         }
         size_t off = 0;
         size_t *offs = talloc_array(tmp, size_t, nmiss);
@@ -815,6 +883,7 @@ gc_restart:
                     .row_pitch = g->w, .ptr = p->gstage_cpu + offs[m]));
             }
         }
+        stats_time_end(p->stats, "sub-upload");
     }
 
     int max_run = 0;
@@ -960,13 +1029,23 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     mp_get_3d_side_by_side(stereo_mode, div);
     res.w /= div[0];
     res.h /= div[1];
+    // WP-A3 slow-frame phase timers: only take wall-clock samples when the
+    // MSGL_V [slowframe] path can fire. The dump-stats start/end phase events
+    // (stats_time_*) are emitted unconditionally and self-gate on MSGL_STATS.
+    bool want_t = mp_msg_test(vo->log, MSGL_V);
+    p->dbg_subrender_ns = p->dbg_capcomp_ns = p->dbg_blur_ns = 0;
     // Advertise the deferred-composite format too; sd_ass only emits it when
     // --sub-gpu-composite is set, otherwise it falls back to plain LIBASS.
     static const bool gpu_sub_formats[SUBBITMAP_COUNT] = {
         [SUBBITMAP_LIBASS] = true, [SUBBITMAP_BGRA] = true,
         [SUBBITMAP_LIBASS_GLYPHS] = true,
     };
+    stats_time_start(p->stats, "sub-render");   // WP-A3: libass render + fetch
+    int64_t sr0 = want_t ? mp_time_ns() : 0;
     struct sub_bitmap_list *subs = osd_render(vo->osd, res, pts, flags, gpu_sub_formats);
+    if (want_t)
+        p->dbg_subrender_ns = mp_time_ns() - sr0;
+    stats_time_end(p->stats, "sub-render");
 
     frame->overlays = state->overlays;
     frame->num_overlays = 0;
@@ -981,7 +1060,9 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             // runs in that space and upscale to display. gs == 1 when uncapped.
             double gs = item->render_w > 0 && subs->w > 0
                       ? (double) item->render_w / subs->w : 1.0;
+            stats_time_start(p->stats, "sub-composite");   // WP-A3: GPU per-glyph composite
             compose_glyph_runs(p, item, entry, frame, state, coords, src, gs);
+            stats_time_end(p->stats, "sub-composite");
             // Already-combined fallback parts (shadow/karaoke runs, glyph_id 0)
             // go through the legacy path below; skip it if there are none.
             bool has_fallback = false;
@@ -998,10 +1079,14 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         // (each realloc stalls the display thread).
         int want_w = (item->packed_w + 255) & ~255;
         int want_h = (item->packed_h + 255) & ~255;
+        int prev_w = entry->tex ? entry->tex->params.w : -1;
+        int prev_h = entry->tex ? entry->tex->params.h : -1;
+        int new_w = MPMAX(want_w, entry->tex ? entry->tex->params.w : 0);
+        int new_h = MPMAX(want_h, entry->tex ? entry->tex->params.h : 0);
         bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
             .format = tex_fmt,
-            .w = MPMAX(want_w, entry->tex ? entry->tex->params.w : 0),
-            .h = MPMAX(want_h, entry->tex ? entry->tex->params.h : 0),
+            .w = new_w,
+            .h = new_h,
             .host_writable = true,
             .sampleable = true,
         });
@@ -1009,6 +1094,11 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             MP_ERR(vo, "Failed recreating OSD texture!\n");
             break;
         }
+        // WP-A3: count only real (re)allocations -- the tex is grown monotonically
+        // so this fires on first alloc and on each grow, not every frame.
+        if (new_w != prev_w || new_h != prev_h)
+            vo_alloc_bump(p, &p->cnt_tex_realloc);
+        stats_time_start(p->stats, "sub-upload");   // WP-A3: overlay atlas upload
         struct pl_tex_transfer_params upload_params = {
             .tex        = entry->tex,
             .rc         = { .x1 = item->packed_w, .y1 = item->packed_h, },
@@ -1029,6 +1119,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             size_t want = (buf_size + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
             buf_ok = pl_buf_recreate(p->gpu, ring,
                                      pl_buf_params(.size = want, .host_writable = true));
+            vo_alloc_bump(p, &p->cnt_overlay_buf_grow);   // WP-A3: overlay ring grow
         }
         if (buf_ok)
         {
@@ -1044,6 +1135,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             }
             ok = pl_tex_upload(p->gpu, &upload_params);
         }
+        stats_time_end(p->stats, "sub-upload");
         if (!ok) {
             MP_ERR(vo, "Failed uploading OSD texture!\n");
             talloc_free(upload_params.priv);
@@ -1105,6 +1197,8 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 if (pl_tex_recreate(p->gpu, &entry->blur_tex, &bp) &&
                     pl_tex_recreate(p->gpu, &entry->tmp_tex, &bp))
                 {
+                    stats_time_start(p->stats, "sub-blur");   // WP-A3: GPU blur pass
+                    int64_t bl0 = want_t ? mp_time_ns() : 0;
                     for (int i = 0; i < item->num_parts; i++) {
                         const struct sub_bitmap *b = &item->parts[i];
                         if (b->w < 1 || b->h < 1)
@@ -1119,6 +1213,9 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                                       b->src_x, b->src_y, b->w, b->h,
                                       b->libass.blur_y, osd_blur_body_v);
                     }
+                    if (want_t)
+                        p->dbg_blur_ns += mp_time_ns() - bl0;
+                    stats_time_end(p->stats, "sub-blur");
                     overlay_tex = entry->blur_tex;
                 }
             }
@@ -1241,7 +1338,10 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 op.background = PL_CLEAR_COLOR;
                 op.border = PL_CLEAR_COLOR;
                 op.background_transparency = 1.0f; // clear to transparent
+                int64_t cc0 = want_t ? mp_time_ns() : 0;   // WP-A3: capped composite
                 pl_render_image(p->osd_rr, NULL, &inter, &op);
+                if (want_t)
+                    p->dbg_capcomp_ns += mp_time_ns() - cc0;
 
                 // Replace the N display-space parts with one upscale of the
                 // composited intermediate over the parts' display bounding box.
@@ -2223,12 +2323,20 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             target.color.transfer = PL_COLOR_TRC_SRGB;
 #endif
     }
+    // WP-A3: slow-frame timing. Only sample the clock when the MSGL_V slowframe
+    // line can fire; otherwise this is just the (already-present) stats events.
+    bool want_slow = mp_msg_test(vo->log, MSGL_V);
+    int64_t osd_t0 = want_slow ? mp_time_ns() : 0;
     stats_time_start(p->stats, "osd-update");
     update_overlays(vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
                     frame->current ? frame->current->params.stereo3d : 0);
     stats_time_end(p->stats, "osd-update");
+    // Snapshot the phase timers now, before the blend-subs update_overlays loop
+    // below can overwrite them (they live in priv, reset per update_overlays call).
+    int64_t osd_ns = want_slow ? mp_time_ns() - osd_t0 : 0;
+    int64_t sr_ns = p->dbg_subrender_ns, cc_ns = p->dbg_capcomp_ns, bl_ns = p->dbg_blur_ns;
     apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
 
@@ -2329,9 +2437,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     // Render frame
+    int64_t submit_t0 = want_slow ? mp_time_ns() : 0;   // WP-A3: render-submit wall time
     stats_time_start(p->stats, "render");
     bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
     stats_time_end(p->stats, "render");
+    int64_t submit_ns = want_slow ? mp_time_ns() - submit_t0 : 0;
     if (!render_ok) {
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
@@ -2339,6 +2449,29 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     struct pl_frame ref_frame;
     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
+
+    // WP-A3: per-frame counter samples (emit-on-change; no-op unless --dump-stats)
+    // and the MSGL_V [slowframe] breakdown line (format kept byte-compatible with
+    // the historical logs + TOOLS/subtest/parse_stats.py).
+    emit_counter(vo, "gcache-flush",              p->cnt_gcache_flush,        &p->stat_gcache_flush);
+    emit_counter(vo, "atlas-overflow",            p->cnt_atlas_overflow,      &p->stat_atlas_overflow);
+    emit_counter(vo, "staging-grow",              p->cnt_staging_grow,        &p->stat_staging_grow);
+    emit_counter(vo, "overlay-buf-grow",          p->cnt_overlay_buf_grow,    &p->stat_overlay_buf_grow);
+    emit_counter(vo, "tex-realloc",               p->cnt_tex_realloc,         &p->stat_tex_realloc);
+    emit_counter(vo, "vo-alloc-after-first-frame", p->cnt_vo_alloc_after_first, &p->stat_vo_alloc_after_first);
+    if (want_slow) {
+        int64_t gpu_ns = 0;
+        for (int i = 0; i < p->perf_fresh.count; i++)
+            gpu_ns += p->perf_fresh.info[i].last;
+        double osd_ms = osd_ns / 1e6, sr_ms = sr_ns / 1e6, cc_ms = cc_ns / 1e6,
+               bl_ms = bl_ns / 1e6, sub_ms = submit_ns / 1e6, gpu_ms = gpu_ns / 1e6;
+        double other_ms = osd_ms - sr_ms - cc_ms - bl_ms; // upload + overlay build
+        double budget_ms = frame->duration > 0 ? frame->duration / 1e6 : 41.7;
+        if (osd_ms > budget_ms)
+            MP_VERBOSE(vo, "[slowframe] osd-update=%.1f (subrender=%.1f capcomp=%.1f "
+                       "blur=%.1f other=%.1f) render-submit=%.1f gpu-passes=%.1f ms\n",
+                       osd_ms, sr_ms, cc_ms, bl_ms, other_ms, sub_ms, gpu_ms);
+    }
 
     mp_mutex_lock(&vo->params_mutex);
     p->target_params = (struct mp_image_params){
@@ -2360,6 +2493,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     p->is_interpolated = pts_offset != 0 && mix.num_frames > 1;
     valid = true;
+    p->first_frame_drawn = true; // WP-A3: gate vo-alloc-after-first-frame counting
     // fall through
 
 done:
@@ -3116,6 +3250,11 @@ static int preinit(struct vo *vo)
     p->global = vo->global;
     p->log = vo->log;
     p->stats = stats_ctx_create(p, vo->global, "vo/gpu-next");
+    // WP-A3: seed emit-on-change sentinels so the first frame emits a baseline
+    // value sample for every counter (so e.g. --assert-value gcache-flush==0
+    // finds a sample on a clean run).
+    p->stat_gcache_flush = p->stat_atlas_overflow = p->stat_staging_grow = -1;
+    p->stat_overlay_buf_grow = p->stat_tex_realloc = p->stat_vo_alloc_after_first = -1;
 
     struct gl_video_opts *gl_opts = p->opts_cache->opts;
     struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
