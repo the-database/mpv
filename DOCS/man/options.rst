@@ -2674,6 +2674,19 @@ Subtitles
 
     Default: no.
 
+``--sub-glyph-atlas-height=<0-16384>``
+    Debug/development only. Caps the size (in pixels) of the ``--vo=gpu-next``
+    persistent GPU glyph atlas at creation. 0 (the default) uses the GPU maximum
+    (up to 16384). A small value (e.g. 256) shrinks the atlas (the cap is applied
+    to both dimensions, since row-major packing means a short-but-wide atlas would
+    never overflow) and deliberately forces glyph-atlas overflow and glyph-cache
+    flush storms, so the built-in performance counters (``atlas-overflow``,
+    ``gcache-flush``, exposed via ``--dump-stats``) can be exercised in tests. Not
+    intended for normal playback: a low cap makes dense subtitle/sign frames flash
+    as glyphs are dropped and re-uploaded.
+
+    Default: 0 (no cap).
+
 ``--sub-ass-styles=<filename>``
     Load all SSA/ASS styles found in the specified file and use them for
     rendering text subtitles. The syntax of the file is exactly like the ``[V4
