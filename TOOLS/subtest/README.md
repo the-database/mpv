@@ -6,13 +6,19 @@ an acceptance matrix of mpv configs.
 
 Python 3.12, **stdlib only** — no third-party packages.
 
-Three tools plus a self-test:
+Four tools plus self-tests:
 
 | file                | role                                                         |
 |---------------------|--------------------------------------------------------------|
 | `parse_stats.py`    | parse / report / assert on `--dump-stats` and mpv text logs  |
 | `run_matrix.py`     | run (or emit for Windows) an acceptance config matrix        |
 | `check_reference.py`| self-test: reproduce the postmortem reference table          |
+| `abdiff.py`         | screenshot A/B **pixel** diff: prove two configs render identically |
+
+`parse_stats.py`/`run_matrix.py`/`check_reference.py` measure *performance*.
+`abdiff.py` verifies *pixel output*: it screenshots the actual gpu-next window
+under two configs and diffs the PNGs, so "the GPU path is bit-identical to the
+CPU path" becomes a mechanical, gateable check.
 
 ---
 
@@ -146,6 +152,146 @@ mpv's IPC socket from a `.bat` is painful, the **seek is manual**: the `.bat`
 header tells the operator to press RIGHT ARROW (or drag the seek bar) around
 the halfway mark — or to set `SEEKSTART=--start=SECONDS` to sample the tail of
 the file with no manual step.
+
+---
+
+## abdiff.py — screenshot A/B pixel-diff harness
+
+Proves that two mpv configs produce **identical on-screen subtitle rendering**,
+or quantifies the difference. This is the §2.B acceptance mechanism: with
+`--blend-subtitles=no`, the CPU-bitmap and GPU-deferred paths share the same
+final float blend, so a final-frame pixel diff of exactly **0** is a valid gate.
+
+### How it works
+
+For each config it launches mpv once over `--input-ipc-server=<sock>` (JSON
+IPC), waits until the file is loaded and `seekable`, then for each requested PTS
+does `seek <pts> absolute+exact`, waits for the `playback-restart` event (+ a
+small settle), and `screenshot-to-file <out.png> window`. **Window** mode
+captures the real gpu-next output — including GPU-composited subs — and the PNG
+is lossless. The two screenshots are then diffed pixel-for-pixel.
+
+### PNG decode (why it's built in)
+
+ffmpeg/ffprobe are **not installed** on this box and the Python stdlib has no
+PNG decoder, so `abdiff.py` ships a minimal one built on `zlib`. mpv's window
+screenshots are **16-bit RGBA (rgba64), non-interlaced**; the decoder handles
+8- and 16-bit RGB/RGBA and all five scanline filters. We pin
+`--screenshot-png-filter=0` (filter None) so decode is effectively a memcpy.
+Diffs are computed in native sample units (0..65535 at 16-bit) and also
+reported normalised to an 8-bit (`/255`) scale so "1 LSB" reads intuitively
+(1 LSB @8-bit ≈ 257 @16-bit).
+
+### Determinism controls (baked into `BASE_FLAGS`)
+
+Every run pins: `--geometry=1280x720 --window-scale=1` (window size ==
+composite resolution), `--no-border --no-osc --no-osd-bar --osd-level=0
+--no-input-default-bindings --force-window=yes --keep-open=yes --pause`,
+`--dither=no --deband=no --icc-profile-auto=no --hr-seek=yes --sub-auto=no
+--blend-subtitles=no`, `--screenshot-format=png --screenshot-png-compression=1
+--screenshot-png-filter=0 --screenshot-high-bit-depth=yes
+--screenshot-tag-colorspace=no`, plus the box requirements `--no-config
+--gpu-sw=yes --vo=gpu-next --gpu-api=vulkan --no-audio` and a fixed `--sid`.
+With these pinned, determinism is exact — same config twice gives maxdiff 0 on
+both synthetic lavfi media and the real kobayashi mkv (verified, see below). No
+extra pinning was needed.
+
+> **NB:** give synthetic media as an `av://lavfi:...` URL. The `av://` protocol
+> selects the demuxer itself; do **not** add a global `--demuxer-lavf-format=lavfi`
+> — it also routes the external `.ass` sub file through lavfi and fails to open it.
+
+### Single pair
+
+```sh
+# from TOOLS/subtest/ so the samples/ paths resolve
+python3 abdiff.py --mpv ../../build/mpv \
+    --media "av://lavfi:color=c=0x606060:s=1280x720:d=120:r=24" \
+    --sub samples/blur.ass --pts 3,9,15 \
+    --config-a="" --config-b="--sub-gpu-blur=yes" \
+    --out out --tag blur_gpu
+```
+
+Output: per-PTS `maxdiff` (16-bit + `~/255`), differing-pixel count and `%px`,
+and an overall `IDENTICAL`/`DIFFERS` verdict. Exit code is 0 iff identical
+(so tests 1–3 are gateable). On any mismatch it saves `<tag>_a_<pts>.png`,
+`<tag>_b_<pts>.png`, and an amplified `<tag>_diff_<pts>.png` into `--out`, plus
+a machine-readable `<tag>_result.json`.
+
+> **argparse gotcha:** a `--config-*` value that starts with `-` must use the
+> `=` form (`--config-b="--sub-gpu-blur=yes"`), otherwise argparse treats it as
+> an option. The JSON batch mode below has no such restriction.
+
+### JSON batch mode (config matrix)
+
+```sh
+python3 abdiff.py --mpv ../../build/mpv --batch samples/selftest_batch.json --out out
+```
+
+The batch spec is an object with optional top-level defaults (`media`, `pts`,
+`sub`, `amp`) and a `pairs` list; each pair may override any default and sets
+`tag`, `config_a`, `config_b`:
+
+```json
+{
+  "media": "av://lavfi:color=c=0x606060:s=1280x720:d=120:r=24",
+  "pts": [3, 9, 15],
+  "pairs": [
+    {"tag": "det",       "sub": "samples/dialogue.ass", "config_a": "", "config_b": ""},
+    {"tag": "gpu_blur",  "sub": "samples/blur.ass",     "config_a": "", "config_b": "--sub-gpu-blur=yes"}
+  ]
+}
+```
+
+Exit code is 1 if any pair is not `IDENTICAL`. A `batch_summary.json` is written
+to `--out`. `samples/selftest_batch.json` is the committed self-test matrix.
+
+### samples/
+
+Ten hand-written `.ass` files (font: **DejaVu Sans**, resolved by fontconfig;
+nothing embedded), each with a few events spanning 0–22 s so PTS 1–18 hit
+visible content:
+
+| sample               | exercises                                            |
+|----------------------|------------------------------------------------------|
+| `dialogue.ass`       | plain styled text (baseline)                         |
+| `blur.ass`           | `\blur0.6`, `\blur3`, `\blur12`                       |
+| `be.ass`             | `\be1`, `\be4`                                        |
+| `clip_rect.ass`      | rectangular `\clip(x1,y1,x2,y2)`                      |
+| `clip_vect.ass`      | vector-drawing `\clip(m … l …)`                       |
+| `iclip.ass`          | inverse `\iclip`                                      |
+| `kf.ass`             | `\kf` karaoke sweep (mid-line at each PTS)            |
+| `shadow_layers.ass`  | `\shad` + overlapping layered events                 |
+| `rotate.ass`         | `\frz` via `\t` animation                             |
+| `fs300.ass`          | fontsize 300 + heavy `\blur8` glyphs                 |
+
+### Self-tests (verification of this harness)
+
+Run: `python3 abdiff.py --mpv ../../build/mpv --batch samples/selftest_batch.json
+--out out` (llvmpipe/`--gpu-sw`; the real-mkv pair needs `/mnt/y/Video/kobayashi`).
+Baseline results captured on this box — maxdiffs are in **16-bit** sample units:
+
+| test | what                         | sample(s)                        | maxdiff | verdict   |
+|------|------------------------------|----------------------------------|---------|-----------|
+| 1    | same config ×2 (determinism) | dialogue.ass                     | 0       | IDENTICAL |
+| 1    | same config ×2               | kobayashi mkv (pts 30/90/150)    | 0       | IDENTICAL |
+| 2    | threads =1 vs =8             | dialogue / blur / shadow_layers  | 0       | IDENTICAL |
+| 3    | `--sub-gpu-composite=yes`    | dialogue.ass                     | 0       | IDENTICAL |
+| 3    | `--sub-gpu-composite=yes`    | shadow_layers.ass                | 0       | IDENTICAL |
+| 3    | `--sub-gpu-composite=yes`    | clip_rect.ass                    | 0       | IDENTICAL |
+| 4    | `--sub-gpu-blur=yes`         | blur.ass                         | 635 (~2.47/255)   | DIFFERS |
+| 5    | `--sub-gpu-blur=yes`         | be.ass                           | 15584 (~60.64/255)| DIFFERS |
+
+* Tests 1–3 are **0** (bit-exact): determinism holds with no extra pinning;
+  `--sub-ass-render-threads` is bit-exact by design; and `--sub-gpu-composite`
+  reproduces the CPU blend exactly on these samples.
+* Test 4 documents the GPU box-blur **approximation** (small but nonzero) that
+  this effort will replace.
+* Test 5 is large because `\be` is silently dropped in blur-only deferral (the
+  known bug B2 will fix); the amplified diff shows the difference concentrated
+  on the un-softened glyph edges.
+
+Note: `--sub-ass-render-threads=0` means *auto*, not serial — use `=1` for the
+serial baseline in test 2.
 
 ---
 
