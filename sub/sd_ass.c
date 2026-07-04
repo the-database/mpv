@@ -61,6 +61,9 @@ struct sd_ass_priv {
     struct seen_packet *seen_packets;
     int num_seen_packets;
     bool check_animated;
+    // One-shot "built without forked-libass deferred API" warnings (only used
+    // when the corresponding HAVE_ASS_*_DEFERRED guard is off; harmless otherwise).
+    bool warned_gpu_blur, warned_gpu_composite;
 };
 
 struct seen_packet {
@@ -297,6 +300,11 @@ static void assobjects_init(struct sd *sd)
     ass_set_render_thread_count(ctx->ass_renderer, render_threads);
     MP_VERBOSE(sd, "libass render threads: %d\n",
                ass_get_render_thread_count(ctx->ass_renderer));
+#else
+    // Stock libass has no ass_set_render_thread_count: render is single-threaded.
+    // Warn once only when the user asked for a specific non-default count.
+    if (sd->opts->sub_ass_render_threads != 0 && !sd->ass_render_thread_count_override)
+        MP_WARN(sd, "built without forked-libass thread API; ignoring --sub-ass-render-threads\n");
 #endif
 }
 
@@ -781,11 +789,30 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     // The VO advertises SUBBITMAP_LIBASS_GLYPHS when it has the GPU compositor;
     // honor it only when --sub-gpu-composite is set, else fall back to combined
     // LIBASS so a VO that requested glyphs still gets drawable output.
+#if HAVE_ASS_COMPOSITE_DEFERRED
     bool comp = format == SUBBITMAP_LIBASS_GLYPHS && opts->sub_gpu_composite;
+#else
+    // Built against a libass without the deferred-composite API: never advertise
+    // the glyph path, so a GLYPHS-capable VO still gets drawable combined output.
+    bool comp = false;
+    if (opts->sub_gpu_composite && !ctx->warned_gpu_composite) {
+        MP_WARN(sd, "built without forked-libass deferred API; ignoring --sub-gpu-composite\n");
+        ctx->warned_gpu_composite = true;
+    }
+#endif
     if (format == SUBBITMAP_LIBASS_GLYPHS && !comp)
         format = SUBBITMAP_LIBASS;
+#if HAVE_ASS_BLUR_DEFERRED
     ass_set_blur_deferred(renderer, opts->sub_gpu_blur || comp);
+#else
+    if (opts->sub_gpu_blur && !ctx->warned_gpu_blur) {
+        MP_WARN(sd, "built without forked-libass deferred API; ignoring --sub-gpu-blur\n");
+        ctx->warned_gpu_blur = true;
+    }
+#endif
+#if HAVE_ASS_COMPOSITE_DEFERRED
     ass_set_composite_deferred(renderer, comp);
+#endif
 
     // Currently no supported text sub formats support a distinction between forced
     // and unforced lines, so we just assume everything's unforced and discard everything.
