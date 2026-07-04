@@ -743,6 +743,12 @@ struct gc_region {
     uint32_t fill_color, bord_color;
     int fill_ax, fill_ay, bord_ax, bord_ay;  // result-atlas positions
     uint8_t single_layer;        // 0xff for a run; else the singleton's layer
+    // Outline-mode (SUBBITMAP_LIBASS_OUTLINES) run features; all-zero otherwise.
+    uint32_t clip_id;            // vector \clip mask to multiply by (0 = none)
+    int rcx0, rcy0, rcx1, rcy1;  // rectangular \clip; visible render-space rect
+    uint32_t fill_color2;        // \kf wipe: fill colour right of wipe_x
+    int wipe_x;                  // \kf wipe boundary (render x); used iff KF_WIPE
+    int be;                      // \be: iterations of the [1,2,1]/4 box blur
 };
 
 // Combine a region's glyph list (saturating add) into run_acc at run-local
@@ -913,6 +919,130 @@ static void gc_raster_batch(struct priv *p, int ntiles)
     else
         pl_dispatch_abort(p->osd_dp, &sh);
 }
+
+// \be edge-blur: one separable [1,2,1]/4 box pass over a coverage slot (outside
+// the slot reads 0, matching libass's be_blur edges). horiz!=0 = x pass, else y.
+static const char *const osd_be_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x < bw && g.y < bh) {\n"
+    "    ivec2 b = ivec2(ax, ay);\n"
+    "    float c = imageLoad(src, b + g).r;\n"
+    "    float l, r;\n"
+    "    if (horiz != 0) {\n"
+    "        l = g.x > 0    ? imageLoad(src, b + ivec2(g.x-1, g.y)).r : 0.0;\n"
+    "        r = g.x < bw-1 ? imageLoad(src, b + ivec2(g.x+1, g.y)).r : 0.0;\n"
+    "    } else {\n"
+    "        l = g.y > 0    ? imageLoad(src, b + ivec2(g.x, g.y-1)).r : 0.0;\n"
+    "        r = g.y < bh-1 ? imageLoad(src, b + ivec2(g.x, g.y+1)).r : 0.0;\n"
+    "    }\n"
+    "    imageStore(dst, b + g, vec4((l + 2.0*c + r) * 0.25, 0.0, 0.0, 0.0));\n"
+    "}\n";
+static void gc_be_pass(struct priv *p, pl_tex src, pl_tex dst,
+                       int ax, int ay, int bw, int bh, int horiz)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name = "src", .type = PL_DESC_STORAGE_IMG, .binding = 0,
+                    .access = PL_DESC_ACCESS_READONLY }, .binding = { .object = src } },
+        { .desc = { .name = "dst", .type = PL_DESC_STORAGE_IMG, .binding = 1,
+                    .access = PL_DESC_ACCESS_WRITEONLY }, .binding = { .object = dst } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("ax"), .data = &ax }, { .var = pl_var_int("ay"), .data = &ay },
+        { .var = pl_var_int("bw"), .data = &bw }, { .var = pl_var_int("bh"), .data = &bh },
+        { .var = pl_var_int("horiz"), .data = &horiz },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 5, .body = osd_be_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (bw+15)/16, (bh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+// `be` iterations of the box blur on a coverage slot, ping-ponging through tmp.
+static void gc_be_blur(struct priv *p, pl_tex res, pl_tex tmp,
+                       int ax, int ay, int bw, int bh, int be)
+{
+    for (int i = 0; i < be; i++) {
+        gc_be_pass(p, res, tmp, ax, ay, bw, bh, 1);   // x pass: res -> tmp
+        gc_be_pass(p, tmp, res, ax, ay, bw, bh, 0);   // y pass: tmp -> res
+    }
+}
+
+// A vector-\clip mask, rasterized into the glyph atlas (like a glyph) at (ax,ay)
+// and corresponding to screen origin (sx,sy); multiply a run's coverage by it.
+struct clipmask { uint32_t id; int ax, ay, sx, sy, w, h, inv; };
+
+static const char *const osd_clipmult_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x >= bw || g.y >= bh) return;\n"
+    "int mlx = ox + g.x - csx, mly = oy + g.y - csy;\n"   // clip-mask-local coord
+    "float m = 0.0;\n"
+    "if (mlx >= 0 && mlx < cw && mly >= 0 && mly < ch)\n"
+    "    m = texelFetch(mask, ivec2(cax + mlx, cay + mly), 0).r;\n"
+    "float f = inv != 0 ? (1.0 - m) : m;\n"
+    "ivec2 sp = ivec2(sox + g.x, soy + g.y);\n"
+    "float c = imageLoad(cov, sp).r;\n"
+    "imageStore(cov, sp, vec4(c * f, 0.0, 0.0, 0.0));\n";
+
+// Multiply cov (at slot (sox,soy), screen origin (ox,oy)) by the clip mask.
+static void gc_clip_mult(struct priv *p, pl_tex cov, int bw, int bh,
+                         int sox, int soy, int ox, int oy,
+                         const struct clipmask *cm)
+{
+    int cax = cm->ax, cay = cm->ay, csx = cm->sx, csy = cm->sy,
+        cw = cm->w, ch = cm->h, inv = cm->inv;
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name = "cov", .type = PL_DESC_STORAGE_IMG, .binding = 0,
+                    .access = PL_DESC_ACCESS_READWRITE }, .binding = { .object = cov } },
+        { .desc = { .name = "mask", .type = PL_DESC_SAMPLED_TEX, .binding = 1 },
+          .binding = { .object = p->glyph_atlas } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("bw"), .data = &bw }, { .var = pl_var_int("bh"), .data = &bh },
+        { .var = pl_var_int("sox"), .data = &sox }, { .var = pl_var_int("soy"), .data = &soy },
+        { .var = pl_var_int("ox"), .data = &ox }, { .var = pl_var_int("oy"), .data = &oy },
+        { .var = pl_var_int("cax"), .data = &cax }, { .var = pl_var_int("cay"), .data = &cay },
+        { .var = pl_var_int("csx"), .data = &csx }, { .var = pl_var_int("csy"), .data = &csy },
+        { .var = pl_var_int("cw"), .data = &cw }, { .var = pl_var_int("ch"), .data = &ch },
+        { .var = pl_var_int("inv"), .data = &inv },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = { 16, 16 },
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 13, .body = osd_clipmult_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (bw + 15) / 16, (bh + 15) / 16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
+// Post-blur outline-mode features on one run-local coverage slot (origin 0,0,
+// screen origin (r->x0 - margin, r->y0 - margin)): \be box blur (after the
+// gaussian, matching libass's order), then the vector-\clip mask multiply.
+static void gc_outline_features(struct priv *p, pl_tex cov, int bw, int bh,
+                                struct gc_region *r,
+                                const struct clipmask *clips, int nclips)
+{
+    if (r->be > 0)
+        gc_be_blur(p, cov, p->run_tmp, 0, 0, bw, bh, r->be);
+    if (!r->clip_id)
+        return;
+    for (int c = 0; c < nclips; c++) {
+        if (clips[c].id == r->clip_id) {
+            gc_clip_mult(p, cov, bw, bh, 0, 0,
+                         r->x0 - r->margin, r->y0 - r->margin, &clips[c]);
+            return;
+        }
+    }
+}
 #endif // HAVE_ASS_OUTLINE_DEFERRED
 
 // Composite a SUBBITMAP_LIBASS_GLYPHS item: reproduce libass's per-run combine
@@ -989,6 +1119,10 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // outline raster jobs: per missed glyph, its atlas slot + the blob's tiles
     struct rjob { int ax, ay, w, h, sbase, nt; const float *tiles; } *rjobs = NULL;
     int nrjobs = 0, ne = 0;                  // ne = pooled segments (2 texels each)
+    // Vector-\clip masks found in this item: rasterized like glyphs, then used
+    // to multiply each clipped run's coverage (gc_outline_features).
+    struct clipmask *clips = NULL;
+    int nclips = 0;
 #endif
     ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
     // The persistent atlas accumulates glyphs across frames; a dense sign frame
@@ -1000,7 +1134,7 @@ gc_restart:
     nmiss = 0;
     miss_bytes = 0;
 #if HAVE_ASS_OUTLINE_DEFERRED
-    nrjobs = ne = 0;
+    nrjobs = ne = nclips = 0;
 #endif
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
@@ -1020,6 +1154,15 @@ gc_restart:
             continue;   // already rebuilt from empty: this frame genuinely overflows
         }
 #if HAVE_ASS_OUTLINE_DEFERRED
+        if (b->libass.run_flags & RUN_FLAG_CLIP_MASK) {
+            // Record the mask (rasterized below like a glyph on a miss). Its
+            // screen origin lives in the same (capped) render space as the
+            // region coords, so scale the display-space part position by gs.
+            MP_TARRAY_APPEND(tmp, clips, nclips, ((struct clipmask){
+                b->libass.run_id, cpos[i].ax, cpos[i].ay,
+                (int) lrint(b->x * gs), (int) lrint(b->y * gs), b->w, b->h,
+                !!(b->libass.run_flags & RUN_FLAG_CLIP_INVERSE) }));
+        }
         if (up && is_outline) {
             // libass tile-export blob: [n_tiles, n_segs, tiles(11f), segs(8f)].
             // Append this glyph's segments to the shared seg pool (2 rgba32f
@@ -1168,7 +1311,11 @@ gc_restart:
             ri = idx[b->libass.run_id] = nregs++;
             regs[ri] = (struct gc_region){ .x0 = lrint(b->x * gs), .y0 = lrint(b->y * gs),
                 .x1 = lrint((b->x + b->dw) * gs), .y1 = lrint((b->y + b->dh) * gs),
-                .run_flags = b->libass.run_flags, .single_layer = 0xff };
+                .run_flags = b->libass.run_flags, .single_layer = 0xff,
+                .clip_id = b->libass.clip_id,
+                .rcx0 = b->libass.clip_rx0, .rcy0 = b->libass.clip_ry0,
+                .rcx1 = b->libass.clip_rx1, .rcy1 = b->libass.clip_ry1,
+                .be = b->libass.be };
         }
         r = &regs[ri];
         r->x0 = MPMIN(r->x0, (int) lrint(b->x * gs));
@@ -1182,6 +1329,11 @@ gc_restart:
         } else {
             r->fill_color = b->libass.color;
             r->blur_f = b->libass.blur_x;
+            r->fill_color2 = b->libass.color2;
+            r->wipe_x = b->libass.wipe_x;
+            // KF_WIPE lives on the fill part; the region's run_flags came from
+            // whichever part appeared first (the border), so OR it in here.
+            r->run_flags |= b->libass.run_flags & RUN_FLAG_KF_WIPE;
             MP_TARRAY_APPEND(tmp, r->fill, r->nfill, i);
         }
     }
@@ -1200,8 +1352,9 @@ gc_restart:
     for (int i = 0; i < nregs; i++) {
         struct gc_region *r = &regs[i];
         // Deferred runs are raw (unexpanded) per-glyph coverage, so they need
-        // the blur halo padding (libass's exact expand amount).
-        r->margin = blur_expand_pad(MPMAX(r->blur_f, r->blur_b));
+        // the blur halo padding (libass's exact expand amount), plus one px
+        // per \be iteration (each box pass grows the support by one).
+        r->margin = blur_expand_pad(MPMAX(r->blur_f, r->blur_b)) + r->be;
         int rw = r->x1 - r->x0 + 2 * r->margin, rh = r->y1 - r->y0 + 2 * r->margin;
         if (r->nfill) ALLOC_REGION(r->fill_ax, r->fill_ay, rw, rh);
         if (r->nbord) ALLOC_REGION(r->bord_ax, r->bord_ay, rw, rh);
@@ -1229,13 +1382,22 @@ gc_restart:
                     osd_unop(p, p->run_cov_f, p->run_cov_b, bw, bh,
                              "fill", true, "bord", osd_fixoutline_body);
                 gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
+#if HAVE_ASS_OUTLINE_DEFERRED
+                gc_outline_features(p, p->run_cov_b, bw, bh, r, clips, nclips);
+#endif
                 osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
             }
             gc_blur(p, p->run_cov_f, bw, bh, r->blur_f);  // σ may be 0 (bordered fill)
+#if HAVE_ASS_OUTLINE_DEFERRED
+            gc_outline_features(p, p->run_cov_f, bw, bh, r, clips, nclips);
+#endif
             osd_copy(p, p->run_cov_f, entry->result_tex, r->fill_ax, r->fill_ay, bw, bh);
         } else if (r->nbord) {
             gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos, gs);
             gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
+#if HAVE_ASS_OUTLINE_DEFERRED
+            gc_outline_features(p, p->run_cov_b, bw, bh, r, clips, nclips);
+#endif
             osd_copy(p, p->run_cov_b, entry->result_tex, r->bord_ax, r->bord_ay, bw, bh);
         }
     }
@@ -1243,29 +1405,75 @@ gc_restart:
     // Emit the overlay preserving libass's z-order: regions in emission order
     // (regs[] is ordered by each run's first appearance in item->parts, which is
     // libass's back-to-front image-list order -- so an event's drop-shadow run
-    // and any background/mask run stay behind later events), and within a region
-    // border (under) then fill (over). A global border-then-fill pass across all
-    // runs mislayered overlapping signs: a later run's fill (a sign's mask) was
-    // painted over an earlier run's text.
+    // (RUN_FLAG_SHADOW, emitted before its text) and any background/mask run
+    // stay behind later events), and within a region border (under) then fill
+    // (over). A global border-then-fill pass across all runs mislayered
+    // overlapping signs: a later run's fill (a sign's mask) was painted over an
+    // earlier run's text.
     entry->num_run_parts = 0;
     for (int i = 0; i < nregs; i++) {
         struct gc_region *r = &regs[i];
-        int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
+        bool is_shadow = r->run_flags & RUN_FLAG_SHADOW;
+        int dx0 = r->x0 - r->margin, dy0 = r->y0 - r->margin;
+        int dx1 = r->x1 + r->margin, dy1 = r->y1 + r->margin;
+        // Rectangular \clip on the dst (no shader, a plain rect crop), in the
+        // same (capped) render space as the region coords: normal \clip keeps
+        // one visible rect (the intersection); inverse \iclip subtracts the
+        // excluded rect, leaving up to 4 visible strips. Non-outline items
+        // carry no rect: keep the whole dst.
+        int vr[4][4]; int nvr = 0;
+        if (!is_outline) {
+            vr[0][0]=dx0; vr[0][1]=dy0; vr[0][2]=dx1; vr[0][3]=dy1; nvr = 1;
+        } else if (r->run_flags & RUN_FLAG_RECT_INVERSE) {
+            int ex0 = MPMAX(dx0, r->rcx0), ey0 = MPMAX(dy0, r->rcy0);
+            int ex1 = MPMIN(dx1, r->rcx1), ey1 = MPMIN(dy1, r->rcy1);
+            if (ex0 >= ex1 || ey0 >= ey1) {     // dst clear of the hole
+                vr[nvr][0]=dx0; vr[nvr][1]=dy0; vr[nvr][2]=dx1; vr[nvr][3]=dy1; nvr++;
+            } else {
+                if (dy0 < ey0) { vr[nvr][0]=dx0; vr[nvr][1]=dy0; vr[nvr][2]=dx1; vr[nvr][3]=ey0; nvr++; }
+                if (ey1 < dy1) { vr[nvr][0]=dx0; vr[nvr][1]=ey1; vr[nvr][2]=dx1; vr[nvr][3]=dy1; nvr++; }
+                if (dx0 < ex0) { vr[nvr][0]=dx0; vr[nvr][1]=ey0; vr[nvr][2]=ex0; vr[nvr][3]=ey1; nvr++; }
+                if (ex1 < dx1) { vr[nvr][0]=ex1; vr[nvr][1]=ey0; vr[nvr][2]=dx1; vr[nvr][3]=ey1; nvr++; }
+            }
+        } else {
+            int cx0 = MPMAX(dx0, r->rcx0), cy0 = MPMAX(dy0, r->rcy0);
+            int cx1 = MPMIN(dx1, r->rcx1), cy1 = MPMIN(dy1, r->rcy1);
+            if (cx0 < cx1 && cy0 < cy1) { vr[0][0]=cx0; vr[0][1]=cy0; vr[0][2]=cx1; vr[0][3]=cy1; nvr=1; }
+        }
         for (int layer = 0; layer < 2; layer++) {  // 0 = border (under), 1 = fill (over)
             int ax, ay; uint32_t c;
             if (layer == 0) { if (!r->nbord) continue; ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
             else            { if (!r->nfill) continue; ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
-            // result_tex is composited in capped space; upscale the region back
-            // to display coords (gs == 1 when uncapped -> identity). dst is a
-            // float rect, so libplacebo bilinear-upscales the sample.
-            struct pl_overlay_part part = {
-                .src = { ax, ay, ax + bw, ay + bh },
-                .dst = { (r->x0 - r->margin) / gs, (r->y0 - r->margin) / gs,
-                         (r->x1 + r->margin) / gs, (r->y1 + r->margin) / gs },
-                .color = { (c >> 24) / 255.0f, ((c >> 16) & 0xFF) / 255.0f,
-                           ((c >> 8) & 0xFF) / 255.0f, (255 - (c & 0xFF)) / 255.0f },
-            };
-            MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
+            for (int v = 0; v < nvr; v++) {
+                int cx0 = vr[v][0], cy0 = vr[v][1], cx1 = vr[v][2], cy1 = vr[v][3];
+                // \kf karaoke: split the fill at wipe_x into sung (fill_color,
+                // left) and unsung (fill_color2, right). Else one segment.
+                int sx0[2] = { cx0, 0 }, sx1[2] = { cx1, 0 };
+                uint32_t sc[2] = { c, 0 }; int nseg = 1;
+                if (is_outline && layer == 1 && !is_shadow &&
+                    (r->run_flags & RUN_FLAG_KF_WIPE)) {
+                    int w = MPMAX(cx0, MPMIN(cx1, r->wipe_x));
+                    sx0[0] = cx0; sx1[0] = w;   sc[0] = r->fill_color;
+                    sx0[1] = w;   sx1[1] = cx1; sc[1] = r->fill_color2;
+                    nseg = 2;
+                }
+                for (int s = 0; s < nseg; s++) {
+                    if (sx0[s] >= sx1[s]) continue;
+                    uint32_t sg = sc[s];
+                    // result_tex is composited in capped space; upscale the
+                    // region back to display coords (gs == 1 when uncapped ->
+                    // identity). dst is a float rect, so libplacebo
+                    // bilinear-upscales the sample.
+                    struct pl_overlay_part part = {
+                        .src = { ax + (sx0[s] - dx0), ay + (cy0 - dy0),
+                                 ax + (sx1[s] - dx0), ay + (cy1 - dy0) },
+                        .dst = { sx0[s] / gs, cy0 / gs, sx1[s] / gs, cy1 / gs },
+                        .color = { (sg >> 24) / 255.0f, ((sg >> 16) & 0xFF) / 255.0f,
+                                   ((sg >> 8) & 0xFF) / 255.0f, (255 - (sg & 0xFF)) / 255.0f },
+                    };
+                    MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
+                }
+            }
         }
     }
     talloc_free(tmp);
