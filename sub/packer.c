@@ -303,11 +303,19 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->bitmap = img->bitmap;
             b->stride = img->stride;
             b->libass.color = img->color;
+            // Fork-only ASS_Image fields (present only with the deferred APIs).
+            // Guarded per-symbol so this compiles against stock libass; when a
+            // group is absent the fields stay 0 and sd_ass never advertises the
+            // corresponding deferred mode, so they are never consumed.
+#if HAVE_ASS_BLUR_DEFERRED
             b->libass.blur_x = img->blur_x;
             b->libass.blur_y = img->blur_y;
+#endif
+#if HAVE_ASS_COMPOSITE_DEFERRED
             b->libass.glyph_id = img->glyph_id;
             b->libass.run_id = img->run_id;
             b->libass.run_flags = img->run_flags;
+#endif
             b->libass.layer = img->type;   // 0=character/fill, 1=outline, 2=shadow
             b->dw = b->w = img->w;
             b->dh = b->h = img->h;

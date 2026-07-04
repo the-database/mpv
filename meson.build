@@ -477,6 +477,21 @@ features += {'rfork': cc.has_header_symbol('unistd.h', 'rfork_thread')}
 features += {'ass-render-thread-count': cc.has_header_symbol('ass/ass.h', 'ass_set_render_thread_count',
                                                              dependencies: libass)}
 
+# Forked-libass deferred GPU primitive APIs (opt-in, off by default). Each is an
+# independent per-symbol check (same compile-only declaration rationale as
+# ass-render-thread-count): the fork may ship any subset, and stock libass ships
+# none, so every consumer is guarded by its own HAVE_ define and degrades to the
+# CPU path (with a one-shot MP_WARN) when the symbol is absent.
+#   ass-blur-deferred      -> HAVE_ASS_BLUR_DEFERRED       (ass_set_blur_deferred)
+#   ass-composite-deferred -> HAVE_ASS_COMPOSITE_DEFERRED  (ass_set_composite_deferred)
+#   ass-outline-deferred   -> HAVE_ASS_OUTLINE_DEFERRED    (ass_set_outline_deferred)
+features += {'ass-blur-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_blur_deferred',
+                                                       dependencies: libass)}
+features += {'ass-composite-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_composite_deferred',
+                                                             dependencies: libass)}
+features += {'ass-outline-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_outline_deferred',
+                                                           dependencies: libass)}
+
 optical_devices = {
     'windows': 'D:',
     'cygwin': 'D:',
