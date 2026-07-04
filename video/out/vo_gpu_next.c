@@ -220,8 +220,10 @@ struct priv {
     // vo-alloc-after-first-frame aggregate.
     int64_t cnt_gcache_flush, cnt_atlas_overflow, cnt_staging_grow;
     int64_t cnt_overlay_buf_grow, cnt_tex_realloc, cnt_vo_alloc_after_first;
+    int64_t cnt_raster_dispatches, cnt_raster_tiles;
     int64_t stat_gcache_flush, stat_atlas_overflow, stat_staging_grow;
     int64_t stat_overlay_buf_grow, stat_tex_realloc, stat_vo_alloc_after_first;
+    int64_t stat_raster_dispatches, stat_raster_tiles;
     bool first_frame_drawn;
     // Phase wall-times (ns) for the MSGL_V [slowframe] line; only computed when
     // MSGL_V is active. The phase start/end dump-stats events themselves come
@@ -1198,6 +1200,7 @@ gc_restart:
     // Rasterize the outline-mode misses: upload the segment pool + a per-tile
     // work-list (one 16x16 tile = one workgroup), then ONE batched dispatch.
     if (ne) {
+        stats_time_start(p->stats, "sub-raster");   // work-list build + dispatch
         int seg_texels = ne * 2;                                // 2 rgba32f texels per segment
         int eh = (seg_texels + EDGE_TEX_W - 1) / EDGE_TEX_W;
         size_t eneed = (size_t) EDGE_TEX_W * eh * 4;
@@ -1241,7 +1244,10 @@ gc_restart:
                 .rc = { .x1 = WORK_TEX_W, .y1 = wh },
                 .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = p->wbuf));
             gc_raster_batch(p, ntiles);
+            p->cnt_raster_dispatches++;
+            p->cnt_raster_tiles += ntiles;
         }
+        stats_time_end(p->stats, "sub-raster");
     }
 #endif // HAVE_ASS_OUTLINE_DEFERRED
 
@@ -2958,6 +2964,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "overlay-buf-grow",          p->cnt_overlay_buf_grow,    &p->stat_overlay_buf_grow);
     emit_counter(vo, "tex-realloc",               p->cnt_tex_realloc,         &p->stat_tex_realloc);
     emit_counter(vo, "vo-alloc-after-first-frame", p->cnt_vo_alloc_after_first, &p->stat_vo_alloc_after_first);
+    emit_counter(vo, "raster-dispatches",         p->cnt_raster_dispatches,   &p->stat_raster_dispatches);
+    emit_counter(vo, "raster-tiles",              p->cnt_raster_tiles,        &p->stat_raster_tiles);
     if (want_slow) {
         int64_t gpu_ns = 0;
         for (int i = 0; i < p->perf_fresh.count; i++)
@@ -3756,6 +3764,7 @@ static int preinit(struct vo *vo)
     // finds a sample on a clean run).
     p->stat_gcache_flush = p->stat_atlas_overflow = p->stat_staging_grow = -1;
     p->stat_overlay_buf_grow = p->stat_tex_realloc = p->stat_vo_alloc_after_first = -1;
+    p->stat_raster_dispatches = p->stat_raster_tiles = -1;
 
     struct gl_video_opts *gl_opts = p->opts_cache->opts;
     struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
