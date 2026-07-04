@@ -362,6 +362,7 @@ const struct m_sub_options mp_subtitle_sub_opts = {
             .flags = UPDATE_SUB_HARD},
         {"sub-gpu-blur", OPT_BOOL(sub_gpu_blur), .flags = UPDATE_SUB_HARD},
         {"sub-gpu-composite", OPT_BOOL(sub_gpu_composite), .flags = UPDATE_SUB_HARD},
+        {"sub-gpu-raster", OPT_BOOL(sub_gpu_raster), .flags = UPDATE_SUB_HARD},
         {0}
     },
     .size = sizeof(OPT_BASE_STRUCT),
