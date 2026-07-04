@@ -169,6 +169,14 @@ struct priv {
     unsigned glyph_stage_idx;
     uint8_t *gstage_cpu; size_t gstage_cpu_sz; // tight-repack scratch for misses
 
+    // GPU glyph rasterizer (SUBBITMAP_LIBASS_OUTLINES): cache misses are
+    // rasterized into glyph_atlas from libass's tile-export blobs instead of
+    // being uploaded (only used when built with HAVE_ASS_OUTLINE_DEFERRED).
+    pl_tex edge_tex;                         // rgba32f segment pool (2 texels/seg)
+    float *ebuf; int ebuf_cap;               // CPU segment scratch (in float units)
+    pl_tex work_tex;                         // batched raster: one 16x16 tile per workgroup
+    float *wbuf; int wbuf_cap;               // CPU work-list scratch (in float units)
+
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
     struct osd_state osd_state;
@@ -608,10 +616,15 @@ static bool gc_ensure(pl_gpu gpu, pl_tex *t, pl_fmt fmt, int w, int h,
                       bool storable, bool sampleable, bool blit_src,
                       bool blit_dst, bool host_writable)
 {
+    w = MPMAX(w, *t ? (*t)->params.w : 0);
+    h = MPMAX(h, *t ? (*t)->params.h : 0);
+    // Respect the GPU's max 2D texture size; bail (caller skips) rather than
+    // hit a libplacebo validation crash. At 8K the coverage atlas can stack
+    // taller than this.
+    if (w > gpu->limits.max_tex_2d_dim || h > gpu->limits.max_tex_2d_dim)
+        return false;
     return pl_tex_recreate(gpu, t, pl_tex_params(
-        .format = fmt,
-        .w = MPMAX(w, *t ? (*t)->params.w : 0),
-        .h = MPMAX(h, *t ? (*t)->params.h : 0),
+        .format = fmt, .w = w, .h = h,
         .storable = storable, .sampleable = sampleable,
         .blit_src = blit_src, .blit_dst = blit_dst, .host_writable = host_writable));
 }
@@ -700,6 +713,8 @@ static bool gcache_reserve(struct priv *p, uint64_t id, int w, int h,
         return true;
     }
     int nw = w + 1, nh = h + 1;     // 1px pad against bilinear bleed
+    if (nw > p->gatlas_w || nh > p->gatlas_h)
+        return false;               // glyph larger than the whole atlas: skip (no OOB)
     if (p->gsx + nw > p->gatlas_w) { p->gsy += p->growh; p->gsx = 0; p->growh = 0; }
     if (p->gsy + nh > p->gatlas_h)
         return false;               // atlas full this frame (reset happens at frame start)
@@ -759,9 +774,152 @@ static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
     stats_time_end(p->stats, "sub-blur");
 }
 
+// Run/part flags of the forked libass ABI (ASS_Image.run_flags); see the
+// FilterDesc flags in the fork's ass_render.c. Bit 0 (fix_outline) is tested
+// directly as `run_flags & 1` by the composite path above.
+#define RUN_FLAG_CLIP_MASK    0x2  // libass ABI: this part is a vector-clip mask
+#define RUN_FLAG_CLIP_INVERSE 0x4  // the clip mask is inverse (\iclip)
+#define RUN_FLAG_KF_WIPE      0x8  // \kf fill: fill_color left of wipe_x, color2 right
+#define RUN_FLAG_RECT_INVERSE 0x10 // \iclip rect: the clip rect is EXCLUDED, not visible
+#define RUN_FLAG_SHADOW       0x20 // drop shadow: draw behind border+fill
+
+#if HAVE_ASS_OUTLINE_DEFERRED
+// --- GPU glyph rasterizer (SUBBITMAP_LIBASS_OUTLINES) -----------------------
+// Exact-area analytic coverage from a glyph's line segments, written into the
+// glyph atlas slot -- a faithful GLSL port of libass's tile fillers, driven by
+// libass's own tile-split export (ass_outline_to_tiles), so it matches the CPU
+// raster bit for bit (including stroke self-intersections).
+#define EDGE_TEX_W 8192   // edge_tex/work_tex width; element i is at (i%W, i/W).
+#define WORK_TEX_W 8192   // Wide so the height (count/W) stays under max_tex_2d_dim at 8K.
+#define TILE_EXPORT_W 11  // libass tile-export: tx,ty,ng,group0[4],group1[4] (matches ass_rasterizer.h)
+#define SEG_EXPORT_W  8   // libass tile-export: a,b,c,flags,xmin,ymin,ymax,_ (2 rgba32f texels)
+// Faithful float port of libass update_border_line (rasterizer_template.h): the
+// per-pixel coverage of a partial sub-pixel row span [up,dn] (1/64 units),
+// FULL_VALUE=1024, TILE_ORDER=4. Used by the res/winding filler below so the GPU
+// matches libass's analytic AA (incl. filling stroke self-overlaps).
+static const char *const osd_raster_prelude =
+    "float ubl(int px, float abs_a, float a, float b, float abs_b, float c, float up, float dn){\n"
+    "  float size = dn - up;\n"
+    "  float w = min(1024.0 + size*16.0 - abs_a, 1024.0) * 8.0;\n"
+    "  float dc_b = abs_b*size/64.0;\n"
+    "  float dc = (min(abs_a, dc_b)+2.0)/4.0;\n"
+    "  float base = b*(up+dn)/128.0;\n"
+    "  float offs1 = size - (base+dc)*w/65536.0;\n"
+    "  float offs2 = size - (base-dc)*w/65536.0;\n"
+    "  float size2 = size*2.0;\n"
+    "  float cw = (c - a*float(px))*w/65536.0;\n"
+    "  float c1 = clamp(cw+offs1, 0.0, size2);\n"
+    "  float c2 = clamp(cw+offs2, 0.0, size2);\n"
+    "  return c1+c2;\n"
+    "}\n";
+// One 16x16 workgroup per work-list tile. Each tile carries the glyph's atlas
+// origin, the tile offset/size, and 1-2 groups of clipped segments + winding
+// (from libass's tile-split, ass_outline_to_tiles). Per pixel: run libass's
+// generic_tile filler (res = unsigned 2-sample coverage; cur = winding via the
+// SEGFLAG_DN delta; |res+cur|) for each group and max-merge them -- matching
+// libass CPU exactly, including stroke self-intersections.
+static const char *const osd_raster_body =
+    "int wi = int(gl_WorkGroupID.y) * gridx + int(gl_WorkGroupID.x);\n"
+    "if (wi >= ntiles) return;\n"
+    "int w0 = 4 * wi;\n"
+    "vec4 A  = texelFetch(work, ivec2(w0 % ww, w0 / ww), 0);\n"            // ax,ay,tx,ty
+    "vec4 WH = texelFetch(work, ivec2((w0+1) % ww, (w0+1) / ww), 0);\n"    // w,h,ng,_
+    "vec4 GG[2];\n"
+    "GG[0] = texelFetch(work, ivec2((w0+2) % ww, (w0+2) / ww), 0);\n"
+    "GG[1] = texelFetch(work, ivec2((w0+3) % ww, (w0+3) / ww), 0);\n"
+    "int ax=int(A.x), ay=int(A.y), tx=int(A.z), ty=int(A.w);\n"
+    "int gw=int(WH.x), gh=int(WH.y), ng=int(WH.z);\n"
+    "int lx=int(gl_LocalInvocationID.x), ly=int(gl_LocalInvocationID.y);\n"
+    "if (tx+lx >= gw || ty+ly >= gh) return;\n"
+    "float cov = 0.0;\n"
+    "for (int gi = 0; gi < 2; gi++) {\n"
+    "  if (gi >= ng) break;\n"
+    "  vec4 G = GG[gi];\n"
+    "  int type=int(G.x); float wind=G.y; int soff=int(G.z); int scnt=int(G.w);\n"
+    "  float v = 0.0;\n"
+    "  if (type == 0) { v = wind != 0.0 ? 255.0 : 0.0; }\n"               // solid
+    "  else if (type == 1) {\n"                                           // halfplane
+    "    int e=soff*2; vec4 s0=texelFetch(edges, ivec2(e % ew, e / ew), 0);\n"
+    "    float aa=s0.x, bb=s0.y;\n"
+    "    float cc = s0.z + 512.0 - (aa+bb)*0.5 - bb*float(ly);\n"
+    "    float dl = (min(abs(aa),abs(bb))+2.0)/4.0;\n"
+    "    float c1=clamp(cc-aa*float(lx)-dl,0.0,1024.0), c2=clamp(cc-aa*float(lx)+dl,0.0,1024.0);\n"
+    "    v = min((c1+c2)/8.0, 255.0);\n"
+    "  } else {\n"                                                        // generic
+    "    float res=0.0, cur=256.0*wind;\n"
+    "    for (int i=0;i<scnt;i++){\n"
+    "      int e=(soff+i)*2;\n"
+    "      vec4 s0=texelFetch(edges, ivec2(e % ew, e / ew), 0);\n"
+    "      vec4 s1=texelFetch(edges, ivec2((e+1) % ew, (e+1) / ew), 0);\n"
+    "      float a=s0.x, b=s0.y, c0=s0.z; int flags=int(s0.w);\n"
+    "      int xmin=int(s1.x), ymn=int(s1.y), ymx=int(s1.z);\n"
+    "      float upd = (flags&1)!=0 ? 4.0 : 0.0, dnd=upd;\n"
+    "      if (xmin==0 && (flags&4)!=0) dnd=4.0-dnd;\n"
+    "      if ((flags&2)!=0){ float t=upd; upd=dnd; dnd=t; }\n"
+    "      int up=ymn>>6, dn=ymx>>6; float upp=float(ymn&63), dnp=float(ymx&63);\n"
+    "      if (up   <= ly) cur-=upd*64.0-upd*upp;\n"
+    "      if (up+1 <= ly) cur-=upd*upp;\n"
+    "      if (dn   <= ly) cur+=dnd*64.0-dnd*dnp;\n"
+    "      if (dn+1 <= ly) cur+=dnd*dnp;\n"
+    "      if (ymn==ymx) continue;\n"
+    "      float abs_a=abs(a), abs_b=abs(b);\n"
+    "      float dc=(min(abs_a,abs_b)+2.0)/4.0;\n"
+    "      float base=512.0 - b*0.5;\n"
+    "      float c=c0 - a*0.5 - b*float(up); int rup=up;\n"
+    "      if (upp!=0.0){\n"
+    "        if (dn==up){ if(ly==up) res+=ubl(lx,abs_a,a,b,abs_b,c,upp,dnp); continue; }\n"
+    "        if (ly==up) res+=ubl(lx,abs_a,a,b,abs_b,c,upp,64.0); rup=up+1; c-=b;\n"
+    "      }\n"
+    "      if (ly>=rup && ly<dn){\n"
+    "        float cy=c - b*float(ly-rup);\n"
+    "        float c1=clamp(cy-a*float(lx)+base+dc,0.0,1024.0), c2=clamp(cy-a*float(lx)+base-dc,0.0,1024.0);\n"
+    "        res+=(c1+c2)/8.0;\n"
+    "      }\n"
+    "      if (dnp!=0.0 && ly==dn){ float cy=c - b*float(dn-rup); res+=ubl(lx,abs_a,a,b,abs_b,cy,0.0,dnp); }\n"
+    "    }\n"
+    "    float val=res+cur; v = min(max(val,-val), 255.0);\n"
+    "  }\n"
+    "  cov = gi==0 ? v : max(cov, v);\n"
+    "}\n"
+    "imageStore(dst, ivec2(ax+tx+lx, ay+ty+ly), vec4(cov/255.0, 0.0, 0.0, 0.0));\n";
+
+// Rasterize ALL collected glyphs in one dispatch: ntiles 16x16 work-list tiles.
+static void gc_raster_batch(struct priv *p, int ntiles)
+{
+    int ew = EDGE_TEX_W, ww = WORK_TEX_W;
+    int gridx = MPMIN(ntiles, 32768), gridy = (ntiles + gridx - 1) / gridx;
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name = "dst", .type = PL_DESC_STORAGE_IMG, .binding = 0,
+                    .access = PL_DESC_ACCESS_WRITEONLY }, .binding = { .object = p->glyph_atlas } },
+        { .desc = { .name = "edges", .type = PL_DESC_SAMPLED_TEX, .binding = 1 },
+          .binding = { .object = p->edge_tex } },
+        { .desc = { .name = "work", .type = PL_DESC_SAMPLED_TEX, .binding = 2 },
+          .binding = { .object = p->work_tex } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("ntiles"), .data = &ntiles }, { .var = pl_var_int("gridx"), .data = &gridx },
+        { .var = pl_var_int("ew"), .data = &ew }, { .var = pl_var_int("ww"), .data = &ww },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = { 16, 16 },
+        .descriptors = descs, .num_descriptors = 3,
+        .variables = vars, .num_variables = 4,
+        .prelude = osd_raster_prelude, .body = osd_raster_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { gridx, gridy, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+#endif // HAVE_ASS_OUTLINE_DEFERRED
+
 // Composite a SUBBITMAP_LIBASS_GLYPHS item: reproduce libass's per-run combine
 // + blur + fix_outline on the GPU into entry->tex (a result atlas), then emit a
 // single monochrome overlay whose parts reference each run's coverage region.
+// SUBBITMAP_LIBASS_OUTLINES items take the same path, except cache-miss glyph
+// coverage is rasterized on the GPU (gc_raster_batch) instead of uploaded.
 static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                                struct osd_entry *entry, struct pl_frame *frame,
                                struct osd_state *state, enum pl_overlay_coords coords,
@@ -795,8 +953,14 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             p->gatlas_h = MPMIN(p->gatlas_h, cap);
             p->gatlas_w = MPMIN(p->gatlas_w, cap);
         }
+#if HAVE_ASS_OUTLINE_DEFERRED
+        // storable too: the GPU rasterizer (outline mode) writes coverage here.
+        const bool atlas_storable = true;
+#else
+        const bool atlas_storable = false;
+#endif
         if (!gc_ensure(gpu, &p->glyph_atlas, r8, p->gatlas_w, p->gatlas_h,
-                       false, true, false, false, true))
+                       atlas_storable, true, false, false, true))
             return;
         p->gcache_cap = 1 << 15;
         p->gcache = talloc_zero_array(p, struct gcache_slot, p->gcache_cap);
@@ -811,12 +975,22 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // Resolve every deferred glyph to its atlas position, collecting cache
     // misses to upload in one async batch (a synchronous per-glyph .ptr upload
     // stalls the VO thread on d3d11; see the staging-buffer note below).
+    // Outline mode (SUBBITMAP_LIBASS_OUTLINES) has no packed atlas: a cache
+    // miss is instead RASTERIZED into its slot from the part's tile-export
+    // blob, batched into one dispatch below (rasterize-on-miss-only: hits use
+    // the cached coverage untouched).
+    bool is_outline = item->format == SUBBITMAP_LIBASS_OUTLINES;
     struct gpos *cpos = talloc_array(tmp, struct gpos, item->num_parts);
     struct gmiss { int ax, ay, w, h; const uint8_t *src; };
     struct gmiss *miss = NULL;
     int nmiss = 0;
     size_t miss_bytes = 0;
-    ptrdiff_t pstride = item->packed->stride[0];
+#if HAVE_ASS_OUTLINE_DEFERRED
+    // outline raster jobs: per missed glyph, its atlas slot + the blob's tiles
+    struct rjob { int ax, ay, w, h, sbase, nt; const float *tiles; } *rjobs = NULL;
+    int nrjobs = 0, ne = 0;                  // ne = pooled segments (2 texels each)
+#endif
+    ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
     // The persistent atlas accumulates glyphs across frames; a dense sign frame
     // can exhaust it mid-frame and drop its later glyphs (flashing). Nothing is
     // uploaded until after this loop, so on overflow reset once and rebuild from
@@ -825,6 +999,9 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 gc_restart:
     nmiss = 0;
     miss_bytes = 0;
+#if HAVE_ASS_OUTLINE_DEFERRED
+    nrjobs = ne = 0;
+#endif
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
         cpos[i] = (struct gpos){0, 0};
@@ -842,6 +1019,29 @@ gc_restart:
             }
             continue;   // already rebuilt from empty: this frame genuinely overflows
         }
+#if HAVE_ASS_OUTLINE_DEFERRED
+        if (up && is_outline) {
+            // libass tile-export blob: [n_tiles, n_segs, tiles(11f), segs(8f)].
+            // Append this glyph's segments to the shared seg pool (2 rgba32f
+            // texels each) and record the glyph's tiles for the work-list below.
+            const int32_t *blob = b->libass.outline;
+            if (!blob || b->libass.n_outline < 2)
+                continue;
+            int nt = blob[0], ns = blob[1];
+            const float *gtiles = (const float *)(blob + 2);
+            const float *gsegs  = (const float *)(blob + 2 + (size_t) nt * TILE_EXPORT_W);
+            if (p->ebuf_cap < (ne + ns) * SEG_EXPORT_W) {
+                p->ebuf_cap = MPMAX((ne + ns) * SEG_EXPORT_W * 2, 8192);
+                p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+            }
+            memcpy(p->ebuf + (size_t) ne * SEG_EXPORT_W, gsegs,
+                   (size_t) ns * SEG_EXPORT_W * sizeof(float));
+            MP_TARRAY_APPEND(tmp, rjobs, nrjobs,
+                ((struct rjob){ cpos[i].ax, cpos[i].ay, b->w, b->h, ne, nt, gtiles }));
+            ne += ns;
+            continue;
+        }
+#endif // HAVE_ASS_OUTLINE_DEFERRED
         if (up) {
             const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
                                 + (ptrdiff_t) b->src_y * pstride + b->src_x;
@@ -850,6 +1050,57 @@ gc_restart:
             miss_bytes += (size_t) b->w * b->h;
         }
     }
+
+#if HAVE_ASS_OUTLINE_DEFERRED
+    // Rasterize the outline-mode misses: upload the segment pool + a per-tile
+    // work-list (one 16x16 tile = one workgroup), then ONE batched dispatch.
+    if (ne) {
+        int seg_texels = ne * 2;                                // 2 rgba32f texels per segment
+        int eh = (seg_texels + EDGE_TEX_W - 1) / EDGE_TEX_W;
+        size_t eneed = (size_t) EDGE_TEX_W * eh * 4;
+        if ((size_t) p->ebuf_cap < eneed) {
+            p->ebuf_cap = eneed;
+            p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+        }
+        // 4 texels per tile:
+        // [ax,ay,tx,ty] [w,h,ng,_] group0[type,wind,segoff,cnt] group1[...]
+        int ntiles = 0;
+        for (int j = 0; j < nrjobs; j++)
+            ntiles += rjobs[j].nt;
+        int wh = (4 * ntiles + WORK_TEX_W - 1) / WORK_TEX_W;
+        size_t wneed = (size_t) WORK_TEX_W * wh * 4;
+        if ((size_t) p->wbuf_cap < wneed) {
+            p->wbuf_cap = wneed;
+            p->wbuf = talloc_realloc(p, p->wbuf, float, p->wbuf_cap);
+        }
+        int ti = 0;
+        for (int j = 0; j < nrjobs; j++) {
+            struct rjob *r = &rjobs[j];
+            for (int t = 0; t < r->nt; t++) {
+                const float *T = r->tiles + (size_t) t * TILE_EXPORT_W;  // tx,ty,ng,g0[4],g1[4]
+                float *w0 = &p->wbuf[(4 * ti) * 4];
+                int ng = (int) T[2];
+                w0[0]=r->ax; w0[1]=r->ay; w0[2]=T[0]; w0[3]=T[1];        // ax,ay,tx,ty
+                w0[4]=r->w;  w0[5]=r->h;  w0[6]=T[2]; w0[7]=0;           // w,h,ng
+                w0[8]=T[3];  w0[9]=T[4];  w0[10]=T[5]+r->sbase; w0[11]=T[6];   // group0
+                if (ng >= 2) { w0[12]=T[7]; w0[13]=T[8]; w0[14]=T[9]+r->sbase; w0[15]=T[10]; }
+                else { w0[12]=-1; w0[13]=w0[14]=w0[15]=0; }
+                ti++;
+            }
+        }
+        pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
+        if (ef && gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true, false, false, true) &&
+                  gc_ensure(gpu, &p->work_tex, ef, WORK_TEX_W, wh, false, true, false, false, true)) {
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
+                .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
+                .row_pitch = (size_t) EDGE_TEX_W * 4 * sizeof(float), .ptr = p->ebuf));
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->work_tex,
+                .rc = { .x1 = WORK_TEX_W, .y1 = wh },
+                .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = p->wbuf));
+            gc_raster_batch(p, ntiles);
+        }
+    }
+#endif // HAVE_ASS_OUTLINE_DEFERRED
 
     // Flush the misses: tight-repack into a CPU scratch, one async buffer write,
     // then per-glyph async texture uploads (buffer-backed = no VO-thread stall).
@@ -909,6 +1160,8 @@ gc_restart:
         struct gc_region *r;
         if (b->libass.glyph_id == 0)
             continue;   // already-combined fallback parts go via the legacy path
+        if (b->libass.run_flags & RUN_FLAG_CLIP_MASK)
+            continue;   // clip masks are multiplied in, not drawn as runs
         int ri = idx[b->libass.run_id];
         if (ri < 0) {
             MP_TARRAY_GROW(tmp, regs, nregs);
@@ -1045,11 +1298,15 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     // (stats_time_*) are emitted unconditionally and self-gate on MSGL_STATS.
     bool want_t = mp_msg_test(vo->log, MSGL_V);
     p->dbg_subrender_ns = p->dbg_capcomp_ns = p->dbg_blur_ns = 0;
-    // Advertise the deferred-composite format too; sd_ass only emits it when
-    // --sub-gpu-composite is set, otherwise it falls back to plain LIBASS.
+    // Advertise the deferred-composite/outline formats too; sd_ass only emits
+    // them when --sub-gpu-composite / --sub-gpu-raster are set, otherwise it
+    // falls back to plain LIBASS.
     static const bool gpu_sub_formats[SUBBITMAP_COUNT] = {
         [SUBBITMAP_LIBASS] = true, [SUBBITMAP_BGRA] = true,
         [SUBBITMAP_LIBASS_GLYPHS] = true,
+#if HAVE_ASS_OUTLINE_DEFERRED
+        [SUBBITMAP_LIBASS_OUTLINES] = true,
+#endif
     };
     stats_time_start(p->stats, "sub-render");   // WP-A3: libass render + fetch
     int64_t sr0 = want_t ? mp_time_ns() : 0;
@@ -1063,9 +1320,28 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
 
     for (int n = 0; n < subs->num_items; n++) {
         const struct sub_bitmaps *item = subs->items[n];
+#if HAVE_ASS_OUTLINE_DEFERRED
+        // Outline mode has no packed atlas (the GPU rasterizes from the blobs).
+        if (!item->num_parts ||
+            (!item->packed && item->format != SUBBITMAP_LIBASS_OUTLINES))
+            continue;
+#else
         if (!item->num_parts || !item->packed)
             continue;
+#endif
         struct osd_entry *entry = &state->entries[item->render_index];
+#if HAVE_ASS_OUTLINE_DEFERRED
+        if (item->format == SUBBITMAP_LIBASS_OUTLINES) {
+            // Coverage is rasterized at the (capped) render_w; compose in that
+            // space and upscale to display. gs == 1 when uncapped.
+            double gs = item->render_w > 0 && subs->w > 0
+                      ? (double) item->render_w / subs->w : 1.0;
+            stats_time_start(p->stats, "sub-composite");
+            compose_glyph_runs(p, item, entry, frame, state, coords, src, gs);
+            stats_time_end(p->stats, "sub-composite");
+            continue;   // no legacy fallback path (it would need a packed atlas)
+        }
+#endif // HAVE_ASS_OUTLINE_DEFERRED
 #if HAVE_ASS_COMPOSITE_DEFERRED
         if (item->format == SUBBITMAP_LIBASS_GLYPHS) {
             // Glyph coverage is rendered at the (capped) render_w; compose the
@@ -3204,6 +3480,8 @@ static void uninit(struct vo *vo)
     pl_tex_destroy(p->gpu, &p->run_cov_f);
     pl_tex_destroy(p->gpu, &p->run_cov_b);
     pl_tex_destroy(p->gpu, &p->glyph_atlas);
+    pl_tex_destroy(p->gpu, &p->edge_tex);
+    pl_tex_destroy(p->gpu, &p->work_tex);
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
@@ -3306,6 +3584,7 @@ static int preinit(struct vo *vo)
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
     p->osd_fmt[SUBBITMAP_LIBASS_GLYPHS] = p->osd_fmt[SUBBITMAP_LIBASS];
+    p->osd_fmt[SUBBITMAP_LIBASS_OUTLINES] = p->osd_fmt[SUBBITMAP_LIBASS];
     p->osd_acc_fmt = pl_find_named_fmt(p->gpu, "r32f");
     p->osd_sync = 1;
 
