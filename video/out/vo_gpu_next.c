@@ -373,6 +373,12 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
     return mpi;
 }
 
+// GPU deferred blur/composite machinery. All of it consumes the forked-libass
+// deferred primitives (unblurred coverage + per-glyph runs); compiled out
+// against a libass lacking those APIs, where sd_ass never advertises the modes
+// and the CPU path is used. osd_blur_part is shared by both the blur-only path
+// and the composite path, so it lives under either feature.
+#if HAVE_ASS_BLUR_DEFERRED || HAVE_ASS_COMPOSITE_DEFERRED
 // Separable gaussian over one atlas sub-region [ox,oy,rw,rh], clamped to that
 // region (so a blurred part can't read/write its atlas neighbours). sigma == 0
 // degenerates to a copy. Validated against a CPU reference via lavapipe.
@@ -440,7 +446,9 @@ static void osd_blur_part(struct priv *p, pl_tex src, pl_tex dst,
         pl_dispatch_abort(p->osd_dp, &sh);
     }
 }
+#endif // HAVE_ASS_BLUR_DEFERRED || HAVE_ASS_COMPOSITE_DEFERRED
 
+#if HAVE_ASS_COMPOSITE_DEFERRED
 // ---- Deferred composite (SUBBITMAP_LIBASS_GLYPHS) GPU passes ----------------
 // libass emits uncombined per-glyph coverage; we reproduce its per-run pipeline
 // on the GPU: combine (saturating add) -> blur -> fix_outline -> alpha-over,
@@ -651,6 +659,7 @@ static void gcache_reset(struct priv *p)
     p->gcache_count = 0;
     p->gsx = p->gsy = p->growh = 0;
 }
+#endif // HAVE_ASS_COMPOSITE_DEFERRED (resumes at gcache_reserve)
 
 // WP-A3: bump a growth/realloc counter and, when it happens after the first
 // successfully drawn frame, also the aggregate vo-alloc-after-first-frame
@@ -674,6 +683,7 @@ static void emit_counter(struct vo *vo, const char *name, int64_t cur, int64_t *
     }
 }
 
+#if HAVE_ASS_COMPOSITE_DEFERRED
 // Locate a glyph in the persistent atlas, uploading it from `src` on a miss
 // (skyline-packed, 1px pad). Returns false if it can't be placed this frame.
 // Reserve a glyph's slot in the persistent atlas. Cache hit: *upload stays
@@ -1017,6 +1027,7 @@ gc_restart:
     if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
         ol->color = src->params.color;
 }
+#endif // HAVE_ASS_COMPOSITE_DEFERRED
 
 static void update_overlays(struct vo *vo, struct mp_osd_res res,
                             int flags, enum pl_overlay_coords coords,
@@ -1055,6 +1066,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         if (!item->num_parts || !item->packed)
             continue;
         struct osd_entry *entry = &state->entries[item->render_index];
+#if HAVE_ASS_COMPOSITE_DEFERRED
         if (item->format == SUBBITMAP_LIBASS_GLYPHS) {
             // Glyph coverage is rendered at the (capped) render_w; compose the
             // runs in that space and upscale to display. gs == 1 when uncapped.
@@ -1071,6 +1083,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             if (!has_fallback)
                 continue;
         }
+#endif // HAVE_ASS_COMPOSITE_DEFERRED
         pl_fmt tex_fmt = p->osd_fmt[item->format];
         if (!entry->tex)
             MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
@@ -1163,10 +1176,11 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, part);
         }
 
+        pl_tex overlay_tex = entry->tex;
+#if HAVE_ASS_BLUR_DEFERRED
         // Deferred-blur (see ass_set_blur_deferred): libass emitted unblurred
         // coverage in pre-expanded bounds plus a per-part gaussian std-dev; do
         // the blur here on the GPU instead of on the CPU display path.
-        pl_tex overlay_tex = entry->tex;
         if (item->format == SUBBITMAP_LIBASS ||
             item->format == SUBBITMAP_LIBASS_GLYPHS) {
             bool any_blur = false;
@@ -1220,6 +1234,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 }
             }
         }
+#endif // HAVE_ASS_BLUR_DEFERRED
 
         struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
         *ol = (struct pl_overlay) {
