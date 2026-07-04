@@ -1,0 +1,53 @@
+{
+  "_comment": "Self-test matrix for abdiff.py. Run from TOOLS/subtest/ so the relative sample paths resolve. See README 'abdiff.py'.",
+  "media": "av://lavfi:color=c=0x606060:s=1280x720:d=120:r=24",
+  "pts": [3, 9, 15],
+  "pairs": [
+    {
+      "tag": "t1_det_lavfi", "sub": "samples/dialogue.ass",
+      "config_a": "", "config_b": ""
+    },
+    {
+      "tag": "t1_det_kobayashi",
+      "media": "/mnt/y/Video/kobayashi/[Dae] Miss Kobayashi's Dragon Maid S - 07 (BD 1080p HEVC FLAC+AAC) [Dual-Audio] [3627AEA5]_new.mkv",
+      "sub": null, "pts": [30, 90, 150],
+      "config_a": "", "config_b": ""
+    },
+
+    {
+      "tag": "t2_threads_dialogue", "sub": "samples/dialogue.ass",
+      "config_a": "--sub-ass-render-threads=1", "config_b": "--sub-ass-render-threads=8"
+    },
+    {
+      "tag": "t2_threads_blur", "sub": "samples/blur.ass",
+      "config_a": "--sub-ass-render-threads=1", "config_b": "--sub-ass-render-threads=8"
+    },
+    {
+      "tag": "t2_threads_shadow", "sub": "samples/shadow_layers.ass",
+      "config_a": "--sub-ass-render-threads=1", "config_b": "--sub-ass-render-threads=8"
+    },
+
+    {
+      "tag": "t3_composite_dialogue", "sub": "samples/dialogue.ass",
+      "config_a": "", "config_b": "--sub-gpu-composite=yes"
+    },
+    {
+      "tag": "t3_composite_shadow", "sub": "samples/shadow_layers.ass",
+      "config_a": "", "config_b": "--sub-gpu-composite=yes"
+    },
+    {
+      "tag": "t3_composite_cliprect", "sub": "samples/clip_rect.ass",
+      "config_a": "", "config_b": "--sub-gpu-composite=yes"
+    },
+
+    {
+      "tag": "t4_gpublur_blur", "sub": "samples/blur.ass",
+      "config_a": "", "config_b": "--sub-gpu-blur=yes"
+    },
+
+    {
+      "tag": "t5_gpublur_be", "sub": "samples/be.ass",
+      "config_a": "", "config_b": "--sub-gpu-blur=yes"
+    }
+  ]
+}
