@@ -2692,18 +2692,40 @@ Subtitles
 
     Default: no.
 
-``--sub-glyph-atlas-height=<0-16384>``
-    Debug/development only. Caps the size (in pixels) of the ``--vo=gpu-next``
-    persistent GPU glyph atlas at creation. 0 (the default) uses the GPU maximum
-    (up to 16384). A small value (e.g. 256) shrinks the atlas (the cap is applied
-    to both dimensions, since row-major packing means a short-but-wide atlas would
-    never overflow) and deliberately forces glyph-atlas overflow and glyph-cache
-    flush storms, so the built-in performance counters (``atlas-overflow``,
-    ``gcache-flush``, exposed via ``--dump-stats``) can be exercised in tests. Not
-    intended for normal playback: a low cap makes dense subtitle/sign frames flash
-    as glyphs are dropped and re-uploaded.
+``--sub-glyph-atlas-size=<1024-16384>``
+    Edge length, in pixels, of the square persistent GPU glyph atlas used by
+    ``--sub-gpu-raster`` / ``--sub-gpu-composite`` on ``--vo=gpu-next``. The atlas
+    is created **once** at this size when the video output is configured and is
+    never resized or rebuilt during playback, so no mid-playback atlas
+    reallocation can stall the display thread. Cache space is reclaimed instead by
+    epoch-segmented eviction: the atlas is divided into a fixed number of
+    horizontal segments, and when the packer runs out of room it advances to the
+    next segment (ring-style) and evicts only that segment's glyphs, which are
+    lazily re-rasterized on their next use. The value is clamped to the GPU's
+    maximum 2D texture size.
 
-    Default: 0 (no cap).
+    A larger atlas caches more glyphs at once (fewer evictions) at a memory cost
+    of ``N×N`` bytes (e.g. the default 8192 uses 64 MiB, 16384 uses 256 MiB).
+    There is normally no reason to change it; the default comfortably holds a
+    dense 8K sign frame's glyphs.
+
+    Default: 8192.
+
+``--sub-glyph-atlas-height=<0-16384>``
+    Debug/development only. Overrides ``--sub-glyph-atlas-size`` with a smaller
+    value at atlas creation. 0 (the default) means no override. A small value
+    (e.g. 256 or 512) shrinks the atlas (the cap is applied to both dimensions,
+    since row-major packing means a short-but-wide atlas would never advance the
+    packing cursor) so that the epoch-segmented eviction machinery is exercised
+    hard: the built-in performance counters (``gcache-epoch-advance``,
+    ``gcache-evict-n`` and, if the working set of a single frame exceeds the whole
+    atlas, ``gcache-overcommit``, all exposed via ``--dump-stats``) can be driven
+    in tests. The full-flush counters (``gcache-flush``, ``atlas-overflow``) stay
+    at 0 regardless — the atlas is never flushed or rebuilt. Not intended for
+    normal playback: a very low cap makes dense subtitle/sign frames flash as
+    glyphs are evicted and re-rasterized more often than they are drawn.
+
+    Default: 0 (no override).
 
 ``--sub-ass-styles=<filename>``
     Load all SSA/ASS styles found in the specified file and use them for
