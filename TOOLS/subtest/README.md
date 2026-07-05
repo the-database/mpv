@@ -366,8 +366,6 @@ for r in data:
     isblur = any(k in tag for k in BLUR)
     limit = 772 if isblur else 0
     ok = md <= limit
-    # t3_* (fractional shadow) is a measured FINDING, not a pass/fail cell
-    if tag.startswith("t3_"): ok = True   # reported separately, see FINDING F1
     print(f"{'ok ' if ok else 'BAD'} {tag:<28} max={md:<6} limit={limit}")
     if not ok: bad.append(tag)
 print("GATE PASS" if not bad else f"GATE FAIL: {bad}")
@@ -400,20 +398,18 @@ python3 parse_stats.py stats.txt \
   — 18 fractional-shadow cases (test 3). These are **static**, so the batch
   points them at a single PTS.
 
-### Known FINDING (F1): fractional \shad is structurally displaced
+### FINDING F1 (fractional \shad displacement) — FIXED
 
-The deferred/raster path rounds sub-pixel shadow offsets to whole pixels while
-the CPU path does a sub-pixel bitmap shift. Every non-integer `\shad` /
-`\xshad` / `\yshad` case (all 18 `frac_shadow` samples) differs from the CPU
-baseline far above the 772 bar (plain up to ~27000/65535, i.e. the shadow is
-offset by a whole pixel). Integer `\shad` at scale 1 remains exact. This is a
-fix package, not an M5 pass. See the WP-D3 verdict for the full table.
-
-Mechanism proven mechanically (2026-07-05, mpv 3250589251): raster `\shad1.5`
-at fs100 is **bit-identical (maxdiff 0)** to CPU `\shad2` — the raster path
-renders the round-to-nearest whole-pixel offset. The measured `raster1.5 vs
-CPU1.5` diff (25724) is the expected fraction of a full 1-px shift
-(`CPU1 vs CPU2` = 40998).
+The deferred/raster path used to round sub-pixel shadow offsets to whole
+pixels while the CPU path does a sub-pixel bitmap shift (proven mechanically:
+raster `\shad1.5` at fs100 was bit-identical to CPU `\shad2`; all 18
+`frac_shadow` samples measured 5319–27010/65535). Fixed by the WP-D4 pair:
+libass emits the offset's floored integer part in the image position plus the
+1/64-px remainder in `ASS_Image.shift_x64/shift_y64`, and vo_gpu_next applies
+an exact integer port of `ass_shift_bitmap`'s fixed-point bilinear smear after
+blur/`\be`. All 18 cases now gate normally: `*_plain` exactly 0, `*_blur1`
+within the 772 gaussian bar (measured ≤225). The adjudicator snippet above no
+longer exempts `t3_*` rows.
 
 ### Runtime caveats for kobayashi comparisons
 
