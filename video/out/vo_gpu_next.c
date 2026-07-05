@@ -174,8 +174,14 @@ struct priv {
     // per-entry result atlas (entry->result_tex).
     pl_fmt osd_acc_fmt;        // r32f (storable) for the combine accumulator
     pl_tex run_acc;            // r32f combine accumulator (sized to max run)
-    pl_tex run_tmp;            // r8 blur temp
+    pl_tex run_tmp;            // r32f blur H->V intermediate (14-bit-equiv precision)
     pl_tex run_cov_f, run_cov_b; // r8 per-run fill/border coverage (pre-copy)
+
+    // Single-entry cache for the per-sigma blur tap weights (see blur_weights):
+    // sigma is constant across an event's runs, so recompute only on change.
+    float blur_cache_sigma;    // -1 = empty
+    int blur_cache_use;        // 1 = use the cascade FIR weights below, 0 = analytic
+    float blur_cache_w[9];     // cascade half-kernel wt[0..8] (0 padded)
 
     // Persistent GPU glyph cache (Stage B): each unique glyph (keyed by libass
     // cache_id) is uploaded once into glyph_atlas, so the per-frame upload is
@@ -440,36 +446,177 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
 // and the CPU path is used. osd_blur_part is shared by both the blur-only path
 // and the composite path, so it lives under either feature.
 #if HAVE_ASS_BLUR_DEFERRED || HAVE_ASS_COMPOSITE_DEFERRED
+// --- libass cascade tap weights ---------------------------------------------
+// The analytic gaussian exp(-t^2/2s^2), sampled at integer taps and renormalised
+// over its truncated support, matches libass's cascade blur to well under a LSB
+// for sigma >= ~1 -- but NOT for very small sigma (e.g. \blur0.5), where the
+// narrow kernel's shape diverges from libass's coefficient-table FIR by ~3.6/255
+// on a hard edge (sweep: \blur0.5 bordered text = maxdiff up to 3858). For those
+// small-sigma cases libass runs its cascade at level 0 -- i.e. a plain symmetric
+// FIR, no down/upscaling -- so its exact effective kernel is just that FIR:
+// center d = 1 - 2*sum(coeff), tap +-i = coeff[i-1]. We reproduce libass's
+// find_best_method()/calc_coeff() here (double precision, at pass-build time,
+// cached per sigma) and feed those weights to the blur shader in place of the
+// analytic gaussian, sampled at the SAME tap positions (perf-neutral: identical
+// tap count/striding/passes, only the weight values change). For sigma large
+// enough to need down/upscaling (level > 0) the analytic gaussian already meets
+// the bar, so we keep it (avoids porting the resampling cascade).
+static void ass_calc_gauss(double *res, int n, double r2)
+{
+    double alpha = 0.5 / r2, mul = exp(-alpha), mul2 = mul * mul;
+    double cur = sqrt(alpha / M_PI);
+    res[0] = cur; cur *= mul; res[1] = cur;
+    for (int i = 2; i < n; i++) { mul *= mul2; cur *= mul; res[i] = cur; }
+}
+static void ass_coeff_filter(double *c, int n, const double k[4])
+{
+    double p1 = c[1], p2 = c[2], p3 = c[3];
+    for (int i = 0; i < n; i++) {
+        double r = c[i]*k[0] + (p1+c[i+1])*k[1] + (p2+c[i+2])*k[2] + (p3+c[i+3])*k[3];
+        p3 = p2; p2 = p1; p1 = c[i]; c[i] = r;
+    }
+}
+static void ass_calc_matrix(double mat[8][8], const double *mf, int n)
+{
+    for (int i = 0; i < n; i++) {
+        mat[i][i] = mf[2*i+2] + 3*mf[0] - 4*mf[i+1];
+        for (int j = i+1; j < n; j++)
+            mat[i][j] = mat[j][i] = mf[i+j+2] + mf[j-i] + 2*(mf[0]-mf[i+1]-mf[j+1]);
+    }
+    for (int k = 0; k < n; k++) {
+        double z = 1/mat[k][k]; mat[k][k] = 1;
+        for (int i = 0; i < n; i++) {
+            if (i == k) continue;
+            double m = mat[i][k]*z; mat[i][k] = 0;
+            for (int j = 0; j < n; j++) mat[i][j] -= mat[k][j]*m;
+        }
+        for (int j = 0; j < n; j++) mat[k][j] *= z;
+    }
+}
+static void ass_calc_coeff(double mu[8], int n, double r2, double mul)
+{
+    const double w = 12096;
+    double kernel[4] = {
+        (((+3280/w)*mul + 1092/w)*mul + 2520/w)*mul + 5204/w,
+        (((-2460/w)*mul -  273/w)*mul -  210/w)*mul + 2943/w,
+        (((+ 984/w)*mul -  546/w)*mul -  924/w)*mul +  486/w,
+        (((- 164/w)*mul +  273/w)*mul -  126/w)*mul +   17/w,
+    };
+    double mat_freq[17] = { kernel[0], kernel[1], kernel[2], kernel[3] };
+    ass_coeff_filter(mat_freq, 7, kernel);
+    double vec_freq[12];
+    ass_calc_gauss(vec_freq, n + 4, r2 * mul);
+    ass_coeff_filter(vec_freq, n + 1, kernel);
+    double mat[8][8] = {{0}};
+    ass_calc_matrix(mat, mat_freq, n);
+    double vec[8];
+    for (int i = 0; i < n; i++)
+        vec[i] = mat_freq[0] - mat_freq[i+1] - vec_freq[0] + vec_freq[i+1];
+    for (int i = 0; i < n; i++) {
+        double res = 0;
+        for (int j = 0; j < n; j++) res += mat[i][j]*vec[j];
+        mu[i] = res > 0 ? res : 0;
+    }
+}
+// Fill p->blur_cache_{use,w} for `sigma` (cached; single entry). Returns whether
+// the cascade FIR weights apply (level 0); otherwise the caller uses analytic.
+static bool blur_weights(struct priv *p, float sigma)
+{
+    if (sigma == p->blur_cache_sigma)
+        return p->blur_cache_use;
+    p->blur_cache_sigma = sigma;
+    p->blur_cache_use = 0;
+    for (int i = 0; i < 9; i++) p->blur_cache_w[i] = 0;
+    double r2 = (double) sigma * sigma;
+    if (r2 <= 0.001)
+        return false;
+    int level, radius;
+    double mu[8] = {0};
+    if (r2 < 0.5) {
+        level = 0; radius = 4;
+        mu[1] = 0.085 * r2 * r2 * r2;
+        mu[0] = 0.5 * r2 - 4 * mu[1];
+    } else {
+        double frac = frexp(sqrt(0.11569*r2 + 0.20591047), &level);
+        if (level != 0)
+            return false;   // needs the resampling cascade; analytic is fine there
+        double mul = pow(0.25, level);
+        radius = 8 - (int)((10.1525 + 0.8335*mul)*(1 - frac));
+        if (radius < 4) radius = 4;
+        ass_calc_coeff(mu, radius, r2, mul);
+    }
+    // Quantise to libass's Q16 coeff table, then normalise to floating weights;
+    // half[0] = center, half[i] = tap at +-i. radius <= 8 so this fits wt[0..8].
+    int coeff[8], sum = 0;
+    for (int i = 0; i < radius; i++) { coeff[i] = (int)(0x10000*mu[i] + 0.5); sum += coeff[i]; }
+    p->blur_cache_w[0] = (65536 - 2*sum) / 65536.0f;
+    for (int i = 0; i < radius; i++) p->blur_cache_w[i+1] = coeff[i] / 65536.0f;
+    p->blur_cache_use = 1;
+    return true;
+}
+
 // Separable gaussian over one atlas sub-region [ox,oy,rw,rh], clamped to that
 // region (so a blurred part can't read/write its atlas neighbours). sigma == 0
-// degenerates to a copy. Validated against a CPU reference via lavapipe.
+// degenerates to a copy. For small sigma the per-tap weight comes from libass's
+// cascade FIR (uc!=0, weights wt[]); otherwise the analytic gaussian is used.
+// Validated against a CPU reference via lavapipe.
 static const char *const osd_blur_body_h =
     "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
     "if (g.x < rw && g.y < rh) {\n"
     "    int px = g.x + ox, py = g.y + oy;\n"
+    "    float wt[9];\n"
+    "    wt[0]=w0.x; wt[1]=w0.y; wt[2]=w0.z; wt[3]=w0.w;\n"
+    "    wt[4]=w1.x; wt[5]=w1.y; wt[6]=w1.z; wt[7]=w1.w;\n"
+    "    wt[8]=w2.x;\n"
     "    float acc = 0.0, wsum = 0.0;\n"
     "    for (int t = -radius; t <= radius; t++) {\n"
     "        int q = px + t;\n"
     "        if (q >= ox && q < ox+rw) {\n"
-    "            float w = sigma > 0.0 ? exp(-0.5*float(t*t)/(sigma*sigma)) : float(t==0);\n"
+    "            float w = uc != 0 ? wt[abs(t)]\n"
+    "                    : (sigma > 0.0 ? exp(-0.5*float(t*t)/(sigma*sigma)) : float(t==0));\n"
     "            acc += w * texelFetch(src, ivec2(q, py), 0).r; wsum += w;\n"
     "        }\n"
     "    }\n"
     "    imageStore(dst, ivec2(px, py), vec4(acc / wsum, 0.0, 0.0, 0.0));\n"
     "}\n";
+// The V (final) pass writes 8-bit coverage. libass does NOT round-to-nearest at
+// its 14->8 bit pack: ass_stripe_pack applies a 2x2 ordered dither tied to the
+// bitmap's own pixel grid -- out8 = (v14 - (v14>>8) + dither) >> 6, with
+// dither in {8,40,56,24} chosen by (x&1,y&1). Round-to-nearest instead leaves a
+// systematic, position-correlated ~1-LSB coverage error on every blurred edge;
+// across many overlapping blurred layers over a high-contrast background that
+// stacks into visible outliers (kobayashi). Because the GPU raster is bit-exact
+// with libass, the run-local (atlas) grid IS libass's combined-bitmap grid, so
+// gl_GlobalInvocationID parity matches libass's bitmap-local dither phase.
+// sigma==0 is the unblurred (bordered) fill: libass never packs it, so keep it a
+// bit-exact copy (no dither).
 static const char *const osd_blur_body_v =
     "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
     "if (g.x < rw && g.y < rh) {\n"
     "    int px = g.x + ox, py = g.y + oy;\n"
+    "    float wt[9];\n"
+    "    wt[0]=w0.x; wt[1]=w0.y; wt[2]=w0.z; wt[3]=w0.w;\n"
+    "    wt[4]=w1.x; wt[5]=w1.y; wt[6]=w1.z; wt[7]=w1.w;\n"
+    "    wt[8]=w2.x;\n"
     "    float acc = 0.0, wsum = 0.0;\n"
     "    for (int t = -radius; t <= radius; t++) {\n"
     "        int q = py + t;\n"
     "        if (q >= oy && q < oy+rh) {\n"
-    "            float w = sigma > 0.0 ? exp(-0.5*float(t*t)/(sigma*sigma)) : float(t==0);\n"
+    "            float w = uc != 0 ? wt[abs(t)]\n"
+    "                    : (sigma > 0.0 ? exp(-0.5*float(t*t)/(sigma*sigma)) : float(t==0));\n"
     "            acc += w * texelFetch(src, ivec2(px, q), 0).r; wsum += w;\n"
     "        }\n"
     "    }\n"
-    "    imageStore(dst, ivec2(px, py), vec4(acc / wsum, 0.0, 0.0, 0.0));\n"
+    "    float cf = acc / wsum, outv;\n"
+    "    if (sigma > 0.0) {\n"
+    "        int v14 = clamp(int(cf * 16384.0 + 0.5), 0, 16384);\n"
+    "        int dth = (g.y & 1) == 0 ? ((g.x & 1) == 0 ? 8 : 40)\n"
+    "                                 : ((g.x & 1) == 0 ? 56 : 24);\n"
+    "        outv = float((v14 - (v14 >> 8) + dth) >> 6) / 255.0;\n"
+    "    } else {\n"
+    "        outv = cf;\n"
+    "    }\n"
+    "    imageStore(dst, ivec2(px, py), vec4(outv, 0.0, 0.0, 0.0));\n"
     "}\n";
 
 static void osd_blur_part(struct priv *p, pl_tex src, pl_tex dst,
@@ -477,6 +624,12 @@ static void osd_blur_part(struct priv *p, pl_tex src, pl_tex dst,
                           const char *body)
 {
     int radius = (int)(3.0f * sigma + 0.999f); // ~ceil(3*sigma); 0 when sigma==0
+    // Cascade FIR tap weights for small sigma (else analytic). radius <= 8
+    // whenever these apply (level 0), so wt[0..8] covers every tap.
+    int uc = blur_weights(p, sigma) ? 1 : 0;
+    float w0[4] = { p->blur_cache_w[0], p->blur_cache_w[1], p->blur_cache_w[2], p->blur_cache_w[3] };
+    float w1[4] = { p->blur_cache_w[4], p->blur_cache_w[5], p->blur_cache_w[6], p->blur_cache_w[7] };
+    float w2[4] = { p->blur_cache_w[8], 0, 0, 0 };
     pl_shader sh = pl_dispatch_begin(p->osd_dp);
     struct pl_shader_desc descs[] = {
         { .desc = { .name="src", .type=PL_DESC_SAMPLED_TEX, .binding=0 },
@@ -492,12 +645,16 @@ static void osd_blur_part(struct priv *p, pl_tex src, pl_tex dst,
         { .var = pl_var_int("rh"),     .data=&rh },
         { .var = pl_var_int("radius"), .data=&radius },
         { .var = pl_var_float("sigma"),.data=&sigma },
+        { .var = pl_var_int("uc"),     .data=&uc },
+        { .var = pl_var_vec4("w0"),    .data=w0 },
+        { .var = pl_var_vec4("w1"),    .data=w1 },
+        { .var = pl_var_vec4("w2"),    .data=w2 },
     };
     struct pl_custom_shader cs = {
         .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE,
         .compute = true, .compute_group_size = {16, 16},
         .descriptors = descs, .num_descriptors = 2,
-        .variables = vars, .num_variables = 6,
+        .variables = vars, .num_variables = 10,
         .body = body,
     };
     if (pl_shader_custom(sh, &cs)) {
@@ -1295,8 +1452,12 @@ static void gc_warmup(struct priv *p)
     bool have_r32 = r32 && (r32->caps & PL_FMT_CAP_STORABLE);
     if (have_r32)
         gc_ensure(gpu, &p->run_acc, r32, W, H, true, false, false, false, false);
+    // run_tmp is the blur's H->V intermediate; it must be created at the same
+    // high precision the hot path uses (r32f), else the first real frame regrows
+    // it. See the r_tmp rationale in compose_glyph_runs.
+    if (have_r32)
+        gc_ensure(gpu, &p->run_tmp,   r32, W, H, true, true, false, false, false);
     if (have_r8) {
-        gc_ensure(gpu, &p->run_tmp,   r8, W, H, true, true, false, false, false);
         gc_ensure(gpu, &p->run_cov_f, r8, W, H, true, true, false, false, false);
         gc_ensure(gpu, &p->run_cov_b, r8, W, H, true, true, false, false, false);
     }
@@ -1385,7 +1546,17 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // final overlay. gs == 1 (uncapped) leaves coords unchanged.
     pl_gpu gpu = p->gpu;
     pl_fmt r8 = p->osd_fmt[SUBBITMAP_LIBASS];
-    if (!r8 || !p->osd_acc_fmt || !(p->osd_acc_fmt->caps & PL_FMT_CAP_STORABLE) ||
+    // The gaussian's H->V intermediate (run_tmp) must keep more than 8 bits:
+    // libass unpacks its 8-bit coverage to 14 bits (0x4000) and holds that
+    // precision across BOTH separable passes, packing back to 8 bits only once,
+    // after the V pass. An r8 intermediate would round the H-pass result to 8
+    // bits before the V pass -- a second 8-bit rounding libass never does --
+    // which leaves a ~1-LSB error on every blurred edge that compounds across
+    // overlapping layers (kobayashi maxdiff 2000). r32f is the storable
+    // high-precision format already used for run_acc; carrying the H result at
+    // that precision makes the pair of passes match libass's single final pack.
+    pl_fmt r_tmp = p->osd_acc_fmt;
+    if (!r8 || !r_tmp || !(r_tmp->caps & PL_FMT_CAP_STORABLE) ||
         !(r8->caps & PL_FMT_CAP_STORABLE))
         return;
 
@@ -1655,7 +1826,7 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 
     if (!gc_ensure(gpu, &entry->result_tex, r8, atlas_w, atlas_h, true, true, false, false, false) ||
         !gc_ensure(gpu, &p->run_acc, p->osd_acc_fmt, run_acc_w, run_acc_h, true, false, false, false, false) ||
-        !gc_ensure(gpu, &p->run_tmp, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
+        !gc_ensure(gpu, &p->run_tmp, r_tmp, run_acc_w, run_acc_h, true, true, false, false, false) ||
         !gc_ensure(gpu, &p->run_cov_f, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
         !gc_ensure(gpu, &p->run_cov_b, r8, run_acc_w, run_acc_h, true, true, false, false, false)) {
         talloc_free(tmp);
@@ -4126,6 +4297,7 @@ static int preinit(struct vo *vo)
     p->osd_fmt[SUBBITMAP_LIBASS_GLYPHS] = p->osd_fmt[SUBBITMAP_LIBASS];
     p->osd_fmt[SUBBITMAP_LIBASS_OUTLINES] = p->osd_fmt[SUBBITMAP_LIBASS];
     p->osd_acc_fmt = pl_find_named_fmt(p->gpu, "r32f");
+    p->blur_cache_sigma = -1.0f;   // force computing weights for the first sigma
     p->osd_sync = 1;
 
     // Dedicated renderer + RGBA target for the capped-resolution subtitle
