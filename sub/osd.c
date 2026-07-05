@@ -219,9 +219,18 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
         struct osd_object *obj = osd->objs[OSDTYPE_SUB + index];
         obj->sub = dec_sub;
         obj->vo_change_id += 1;
+        // Sub track attached/detached/switched: invalidate any VO-side
+        // stale-overlay snapshots (never show the previous track's subs).
+        atomic_fetch_add_explicit(&osd->sub_track_epoch, 1,
+                                  memory_order_relaxed);
     }
     osd->want_redraw_notification = true;
     mp_mutex_unlock(&osd->lock);
+}
+
+uint64_t osd_sub_track_epoch(struct osd_state *osd)
+{
+    return atomic_load_explicit(&osd->sub_track_epoch, memory_order_relaxed);
 }
 
 bool osd_get_render_subs_in_filter(struct osd_state *osd)
