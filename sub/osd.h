@@ -237,6 +237,12 @@ bool osd_query_and_reset_want_redraw(struct osd_state *osd);
 void osd_set_text(struct osd_state *osd, const char *text);
 void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub);
 
+// Incremented every time a sub track is attached/detached/switched
+// (osd_set_sub). VOs compare it against the value recorded with a cached
+// subtitle overlay snapshot, so a snapshot predating a track change is
+// never presented (see vo_gpu_next's present guard).
+uint64_t osd_sub_track_epoch(struct osd_state *osd);
+
 bool osd_get_render_subs_in_filter(struct osd_state *osd);
 void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);
 void osd_set_force_video_pts(struct osd_state *osd, double video_pts);
