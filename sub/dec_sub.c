@@ -328,6 +328,7 @@ void sub_preload(struct dec_sub *sub)
         if (!pkt)
             break;
         sub->sd->driver->decode(sub->sd, pkt);
+        sub_ahead_enqueue(sub->ahead, pkt);   // keep the worker's track a mirror
         MP_TARRAY_APPEND(sub, sub->cached_pkts, sub->num_cached_pkts, pkt);
     }
 
@@ -453,9 +454,14 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
 void sub_redecode_cached_packets(struct dec_sub *sub)
 {
     mp_mutex_lock(&sub->lock);
+    // The re-decode changes what the packets produce (filters/options); the
+    // worker's private track must mirror it or the ring would keep serving
+    // pre-change frames. Reset it and refeed the still-cached packets.
+    sub_ahead_flush(sub->ahead);
     int index = sub->cached_pkt_pos;
     while (index < sub->num_cached_pkts) {
         sub->sd->driver->decode(sub->sd, sub->cached_pkts[index]);
+        sub_ahead_enqueue(sub->ahead, sub->cached_pkts[index]);
         ++index;
     }
     mp_mutex_unlock(&sub->lock);
