@@ -104,6 +104,39 @@ struct osd_state {
     struct pl_overlay overlays[MAX_OSD_PARTS];
 };
 
+// WP-E3 never-block presentation guard: the overlay state is double-buffered
+// (ping-pong). Every frame builds into the buffer NOT holding the last
+// complete build, and commits it only when the build ran to completion. If
+// the per-frame deadline (--sub-present-guard-ms) expires mid-build, the
+// partial buffer is abandoned and the previous complete build -- which no
+// build step has touched -- is presented instead (subs at most one frame
+// stale). This is the "defer mutation-commit to the end" design: it makes
+// every checkpoint boundary safe without restructuring compose_glyph_runs,
+// because all state a presented overlay references (entry->tex/blur_tex/
+// inter_tex/result_tex, parts arrays, the pl_overlay array) is per-buffer.
+// Shared caches the build does touch (glyph atlas, run_* scratch, upload
+// rings) are never referenced by a committed overlay: the atlas is only a
+// compose-time *source* (resolved coverage is copied into the per-buffer
+// result_tex), and the scratch/ring contents are consumed within the build.
+struct osd_guard {
+    struct osd_state states[2];
+    int good;                 // index of the last complete build; -1 = none
+    int good_num;             // its number of overlays
+    double good_pts;          // video pts it was built for (validity window)
+    uint64_t good_epoch;      // osd_sub_track_epoch() at build time
+    struct mp_osd_res good_res; // geometry it was built for
+    int good_flags;           // osd_render flags it was built with
+    enum pl_overlay_coords good_coords;
+    // Forward-progress guarantee: a guard fire sets this, and the NEXT build
+    // for this consumer ignores the deadline and runs to completion. Without
+    // it, content that is systematically over-deadline would bail every
+    // frame and freeze the subs at the last committed build; with it the
+    // worst case degrades to committing every other frame, keeping the
+    // "at most one frame stale" invariant. (The guard targets rare transient
+    // stalls, where this flag simply never matters.)
+    bool must_complete;
+};
+
 struct scaler_params {
     struct pl_filter_config config;
 };
@@ -217,7 +250,17 @@ struct priv {
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
-    struct osd_state osd_state;
+    struct osd_guard osd_guard;
+
+    // WP-E3 present-guard runtime state (see struct osd_guard). guard_t0/
+    // guard_deadline_ns are computed once per draw_frame; guard_abs is the
+    // absolute bail time for the update_overlays call currently running
+    // (0 = guard inactive for that call). guard_fired latches any bail this
+    // frame so stale-present counts once per frame, not once per overlay set.
+    int64_t guard_t0;
+    int64_t guard_deadline_ns;
+    int64_t guard_abs;
+    bool guard_fired;
 
     uint64_t last_id;
     uint64_t osd_sync;
@@ -271,6 +314,11 @@ struct priv {
     int64_t cnt_shader_warmups;
     int64_t stat_gcache_epoch_advance, stat_gcache_evict_n, stat_gcache_overcommit;
     int64_t stat_shader_warmups;
+    // WP-E3: presentation-guard engagements (frames presented with the
+    // previous complete overlay state because the build blew its deadline).
+    // Acceptance runs assert this stays 0; it exists for unknown stall
+    // classes. Distinct from ra-stale (dec_sub-level render-ahead staleness).
+    int64_t cnt_stale_present, stat_stale_present;
     bool first_frame_drawn;
     // Phase wall-times (ns) for the MSGL_V [slowframe] line; only computed when
     // MSGL_V is active. The phase start/end dump-stats events themselves come
@@ -299,6 +347,8 @@ struct gl_next_opts {
     bool target_hint_strict;
     int sub_glyph_atlas_size;   // WP-E: persistent glyph atlas edge, created once
     int sub_glyph_atlas_height; // WP-A3 debug knob; 0 = default (see option below)
+    int sub_present_guard_ms;   // WP-E3: overlay-build deadline; -1 auto, 0 off
+    int sub_debug_stall_ms;     // WP-E3 debug: injected overlay-section sleep
     char **raw_opts;
 };
 
@@ -349,6 +399,15 @@ const struct m_sub_options gl_next_conf = {
         // so the perf counters (atlas-overflow, gcache-flush) can be exercised in
         // tests. Not for normal use -- a low cap makes dense subtitle frames flash.
         {"sub-glyph-atlas-height", OPT_INT(sub_glyph_atlas_height), M_RANGE(0, 16384)},
+        // WP-E3: never-block presentation guard. Deadline (ms) for the
+        // per-frame subtitle/OSD overlay build; on expiry the frame presents
+        // the previous complete overlay state instead of waiting (counted as
+        // stale-present). -1 = auto (the frame's duration), 0 = off.
+        {"sub-present-guard-ms", OPT_INT(sub_present_guard_ms), M_RANGE(-1, 10000)},
+        // DEBUG/dev only: sleep this many ms inside the overlay-build section
+        // (after the first guard checkpoint), so the guard can be exercised
+        // deterministically in tests. Not for normal use.
+        {"sub-debug-stall-ms", OPT_INT(sub_debug_stall_ms), M_RANGE(0, 10000)},
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
     },
@@ -361,6 +420,7 @@ const struct m_sub_options gl_next_conf = {
         .target_hint = -1,
         .target_hint_strict = true,
         .sub_glyph_atlas_size = 8192,   // WP-E: 8192^2 r8 = 64 MiB
+        .sub_present_guard_ms = -1,     // WP-E3: auto (frame duration)
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -954,6 +1014,15 @@ static void emit_counter(struct vo *vo, const char *name, int64_t cur, int64_t *
     }
 }
 
+// WP-E3 guard checkpoint: true when the overlay build blew its deadline and
+// should bail at this (safe) boundary. Zero overhead when the guard is
+// inactive (guard_abs == 0: option off, must_complete build, or a
+// non-presentation caller like video_screenshot) -- no clock read.
+static inline bool sub_guard_expired(struct priv *p)
+{
+    return p->guard_abs && mp_time_ns() > p->guard_abs;
+}
+
 #if HAVE_ASS_COMPOSITE_DEFERRED
 // Reserve a glyph's slot in the persistent atlas. Cache hit (live entry, same
 // size): *upload stays false. Miss: a ring slot is allocated + the id inserted,
@@ -1510,10 +1579,13 @@ static void gc_warmup(struct priv *p)
     // image subs) allocates a per-entry texture on first use -- which lands at
     // the first subtitle event, mid-playback, and counts as a VO-thread alloc.
     // Pre-create floor-sized pool textures with the exact params the hot path
-    // uses, so its pl_tex_recreate no-ops on the popped texture.
+    // uses, so its pl_tex_recreate no-ops on the popped texture. WP-E3: the
+    // present guard double-buffers the overlay state, so each in-use entry
+    // needs TWO pool textures (one per ping-pong buffer); stock 4 to cover
+    // two concurrent legacy entries without a mid-playback alloc.
     if (r8) {
         int fl = MPMIN(2048, gpu->limits.max_tex_2d_dim);
-        while (p->num_sub_tex < 2) {
+        while (p->num_sub_tex < 4) {
             pl_tex t = pl_tex_create(gpu, &(struct pl_tex_params) {
                 .format = r8,
                 .w = fl,
@@ -1535,7 +1607,19 @@ static void gc_warmup(struct priv *p)
 // single monochrome overlay whose parts reference each run's coverage region.
 // SUBBITMAP_LIBASS_OUTLINES items take the same path, except cache-miss glyph
 // coverage is rasterized on the GPU (gc_raster_batch) instead of uploaded.
-static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
+//
+// WP-E3: returns false iff the present guard expired at one of the internal
+// checkpoints and the item was abandoned mid-build (the caller then presents
+// the previous complete overlay state). Checkpoint placement is constrained
+// by the persistent glyph cache: gcache_reserve() claims an atlas slot for a
+// miss when the glyph is RESOLVED, but its pixels are only written by the
+// batched raster/upload flush further down. Bailing between those two points
+// would leave slots that cache-hit garbage forever after, so there is
+// deliberately NO checkpoint inside the resolve->flush span; the safe
+// boundaries are before the resolve loop, after the flush, and between
+// per-region compose iterations (which only touch this build buffer's entry
+// plus scratch never referenced by a committed overlay).
+static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                                struct osd_entry *entry, struct pl_frame *frame,
                                struct osd_state *state, enum pl_overlay_coords coords,
                                struct mp_image *src, double gs)
@@ -1558,13 +1642,17 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     pl_fmt r_tmp = p->osd_acc_fmt;
     if (!r8 || !r_tmp || !(r_tmp->caps & PL_FMT_CAP_STORABLE) ||
         !(r8->caps & PL_FMT_CAP_STORABLE))
-        return;
+        return true;
 
     // Persistent glyph cache: ensure the atlas + id table exist (created once,
     // never rebuilt), then upload/rasterize only the cache-miss glyphs. WP-E:
     // no watermark flush -- epoch-segmented eviction (gc_place) reclaims space.
     if (!gc_ensure_atlas(p))
-        return;
+        return true;
+    // WP-E3 checkpoint: last safe point before the glyph resolve claims atlas
+    // slots (see the function comment); nothing is mutated yet.
+    if (sub_guard_expired(p))
+        return false;
     // WP-E: each compose item is one eviction "pass". A segment claimed earlier
     // in this pass is never recycled mid-pass, so a glyph resolved into cpos[]
     // here stays valid through this item's raster+composite below (overcommit
@@ -1751,6 +1839,14 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         stats_time_end(p->stats, "sub-upload");
     }
 
+    // WP-E3 checkpoint: the miss flush is recorded (every claimed atlas slot
+    // has its raster/upload in flight), so the glyph cache is consistent again
+    // and bailing is safe from here on.
+    if (sub_guard_expired(p)) {
+        talloc_free(tmp);
+        return false;
+    }
+
     int max_run = 0;
     for (int i = 0; i < item->num_parts; i++)
         max_run = MPMAX(max_run, (int) item->parts[i].libass.run_id);
@@ -1800,7 +1896,7 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         }
     }
 
-    if (!nregs) { talloc_free(tmp); return; }   // no deferred runs in this item
+    if (!nregs) { talloc_free(tmp); return true; }   // no deferred runs in this item
 
     const int AW = 4096;
     int shelf_x = 0, shelf_y = 0, shelf_h = 0, max_w = 0;
@@ -1830,10 +1926,18 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         !gc_ensure(gpu, &p->run_cov_f, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
         !gc_ensure(gpu, &p->run_cov_b, r8, run_acc_w, run_acc_h, true, true, false, false, false)) {
         talloc_free(tmp);
-        return;
+        return true;
     }
 
     for (int i = 0; i < nregs; i++) {
+        // WP-E3 checkpoint: between regions. Each iteration only records
+        // dispatches into this build buffer's result_tex and the shared
+        // scratch (run_acc/run_cov_*), neither of which the previous
+        // complete overlay state references.
+        if (sub_guard_expired(p)) {
+            talloc_free(tmp);
+            return false;
+        }
         struct gc_region *r = &regs[i];
         int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
         // Reproduce the CPU pipeline order (ass_composite_construct):
@@ -1985,13 +2089,22 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     };
     if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
         ol->color = src->params.color;
+    return true;
 }
 #endif // HAVE_ASS_COMPOSITE_DEFERRED
 
-static void update_overlays(struct vo *vo, struct mp_osd_res res,
+// Build the overlay set for `frame` into one of g's ping-pong buffers.
+// `present` marks the two draw_frame (presentation) callers: only those
+// commit the build as the new "last complete" state and are subject to the
+// WP-E3 present guard; video_screenshot passes false (always builds fully,
+// never commits, so a screenshot at foreign geometry can't pollute the
+// presentation snapshot). Returns false iff the guard bailed the build (the
+// caller must then not treat the overlay state as freshly built, e.g. the
+// blend-subs path leaves fp->osd_sync behind so the next frame retries).
+static bool update_overlays(struct vo *vo, struct mp_osd_res res,
                             int flags, enum pl_overlay_coords coords,
-                            struct osd_state *state, struct pl_frame *frame,
-                            struct mp_image *src, int stereo_mode)
+                            struct osd_guard *g, struct pl_frame *frame,
+                            struct mp_image *src, int stereo_mode, bool present)
 {
     struct priv *p = vo->priv;
     double pts = src ? src->pts : 0;
@@ -1999,6 +2112,18 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     mp_get_3d_side_by_side(stereo_mode, div);
     res.w /= div[0];
     res.h /= div[1];
+
+    // WP-E3 present guard: build into the buffer NOT holding the last
+    // complete overlay state, so that state stays untouched and presentable
+    // until this build commits (see struct osd_guard). A build that follows
+    // a bail runs deadline-free (must_complete) to guarantee progress.
+    uint64_t sub_epoch = osd_sub_track_epoch(vo->osd);
+    bool guard_on = present && p->guard_deadline_ns > 0 && !g->must_complete;
+    p->guard_abs = guard_on ? p->guard_t0 + p->guard_deadline_ns : 0;
+    if (present)
+        g->must_complete = false;
+    int build = g->good >= 0 ? 1 - g->good : 0;
+    struct osd_state *state = &g->states[build];
     // WP-A3 slow-frame phase timers: only take wall-clock samples when the
     // MSGL_V [slowframe] path can fire. The dump-stats start/end phase events
     // (stats_time_*) are emitted unconditionally and self-gate on MSGL_STATS.
@@ -2024,7 +2149,25 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     frame->overlays = state->overlays;
     frame->num_overlays = 0;
 
+    // WP-E3 checkpoint: after the fetch, before anything is mutated (covers a
+    // stalled osd_render, e.g. a render-ahead miss-wait blown far past its
+    // own bound).
+    if (sub_guard_expired(p))
+        goto bail;
+    // WP-E3 debug (--sub-debug-stall-ms): inject an artificial stall after
+    // the first checkpoint so the guard is deterministically testable. Main
+    // presentation call only, once per frame.
+    if (present && g == &p->osd_guard && p->next_opts->sub_debug_stall_ms > 0) {
+        mp_sleep_ns(p->next_opts->sub_debug_stall_ms * INT64_C(1000000));
+        if (sub_guard_expired(p))   // the checkpoint the injected stall hits
+            goto bail;
+    }
+
     for (int n = 0; n < subs->num_items; n++) {
+        // WP-E3 checkpoint: between OSD items; the previous item's overlay is
+        // fully recorded, this item's entry is untouched.
+        if (sub_guard_expired(p))
+            goto bail;
         const struct sub_bitmaps *item = subs->items[n];
 #if HAVE_ASS_OUTLINE_DEFERRED
         // Outline mode has no packed atlas (the GPU rasterizes from the blobs).
@@ -2043,8 +2186,10 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             double gs = item->render_w > 0 && subs->w > 0
                       ? (double) item->render_w / subs->w : 1.0;
             stats_time_start(p->stats, "sub-composite");
-            compose_glyph_runs(p, item, entry, frame, state, coords, src, gs);
+            bool done = compose_glyph_runs(p, item, entry, frame, state, coords, src, gs);
             stats_time_end(p->stats, "sub-composite");
+            if (!done)
+                goto bail;
             continue;   // no legacy fallback path (it would need a packed atlas)
         }
 #endif // HAVE_ASS_OUTLINE_DEFERRED
@@ -2055,8 +2200,10 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             double gs = item->render_w > 0 && subs->w > 0
                       ? (double) item->render_w / subs->w : 1.0;
             stats_time_start(p->stats, "sub-composite");   // WP-A3: GPU per-glyph composite
-            compose_glyph_runs(p, item, entry, frame, state, coords, src, gs);
+            bool done = compose_glyph_runs(p, item, entry, frame, state, coords, src, gs);
             stats_time_end(p->stats, "sub-composite");
+            if (!done)
+                goto bail;
             // Already-combined fallback parts (shadow/karaoke runs, glyph_id 0)
             // go through the legacy path below; skip it if there are none.
             bool has_fallback = false;
@@ -2145,6 +2292,11 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             break;
         }
 
+        // WP-E3 checkpoint: the atlas upload is recorded (async, targets only
+        // this build buffer's entry->tex); the parts build below is next.
+        if (sub_guard_expired(p))
+            goto bail;
+
         entry->num_parts = 0;
         for (int i = 0; i < item->num_parts; i++) {
             const struct sub_bitmap *b = &item->parts[i];
@@ -2204,6 +2356,13 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                     stats_time_start(p->stats, "sub-blur");   // WP-A3: GPU blur pass
                     int64_t bl0 = want_t ? mp_time_ns() : 0;
                     for (int i = 0; i < item->num_parts; i++) {
+                        // WP-E3 checkpoint: between per-part blur dispatch
+                        // pairs (all writes go to this build buffer's blur
+                        // scratch textures).
+                        if (sub_guard_expired(p)) {
+                            stats_time_end(p->stats, "sub-blur");
+                            goto bail;
+                        }
                         const struct sub_bitmap *b = &item->parts[i];
                         if (b->w < 1 || b->h < 1)
                             continue;
@@ -2297,6 +2456,10 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
             !(div[0] > 1 || div[1] > 1) &&
             entry->num_parts > 0)
         {
+            // WP-E3 checkpoint: before recording the capped-res composite
+            // (a whole pl_render_image, the heaviest single call here).
+            if (sub_guard_expired(p))
+                goto bail;
             int rw = item->render_w, rh = item->render_h;
             int iw = (rw + 63) & ~63, ih = (rh + 63) & ~63;
             bool iok = pl_tex_recreate(p->gpu, &entry->inter_tex, &(struct pl_tex_params) {
@@ -2390,11 +2553,62 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
     }
 
     talloc_free(subs);
+
+    // WP-E3 commit: the build ran to completion; it becomes the presentable
+    // snapshot. Record everything needed to validate a later stale-serve.
+    if (present) {
+        g->good = build;
+        g->good_num = frame->num_overlays;
+        g->good_pts = src ? src->pts : MP_NOPTS_VALUE;
+        g->good_epoch = sub_epoch;
+        g->good_res = res;
+        g->good_flags = flags;
+        g->good_coords = coords;
+    }
+    return true;
+
+bail:
+    // WP-E3 guard fired: abandon the partial build (the next build for this
+    // consumer reuses the same buffer from scratch) and present the previous
+    // complete overlay state -- IF it is still valid for this frame. It is
+    // invalidated by: VOCTRL_RESET/reconfig/resize (good = -1, set in
+    // control()/reconfig()/resize()), a sub track change (sub_epoch), any
+    // geometry/flags/coords mismatch, and a pts discontinuity the reset path
+    // might not have covered (backstop: never serve across a pts regression
+    // or a > 0.5 s forward jump). When invalid, this frame simply presents
+    // no overlays -- late-but-correct beats stale-but-wrong.
+    talloc_free(subs);
+    p->guard_fired = true;
+    g->must_complete = true;
+    frame->num_overlays = 0;
+    if (g->good >= 0 && flags == g->good_flags && coords == g->good_coords &&
+        osd_res_equals(res, g->good_res) && sub_epoch == g->good_epoch)
+    {
+        double now = src ? src->pts : MP_NOPTS_VALUE;
+        bool pts_ok = now == g->good_pts ||    // same frame / OSD-only redraw
+                      (now != MP_NOPTS_VALUE && g->good_pts != MP_NOPTS_VALUE &&
+                       now >= g->good_pts && now - g->good_pts <= 0.5);
+        if (pts_ok) {
+            frame->overlays = g->states[g->good].overlays;
+            frame->num_overlays = g->good_num;
+        }
+    }
+    // Off the fast path (fires are exceptional); lets tests attribute exactly
+    // what a guard engagement presented (stale snapshot pts vs no overlays).
+    if (frame->num_overlays) {
+        MP_VERBOSE(vo, "[present-guard] deadline exceeded at pts %f: presenting "
+                   "previous overlays (pts %f)\n",
+                   src ? src->pts : MP_NOPTS_VALUE, g->good_pts);
+    } else {
+        MP_VERBOSE(vo, "[present-guard] deadline exceeded at pts %f: presenting "
+                   "no overlays\n", src ? src->pts : MP_NOPTS_VALUE);
+    }
+    return false;
 }
 
 struct frame_priv {
     struct vo *vo;
-    struct osd_state subs;
+    struct osd_guard subs;
     uint64_t osd_sync;
     struct ra_hwdec *hwdec;
 };
@@ -2809,16 +3023,22 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
     struct priv *p = fp->vo->priv;
-    for (int i = 0; i < MP_ARRAY_SIZE(fp->subs.entries); i++) {
-        pl_tex tex = fp->subs.entries[i].tex;
-        if (tex)
-            MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, tex);
-        pl_tex bl = fp->subs.entries[i].blur_tex;
-        if (bl)
-            MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, bl);
-        pl_tex tm = fp->subs.entries[i].tmp_tex;
-        if (tm)
-            MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, tm);
+    for (int s = 0; s < 2; s++) {   // WP-E3: both ping-pong buffers
+        struct osd_state *state = &fp->subs.states[s];
+        for (int i = 0; i < MP_ARRAY_SIZE(state->entries); i++) {
+            pl_tex tex = state->entries[i].tex;
+            if (tex)
+                MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, tex);
+            pl_tex bl = state->entries[i].blur_tex;
+            if (bl)
+                MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, bl);
+            pl_tex tm = state->entries[i].tmp_tex;
+            if (tm)
+                MP_TARRAY_APPEND(p, p->sub_scratch, p->num_sub_scratch, tm);
+            // Not pooled; destroy rather than leak with the frame.
+            pl_tex_destroy(gpu, &state->entries[i].inter_tex);
+            pl_tex_destroy(gpu, &state->entries[i].result_tex);
+        }
     }
     talloc_free(mpi);
 }
@@ -3106,6 +3326,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
         mpi->priv = fp;
         fp->vo = vo;
+        fp->subs.good = -1;   // WP-E3: no complete overlay build yet
 
         pl_queue_push(p->queue, &(struct pl_source_frame) {
             .pts = mpi->pts,
@@ -3331,12 +3552,35 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // WP-A3: slow-frame timing. Only sample the clock when the MSGL_V slowframe
     // line can fire; otherwise this is just the (already-present) stats events.
     bool want_slow = mp_msg_test(vo->log, MSGL_V);
+    // WP-E3 present guard: one deadline for ALL of this frame's overlay
+    // builds (the main osd-update below plus the blend-subs updates in the
+    // mix loop) so presentation never waits on the sub path longer than one
+    // frame's worth of time. Default (-1) = the frame's duration; when the
+    // frame carries none (redraws, stills) fall back to the cadence-inferred
+    // approx_duration (there is no container fps at the vo level), then to a
+    // ~24 fps budget.
+    p->guard_fired = false;
+    int64_t gdl = 0;
+    int gms = p->next_opts->sub_present_guard_ms;
+    if (gms > 0) {
+        gdl = gms * INT64_C(1000000);
+    } else if (gms < 0) {
+        if (frame->duration > 0) {
+            gdl = (int64_t) frame->duration;
+        } else if (frame->approx_duration > 0) {
+            gdl = (int64_t) frame->approx_duration;
+        } else {
+            gdl = INT64_C(42000000);
+        }
+    }
+    p->guard_deadline_ns = gdl;
+    p->guard_t0 = gdl ? mp_time_ns() : 0;
     int64_t osd_t0 = want_slow ? mp_time_ns() : 0;
     stats_time_start(p->stats, "osd-update");
     update_overlays(vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
-                    PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
-                    frame->current ? frame->current->params.stereo3d : 0);
+                    PL_OVERLAY_COORDS_DST_FRAME, &p->osd_guard, &target, frame->current,
+                    frame->current ? frame->current->params.stereo3d : 0, true);
     stats_time_end(p->stats, "osd-update");
     // Snapshot the phase timers now, before the blend-subs update_overlays loop
     // below can overwrite them (they live in priv, reset per update_overlays call).
@@ -3414,11 +3658,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                     enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
                         ? PL_OVERLAY_COORDS_SRC_CROP : PL_OVERLAY_COORDS_DST_CROP;
                     stats_time_start(p->stats, "osd-blend-update");
-                    update_overlays(vo, res, OSD_DRAW_SUB_ONLY,
-                                    rel, &fp->subs, image, mpi,
-                                    mpi->params.stereo3d);
+                    bool done = update_overlays(vo, res, OSD_DRAW_SUB_ONLY,
+                                                rel, &fp->subs, image, mpi,
+                                                mpi->params.stereo3d, true);
                     stats_time_end(p->stats, "osd-blend-update");
-                    fp->osd_sync = p->osd_sync;
+                    // WP-E3: a bailed build presented this frame's previous
+                    // complete overlays; leave osd_sync behind so the next
+                    // frame rebuilds normally.
+                    if (done)
+                        fp->osd_sync = p->osd_sync;
                 }
             } else {
                 // Disable overlays when blend_subs is disabled
@@ -3470,6 +3718,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "gcache-evict-n",            p->cnt_gcache_evict_n,      &p->stat_gcache_evict_n);
     emit_counter(vo, "gcache-overcommit",         p->cnt_gcache_overcommit,   &p->stat_gcache_overcommit);
     emit_counter(vo, "shader-warmups",            p->cnt_shader_warmups,      &p->stat_shader_warmups);
+    // WP-E3: guard engagements, once per frame no matter how many overlay
+    // sets bailed (ra-stale counts dec_sub-level staleness separately; the
+    // two layers are independent and never double-count).
+    if (p->guard_fired)
+        p->cnt_stale_present++;
+    emit_counter(vo, "stale-present",             p->cnt_stale_present,       &p->stat_stale_present);
     if (want_slow) {
         int64_t gpu_ns = 0;
         for (int i = 0; i < p->perf_fresh.count; i++)
@@ -3571,6 +3825,9 @@ static void resize(struct vo *vo)
     p->osd_res = osd;
     p->src = src;
     p->dst = dst;
+    // WP-E3: geometry changed; a pre-resize overlay snapshot must not be
+    // presented (the res equality check in the bail path is the backstop).
+    p->osd_guard.good = -1;
 }
 
 static int reconfig(struct vo *vo, struct mp_image_params *params)
@@ -3579,6 +3836,9 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     if (!p->ra_ctx->fns->reconfig(p->ra_ctx))
         return -1;
 
+    // WP-E3: new video params; never serve an overlay snapshot across a
+    // reconfigure (resize() below only invalidates when geometry changed).
+    p->osd_guard.good = -1;
     resize(vo);
     mp_mutex_lock(&vo->params_mutex);
     vo->target_params = NULL;
@@ -3780,6 +4040,11 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         osd_flags |= OSD_DRAW_SUB_ONLY;
 
     struct frame_priv *fp = mpi->priv;
+    // WP-E3: screenshots are not presentation -- always build fully (no
+    // deadline) and never commit (present=false below), so a screenshot at
+    // foreign geometry can't pollute the presentation snapshot.
+    p->guard_deadline_ns = 0;
+    p->guard_t0 = 0;
     if (opts->blend_subs) {
         float w = pl_rect_w(opts->blend_subs == BLEND_SUBS_VIDEO ? image.crop : target.crop);
         float h = pl_rect_h(opts->blend_subs == BLEND_SUBS_VIDEO ? image.crop : target.crop);
@@ -3798,12 +4063,12 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
             ? PL_OVERLAY_COORDS_SRC_CROP : PL_OVERLAY_COORDS_DST_CROP;
         update_overlays(vo, res, osd_flags,
                         rel, &fp->subs, &image, mpi,
-                        mpi->params.stereo3d);
+                        mpi->params.stereo3d, false);
     } else {
         // Disable overlays when blend_subs is disabled
         update_overlays(vo, osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
-                        &p->osd_state, &target, mpi,
-                        mpi->params.stereo3d);
+                        &p->osd_guard, &target, mpi,
+                        mpi->params.stereo3d, false);
         image.num_overlays = 0;
     }
 
@@ -3938,6 +4203,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_RESET:
         // Defer until the first new frame (unique ID) actually arrives
         p->want_reset = true;
+        // WP-E3: VOCTRL_RESET is the canonical playback-discontinuity signal
+        // to a VO -- vo.c delivers it on the VO thread on every seek/playback
+        // restart, before the first post-seek draw_frame. Invalidating here
+        // guarantees a guard fire on the first post-seek frame can never
+        // present a pre-seek overlay snapshot (the pts window in the bail
+        // path is only a backstop behind this). The blend-subs snapshots
+        // (frame_priv) need no invalidation: they die with their frames when
+        // the queue is reset, and each is only ever served for its own frame.
+        p->osd_guard.good = -1;
         return VO_TRUE;
 
     case VOCTRL_PERFORMANCE_DATA: {
@@ -4191,12 +4465,15 @@ static void uninit(struct vo *vo)
         pl_gpu_finish(p->gpu);
 
     pl_queue_destroy(&p->queue); // destroy this first
-    for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++) {
-        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
-        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].blur_tex);
-        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tmp_tex);
-        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].inter_tex);
-        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].result_tex);
+    for (int s = 0; s < 2; s++) {   // WP-E3: both ping-pong buffers
+        struct osd_state *state = &p->osd_guard.states[s];
+        for (int i = 0; i < MP_ARRAY_SIZE(state->entries); i++) {
+            pl_tex_destroy(p->gpu, &state->entries[i].tex);
+            pl_tex_destroy(p->gpu, &state->entries[i].blur_tex);
+            pl_tex_destroy(p->gpu, &state->entries[i].tmp_tex);
+            pl_tex_destroy(p->gpu, &state->entries[i].inter_tex);
+            pl_tex_destroy(p->gpu, &state->entries[i].result_tex);
+        }
     }
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
@@ -4278,6 +4555,8 @@ static int preinit(struct vo *vo)
     p->stat_raster_dispatches = p->stat_raster_tiles = -1;
     p->stat_gcache_epoch_advance = p->stat_gcache_evict_n = p->stat_gcache_overcommit = -1;
     p->stat_shader_warmups = -1;
+    p->stat_stale_present = -1;
+    p->osd_guard.good = -1;   // WP-E3: no complete overlay build yet
 
     struct gl_video_opts *gl_opts = p->opts_cache->opts;
     struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
