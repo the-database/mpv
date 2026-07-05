@@ -2774,6 +2774,38 @@ Subtitles
 
     Default: 0 (no override).
 
+``--sub-present-guard-ms=<-1|0|milliseconds>``
+    Safety mechanism (``--vo=gpu-next``): a hard wall-clock deadline for the
+    per-frame subtitle/OSD overlay build (fetch, upload, GPU compose/raster
+    recording) on the display thread. If the build exceeds the deadline, it is
+    abandoned at the next safe checkpoint and the frame is presented with the
+    *previous* frame's completed subtitle overlays instead — subtitles are at
+    most one frame stale, and presentation never waits on the subtitle path.
+    The next frame then rebuilds normally (a build following an engagement
+    always runs to completion, so subtitles can never freeze). The stale state
+    is never used across a seek, a subtitle track change, a resize or a
+    reconfiguration; if it would be, the frame shows no subtitles instead.
+
+    -1 selects the frame's own duration as the deadline (the default); 0
+    disables the guard; a positive value is a fixed deadline in milliseconds.
+
+    This is last-resort insurance against unforeseeable stalls (driver
+    hiccups, pathological frames). All known stall classes are eliminated
+    structurally, so the guard is expected to *never* engage in normal
+    playback — acceptance configurations assert 0 engagements. Engagements
+    are counted as ``stale-present`` in ``--dump-stats``.
+
+    Default: -1 (auto).
+
+``--sub-debug-stall-ms=<0-10000>``
+    Debug/development only. Sleeps this many milliseconds inside the overlay
+    build section of every presented frame (after the first
+    ``--sub-present-guard-ms`` checkpoint), simulating a pathological stall so
+    the presentation guard can be exercised deterministically in tests. Not
+    for normal use.
+
+    Default: 0 (no injected stall).
+
 ``--sub-ass-styles=<filename>``
     Load all SSA/ASS styles found in the specified file and use them for
     rendering text subtitles. The syntax of the file is exactly like the ``[V4
