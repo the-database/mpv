@@ -1,0 +1,17 @@
+{
+  "media": "av://lavfi:color=c=0x606060:s=1280x720:d=120:r=24",
+  "pts": [3, 9, 15],
+  "pairs": [
+    {"tag": "reg_raster_dialogue",   "sub": "samples/dialogue.ass",      "config_a": "", "config_b": "--sub-gpu-raster=yes"},
+    {"tag": "reg_raster_clip_rect",  "sub": "samples/clip_rect.ass",     "config_a": "", "config_b": "--sub-gpu-raster=yes"},
+    {"tag": "reg_raster_clip_vect",  "sub": "samples/clip_vect.ass",     "config_a": "", "config_b": "--sub-gpu-raster=yes"},
+    {"tag": "reg_raster_iclip",      "sub": "samples/iclip.ass",         "config_a": "", "config_b": "--sub-gpu-raster=yes"},
+    {"tag": "reg_raster_kf",         "sub": "samples/kf.ass",            "config_a": "", "config_b": "--sub-gpu-raster=yes"},
+    {"tag": "reg_raster_shadow",     "sub": "samples/shadow_layers.ass", "config_a": "", "config_b": "--sub-gpu-raster=yes"},
+    {"tag": "reg_raster_rotate",     "sub": "samples/rotate.ass",        "config_a": "", "config_b": "--sub-gpu-raster=yes"},
+    {"tag": "reg_raster_be",         "sub": "samples/be.ass",            "config_a": "", "config_b": "--sub-gpu-raster=yes"},
+    {"tag": "reg_composite_dialogue","sub": "samples/dialogue.ass",      "config_a": "", "config_b": "--sub-gpu-composite=yes"},
+    {"tag": "reg_composite_shadow",  "sub": "samples/shadow_layers.ass", "config_a": "", "config_b": "--sub-gpu-composite=yes"},
+    {"tag": "reg_composite_cliprect","sub": "samples/clip_rect.ass",     "config_a": "", "config_b": "--sub-gpu-composite=yes"}
+  ]
+}
