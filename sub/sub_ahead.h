@@ -25,9 +25,9 @@ struct mp_image_params;
 struct sub_ahead;
 
 // Create the worker. Takes ownership of worker_sd (an sd_ass sd built with a
-// capped thread count). depth = lookahead frames (>0); the miss-wait is read
-// from worker_sd->opts. Returns NULL on failure (caller must still free
-// worker_sd in that case).
+// capped thread count). depth = lookahead frames (>0); the bank cap and the
+// miss-wait are read from worker_sd->opts. Returns NULL on failure (caller
+// must still free worker_sd in that case).
 struct sub_ahead *sub_ahead_create(struct dec_sub *sub, struct sd *worker_sd,
                                    int depth, int order);
 

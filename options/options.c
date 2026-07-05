@@ -362,6 +362,8 @@ const struct m_sub_options mp_subtitle_sub_opts = {
             .flags = UPDATE_SUB_HARD},
         {"sub-render-ahead-miss-wait", OPT_DOUBLE(sub_render_ahead_miss_wait),
             M_RANGE(-1, 1000), .flags = UPDATE_SUB_HARD},
+        {"sub-render-ahead-max-frames", OPT_INT(sub_render_ahead_max_frames),
+            M_RANGE(0, 960), .flags = UPDATE_SUB_HARD},
         {"sub-gpu-blur", OPT_BOOL(sub_gpu_blur), .flags = UPDATE_SUB_HARD},
         {"sub-gpu-composite", OPT_BOOL(sub_gpu_composite), .flags = UPDATE_SUB_HARD},
         {"sub-gpu-raster", OPT_BOOL(sub_gpu_raster), .flags = UPDATE_SUB_HARD},
@@ -389,6 +391,7 @@ const struct m_sub_options mp_subtitle_sub_opts = {
         .sub_render_ahead_threads = 2, // worker libass threads (capped, leaves
                                        // cores for the VO + video filters)
         .sub_render_ahead_miss_wait = -1, // auto: one frame interval; 0 = off
+        .sub_render_ahead_max_frames = 0, // bank cap; 0 = auto (4x depth)
     },
     .change_flags = UPDATE_OSD,
 };

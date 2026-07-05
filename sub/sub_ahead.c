@@ -47,6 +47,14 @@
  *    (starting AT the target, i=0) before the VO's first post-seek fetch.
  *    ra-prewarm counts renders done in this mode.
  *
+ * 6. Adaptive banking: the worker tracks an EMA of its per-frame render cost.
+ *    When the depth window is full and the EMA shows headroom (cheap renders,
+ *    e.g. the libass front-end-only cost in --sub-gpu-raster mode), it keeps
+ *    rendering past `depth` up to --sub-render-ahead-max-frames, banking slack
+ *    for dense passages. Pre-warm always preempts banking: after a flush the
+ *    target selection starts over at the (new) base pts, and a stale in-flight
+ *    bank render is discarded by the gen check.
+ *
  * Locking: `lock` protects the ring, the cursor/geometry, the gen, the timing
  * snapshot, the packet queue, and the pending video-params. It is never held
  * across a render. The decode path only ever takes `lock` briefly to enqueue a
@@ -76,6 +84,10 @@
 #include "sub_ahead.h"
 #include "video/mp_image.h"
 
+// Bank only while a render costs less than this fraction of a frame interval
+// (i.e. the worker has real headroom and banking cannot starve keeping up).
+#define BANK_HEADROOM 0.5
+
 // Never stale-serve content older than this (seconds). Bounds how long an
 // outdated subtitle can stay on screen when the worker is badly behind.
 #define STALE_MAX_AGE 2.0
@@ -102,6 +114,7 @@ struct sub_ahead {
     bool terminate;
 
     int depth;                   // lookahead frames (the guaranteed window)
+    int max_frames;              // bank cap (>= depth); ring is sized for it
     double miss_wait_ms;         // <0 = auto (one frame interval), 0 = off
     int64_t debug_slow_ns;       // MPV_SUB_AHEAD_SLOW_MS: debug worker slowdown
     double video_fps;
@@ -141,6 +154,9 @@ struct sub_ahead {
     uint64_t last_served_content;
     bool have_last_served;
 
+    // worker render-cost EMA (seconds per frame), for the banking gate.
+    double render_ema;
+
     int inline_active;           // VO is inline-rendering; worker must not race it
 
     // Render-ahead health counters. Cheap integer increments, all touched under
@@ -150,11 +166,13 @@ struct sub_ahead {
     // miss). wait = fetches rescued by the bounded wait (subset of
     // served/empty). prewarm = worker renders in pre-warm mode. inline =
     // inline renders on the VO thread with the worker active (0 in normal
-    // operation; see sub_ahead_note_inline). Surfaced as MP_STATS ra-* value
-    // lines + a periodic MSGL_V [render-ahead] line (prefix kept
-    // parse_stats.py-compatible).
+    // operation; see sub_ahead_note_inline). bank = current banked count
+    // (gauge, emitted on change). Surfaced as MP_STATS ra-* value lines + a
+    // periodic MSGL_V [render-ahead] line (prefix kept parse_stats.py-
+    // compatible).
     long dbg_served, dbg_empty, dbg_miss;
     long dbg_stale, dbg_wait, dbg_prewarm, dbg_inline;
+    int dbg_bank_last;
 };
 
 static double ahead_pts_to_subtitle(struct sub_ahead *a, double pts)
@@ -274,6 +292,26 @@ static void ahead_store(struct sub_ahead *a, double V, struct mp_osd_res dim,
     };
 }
 
+// Emit the ra-bank gauge (number of rendered frames beyond the guaranteed
+// depth window) when it changed. Called under lock.
+static void ahead_emit_bank(struct sub_ahead *a)
+{
+    double base = a->vo_pts != MP_NOPTS_VALUE ? a->vo_pts : a->hint_pts;
+    int count = 0;
+    if (base != MP_NOPTS_VALUE) {
+        double horizon = base + (a->depth + 0.5) * ahead_interval(a);
+        for (int n = 0; n < a->ring_len; n++) {
+            struct sub_ahead_entry *e = &a->ring[n];
+            if (e->valid && e->gen == a->gen && e->video_pts > horizon)
+                count++;
+        }
+    }
+    if (count != a->dbg_bank_last) {
+        a->dbg_bank_last = count;
+        MP_STATS(a, "value %d ra-bank", count);
+    }
+}
+
 static void ahead_verbose_line(struct sub_ahead *a)
 {
     // Prefix (served= empty= miss=) is parsed by TOOLS/subtest/parse_stats.py;
@@ -365,6 +403,22 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
                 break;
             }
         }
+        // Adaptive banking: the depth window is full and renders are cheap
+        // (EMA well under a frame interval; true in --sub-gpu-raster mode
+        // where the worker only pays the libass front-end) -> keep going up
+        // to the bank cap. Never while pre-warming: the guaranteed window
+        // around a fresh seek target always comes first.
+        if (target == MP_NOPTS_VALUE && !prewarm && a->max_frames > depth &&
+            a->render_ema > 0 && a->render_ema < interval * BANK_HEADROOM)
+        {
+            for (int i = depth + 1; i <= a->max_frames; i++) {
+                double V = base + i * interval;
+                if (ahead_find(a, V, dim, format) < 0) {
+                    target = V;
+                    break;
+                }
+            }
+        }
         if (target == MP_NOPTS_VALUE) {
             // Window full; wait for the VO to advance (or a flush).
             mp_cond_wait(&a->wakeup, &a->lock);
@@ -377,14 +431,18 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         // Render on the worker's own sd -- no decoder lock involved. draw_flags=0
         // (no OSD_DRAW_SUB_ONLY) so --sub-render-res-limit applies to the worker's
         // renders exactly as it does on the inline VO path.
+        int64_t t0 = mp_time_ns();
         struct sub_bitmaps *bmp =
             a->worker_sd->driver->get_bitmaps(a->worker_sd, dim, format, sub_pts, 0);
         if (a->debug_slow_ns)     // debug: artificially slow worker (see create)
             mp_sleep_ns(a->debug_slow_ns);
+        double render_time = (mp_time_ns() - t0) / 1e9;
         uint64_t content_id = bmp ? bmp->change_id : 0;
         pin_outline_blobs(bmp);   // ring entries outlive the packer's blobs
 
         mp_mutex_lock(&a->lock);
+        a->render_ema = a->render_ema <= 0
+            ? render_time : 0.8 * a->render_ema + 0.2 * render_time;
         // A packet that arrived mid-render may add events at/before this pts:
         // discard, the entry is still missing and re-renders next iteration
         // (after the queue drain decodes the packet).
@@ -397,6 +455,7 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
                 a->dbg_prewarm++;
                 MP_STATS(a, "value %ld ra-prewarm", a->dbg_prewarm);
             }
+            ahead_emit_bank(a);
             mp_cond_broadcast(&a->ring_added);  // release a fetch waiting out a miss
         } else {
             talloc_free(bmp);    // stale (flush/resize/late packet during render)
@@ -418,6 +477,10 @@ struct sub_ahead *sub_ahead_create(struct dec_sub *sub, struct sd *worker_sd,
     a->log = worker_sd->log;
     a->worker_sd = worker_sd;
     a->depth = depth;
+    // Bank cap: 0 = auto (4x depth). The ring is sized for the cap (+2 slack
+    // so a couple of just-passed frames survive as the stale-serve source).
+    int max_frames = opts->sub_render_ahead_max_frames;
+    a->max_frames = max_frames > 0 ? MPMAX(max_frames, depth) : depth * 4;
     a->miss_wait_ms = opts->sub_render_ahead_miss_wait;
     a->vo_pts = MP_NOPTS_VALUE;
     a->hint_pts = MP_NOPTS_VALUE;
@@ -426,7 +489,7 @@ struct sub_ahead *sub_ahead_create(struct dec_sub *sub, struct sd *worker_sd,
     a->sub_speed = 1.0;
     a->play_dir = 1;
     a->video_fps = 0;
-    a->ring_len = depth + 2;
+    a->ring_len = a->max_frames + 2;
     a->ring = talloc_zero_array(a, struct sub_ahead_entry, a->ring_len);
 
     // Debug knob (used by the stale-serve tests): sleep this many ms after
@@ -697,6 +760,7 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
             res->change_id = 0;
         }
     }
+    ahead_emit_bank(a);
     mp_mutex_unlock(&a->lock);
     mp_cond_signal(&a->wakeup);  // nudge the worker to refill ahead of us
     return res;

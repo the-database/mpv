@@ -2695,6 +2695,16 @@ Subtitles
     ``MPV_SUB_AHEAD_SLOW_MS`` (debug only) delays every worker render by the
     given number of milliseconds to simulate a worker that cannot keep up.
 
+``--sub-render-ahead-max-frames=<0-960>``
+    Upper bound for opportunistic render-ahead "banking". When the worker has
+    filled its guaranteed window (``--sub-render-ahead-frames``) and its
+    measured per-frame render cost leaves headroom, it keeps rendering ahead
+    up to this many frames, banking slack during easy passages for dense
+    ones. Banking never delays re-filling the guaranteed window (e.g. after
+    a seek). 0 means 4x ``--sub-render-ahead-frames``.
+
+    Default: 0.
+
 ``--sub-gpu-blur=<yes|no>``
     Apply the gaussian blur of ASS/SSA subtitles (``\blur``, and the blur from
     a soft shadow) on the GPU instead of on the CPU. libass emits the unblurred
