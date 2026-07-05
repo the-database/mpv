@@ -138,6 +138,7 @@ struct mp_subtitle_opts {
     int sub_ass_render_threads;
     int sub_render_ahead_frames;
     int sub_render_ahead_threads;
+    double sub_render_ahead_miss_wait;
     bool sub_gpu_blur;
     bool sub_gpu_composite;
     bool sub_gpu_raster;
