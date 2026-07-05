@@ -1881,17 +1881,38 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         }
     }
 
-    // Emit the overlay preserving libass's z-order: regions in emission order
-    // (regs[] is ordered by each run's first appearance in item->parts, which is
-    // libass's back-to-front image-list order -- so an event's drop-shadow run
-    // (RUN_FLAG_SHADOW, emitted before its text) and any background/mask run
-    // stay behind later events), and within a region border (under) then fill
-    // (over). A global border-then-fill pass across all runs mislayered
-    // overlapping signs: a later run's fill (a sign's mask) was painted over an
-    // earlier run's text.
+    // Emit the overlay in libass's EXACT z-order: the ASS_Image list order,
+    // which item->parts preserves. Within one event libass emits every run's
+    // border image before any run's fill image (and shadow/background runs
+    // before those); across events the list is back-to-front. Region-major
+    // emission (border then fill per region) broke that for multi-run events
+    // whose runs overlap -- adjacent \bord3 karaoke syllables, overlapping
+    // 3D-tilted glyph runs -- a later run's border was painted OVER an
+    // earlier run's fill, where libass paints all borders first. And a global
+    // border-then-fill pass across all runs mislayered overlapping signs from
+    // different events. Ordering each region-layer by its FIRST part index
+    // reproduces the image-list order exactly, covering both cases.
     entry->num_run_parts = 0;
+    struct gc_emit { int key, reg, layer; };   // layer: 0 border, 1 fill
+    struct gc_emit *ems = talloc_array(tmp, struct gc_emit, 2 * (size_t) nregs);
+    int nems = 0;
     for (int i = 0; i < nregs; i++) {
-        struct gc_region *r = &regs[i];
+        if (regs[i].nbord)
+            ems[nems++] = (struct gc_emit){ regs[i].bord[0], i, 0 };
+        if (regs[i].nfill)
+            ems[nems++] = (struct gc_emit){ regs[i].fill[0], i, 1 };
+    }
+    // insertion sort by key (part indices are distinct; nems is small)
+    for (int i = 1; i < nems; i++) {
+        struct gc_emit e = ems[i];
+        int j = i;
+        for (; j > 0 && ems[j - 1].key > e.key; j--)
+            ems[j] = ems[j - 1];
+        ems[j] = e;
+    }
+    for (int ei = 0; ei < nems; ei++) {
+        struct gc_region *r = &regs[ems[ei].reg];
+        int layer = ems[ei].layer;
         bool is_shadow = r->run_flags & RUN_FLAG_SHADOW;
         int dx0 = r->x0 - r->margin, dy0 = r->y0 - r->margin;
         int dx1 = r->x1 + r->margin, dy1 = r->y1 + r->margin;
@@ -1919,39 +1940,37 @@ static void compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             int cx1 = MPMIN(dx1, r->rcx1), cy1 = MPMIN(dy1, r->rcy1);
             if (cx0 < cx1 && cy0 < cy1) { vr[0][0]=cx0; vr[0][1]=cy0; vr[0][2]=cx1; vr[0][3]=cy1; nvr=1; }
         }
-        for (int layer = 0; layer < 2; layer++) {  // 0 = border (under), 1 = fill (over)
-            int ax, ay; uint32_t c;
-            if (layer == 0) { if (!r->nbord) continue; ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
-            else            { if (!r->nfill) continue; ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
-            for (int v = 0; v < nvr; v++) {
-                int cx0 = vr[v][0], cy0 = vr[v][1], cx1 = vr[v][2], cy1 = vr[v][3];
-                // \kf karaoke: split the fill at wipe_x into sung (fill_color,
-                // left) and unsung (fill_color2, right). Else one segment.
-                int sx0[2] = { cx0, 0 }, sx1[2] = { cx1, 0 };
-                uint32_t sc[2] = { c, 0 }; int nseg = 1;
-                if (is_outline && layer == 1 && !is_shadow &&
-                    (r->run_flags & RUN_FLAG_KF_WIPE)) {
-                    int w = MPMAX(cx0, MPMIN(cx1, r->wipe_x));
-                    sx0[0] = cx0; sx1[0] = w;   sc[0] = r->fill_color;
-                    sx0[1] = w;   sx1[1] = cx1; sc[1] = r->fill_color2;
-                    nseg = 2;
-                }
-                for (int s = 0; s < nseg; s++) {
-                    if (sx0[s] >= sx1[s]) continue;
-                    uint32_t sg = sc[s];
-                    // result_tex is composited in capped space; upscale the
-                    // region back to display coords (gs == 1 when uncapped ->
-                    // identity). dst is a float rect, so libplacebo
-                    // bilinear-upscales the sample.
-                    struct pl_overlay_part part = {
-                        .src = { ax + (sx0[s] - dx0), ay + (cy0 - dy0),
-                                 ax + (sx1[s] - dx0), ay + (cy1 - dy0) },
-                        .dst = { sx0[s] / gs, cy0 / gs, sx1[s] / gs, cy1 / gs },
-                        .color = { (sg >> 24) / 255.0f, ((sg >> 16) & 0xFF) / 255.0f,
-                                   ((sg >> 8) & 0xFF) / 255.0f, (255 - (sg & 0xFF)) / 255.0f },
-                    };
-                    MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
-                }
+        int ax, ay; uint32_t c;
+        if (layer == 0) { ax = r->bord_ax; ay = r->bord_ay; c = r->bord_color; }
+        else            { ax = r->fill_ax; ay = r->fill_ay; c = r->fill_color; }
+        for (int v = 0; v < nvr; v++) {
+            int cx0 = vr[v][0], cy0 = vr[v][1], cx1 = vr[v][2], cy1 = vr[v][3];
+            // \kf karaoke: split the fill at wipe_x into sung (fill_color,
+            // left) and unsung (fill_color2, right). Else one segment.
+            int sx0[2] = { cx0, 0 }, sx1[2] = { cx1, 0 };
+            uint32_t sc[2] = { c, 0 }; int nseg = 1;
+            if (is_outline && layer == 1 && !is_shadow &&
+                (r->run_flags & RUN_FLAG_KF_WIPE)) {
+                int w = MPMAX(cx0, MPMIN(cx1, r->wipe_x));
+                sx0[0] = cx0; sx1[0] = w;   sc[0] = r->fill_color;
+                sx0[1] = w;   sx1[1] = cx1; sc[1] = r->fill_color2;
+                nseg = 2;
+            }
+            for (int s = 0; s < nseg; s++) {
+                if (sx0[s] >= sx1[s]) continue;
+                uint32_t sg = sc[s];
+                // result_tex is composited in capped space; upscale the
+                // region back to display coords (gs == 1 when uncapped ->
+                // identity). dst is a float rect, so libplacebo
+                // bilinear-upscales the sample.
+                struct pl_overlay_part part = {
+                    .src = { ax + (sx0[s] - dx0), ay + (cy0 - dy0),
+                             ax + (sx1[s] - dx0), ay + (cy1 - dy0) },
+                    .dst = { sx0[s] / gs, cy0 / gs, sx1[s] / gs, cy1 / gs },
+                    .color = { (sg >> 24) / 255.0f, ((sg >> 16) & 0xFF) / 255.0f,
+                               ((sg >> 8) & 0xFF) / 255.0f, (255 - (sg & 0xFF)) / 255.0f },
+                };
+                MP_TARRAY_APPEND(p, entry->run_parts, entry->num_run_parts, part);
             }
         }
     }
