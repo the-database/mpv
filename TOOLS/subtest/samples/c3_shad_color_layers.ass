@@ -1,0 +1,18 @@
+[Script Info]
+Title: c3 shad4 colored shadow + explicit layered z-order
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,DejaVu Sans,48,&H00FFFFFF,&H000000FF,&H00202020,&H00000000,0,0,0,0,100,100,0,0,1,2,1,5,40,40,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 3,0:00:00.00,0:00:22.00,Default,,0,0,0,,{\an5\pos(600,340)\fs64\shad4\4c&HFF0000&\1c&H00FF00&\bord2}TOP EVENT LAYER 3
+Dialogue: 1,0:00:00.00,0:00:22.00,Default,,0,0,0,,{\an5\pos(640,360)\fs64\shad4\4c&HFF0000&\1c&HFFFFFF&\bord2}EVENT LAYER 1
+Dialogue: 2,0:00:00.00,0:00:22.00,Default,,0,0,0,,{\an5\pos(680,380)\fs64\shad4\4c&HFF0000&\1c&H00FFFF&\bord2}EVENT LAYER 2
