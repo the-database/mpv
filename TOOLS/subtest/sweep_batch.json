@@ -1,0 +1,248 @@
+{
+ "media": "av://lavfi:color=c=0x606060:s=1280x720:d=120:r=24",
+ "pts": [
+  5
+ ],
+ "pairs": [
+  {
+   "tag": "s40_fill_0",
+   "sub": "samples/blur_sweep/s40_fill_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s40_bord2_0",
+   "sub": "samples/blur_sweep/s40_bord2_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s40_bord4_0",
+   "sub": "samples/blur_sweep/s40_bord4_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s40_bord2shad3_0",
+   "sub": "samples/blur_sweep/s40_bord2shad3_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s100_fill_0",
+   "sub": "samples/blur_sweep/s100_fill_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s100_fill_1",
+   "sub": "samples/blur_sweep/s100_fill_1.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s100_bord2_0",
+   "sub": "samples/blur_sweep/s100_bord2_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s100_bord2_1",
+   "sub": "samples/blur_sweep/s100_bord2_1.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s100_bord4_0",
+   "sub": "samples/blur_sweep/s100_bord4_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s100_bord4_1",
+   "sub": "samples/blur_sweep/s100_bord4_1.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s100_bord2shad3_0",
+   "sub": "samples/blur_sweep/s100_bord2shad3_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s100_bord2shad3_1",
+   "sub": "samples/blur_sweep/s100_bord2shad3_1.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_fill_0",
+   "sub": "samples/blur_sweep/s300_fill_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_fill_1",
+   "sub": "samples/blur_sweep/s300_fill_1.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_fill_2",
+   "sub": "samples/blur_sweep/s300_fill_2.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_fill_3",
+   "sub": "samples/blur_sweep/s300_fill_3.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_fill_4",
+   "sub": "samples/blur_sweep/s300_fill_4.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_fill_5",
+   "sub": "samples/blur_sweep/s300_fill_5.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_fill_6",
+   "sub": "samples/blur_sweep/s300_fill_6.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2_0",
+   "sub": "samples/blur_sweep/s300_bord2_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2_1",
+   "sub": "samples/blur_sweep/s300_bord2_1.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2_2",
+   "sub": "samples/blur_sweep/s300_bord2_2.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2_3",
+   "sub": "samples/blur_sweep/s300_bord2_3.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2_4",
+   "sub": "samples/blur_sweep/s300_bord2_4.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2_5",
+   "sub": "samples/blur_sweep/s300_bord2_5.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2_6",
+   "sub": "samples/blur_sweep/s300_bord2_6.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord4_0",
+   "sub": "samples/blur_sweep/s300_bord4_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord4_1",
+   "sub": "samples/blur_sweep/s300_bord4_1.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord4_2",
+   "sub": "samples/blur_sweep/s300_bord4_2.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord4_3",
+   "sub": "samples/blur_sweep/s300_bord4_3.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord4_4",
+   "sub": "samples/blur_sweep/s300_bord4_4.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord4_5",
+   "sub": "samples/blur_sweep/s300_bord4_5.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord4_6",
+   "sub": "samples/blur_sweep/s300_bord4_6.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2shad3_0",
+   "sub": "samples/blur_sweep/s300_bord2shad3_0.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2shad3_1",
+   "sub": "samples/blur_sweep/s300_bord2shad3_1.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2shad3_2",
+   "sub": "samples/blur_sweep/s300_bord2shad3_2.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2shad3_3",
+   "sub": "samples/blur_sweep/s300_bord2shad3_3.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2shad3_4",
+   "sub": "samples/blur_sweep/s300_bord2shad3_4.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2shad3_5",
+   "sub": "samples/blur_sweep/s300_bord2shad3_5.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  },
+  {
+   "tag": "s300_bord2shad3_6",
+   "sub": "samples/blur_sweep/s300_bord2shad3_6.ass",
+   "config_a": "",
+   "config_b": "--sub-gpu-raster=yes"
+  }
+ ]
+}
