@@ -1345,6 +1345,26 @@ static void gc_warmup(struct priv *p)
         pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
             .rc = { .x1 = 1, .y1 = 1 }, .row_pitch = 1, .ptr = (void *) &px));
     }
+    // (e) legacy overlay texture pool: the packed-atlas path (fallback parts,
+    // image subs) allocates a per-entry texture on first use -- which lands at
+    // the first subtitle event, mid-playback, and counts as a VO-thread alloc.
+    // Pre-create floor-sized pool textures with the exact params the hot path
+    // uses, so its pl_tex_recreate no-ops on the popped texture.
+    if (r8) {
+        int fl = MPMIN(2048, gpu->limits.max_tex_2d_dim);
+        while (p->num_sub_tex < 2) {
+            pl_tex t = pl_tex_create(gpu, &(struct pl_tex_params) {
+                .format = r8,
+                .w = fl,
+                .h = fl,
+                .host_writable = true,
+                .sampleable = true,
+            });
+            if (!t)
+                break;
+            MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, t);
+        }
+    }
     // Force all compiles + uploads to finish now, before playback starts.
     pl_gpu_finish(gpu);
 }
