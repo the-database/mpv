@@ -492,6 +492,15 @@ features += {'ass-composite-deferred': cc.has_header_symbol('ass/ass.h', 'ass_se
 features += {'ass-outline-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_outline_deferred',
                                                            dependencies: libass)}
 
+# Fractional deferred-shadow offsets ride new ASS_Image FIELDS (shift_x64 /
+# shift_y64), not a new setter symbol, so this feature keys on the struct
+# member: a fork with the deferred APIs but predating the fields must still
+# build (the packer then leaves the shift at 0 = the old whole-pixel rounding).
+#   ass-shadow-shift -> HAVE_ASS_SHADOW_SHIFT (ASS_Image.shift_x64)
+features += {'ass-shadow-shift': cc.has_member('ASS_Image', 'shift_x64',
+                                               prefix: '#include <ass/ass.h>',
+                                               dependencies: libass)}
+
 optical_devices = {
     'windows': 'D:',
     'cygwin': 'D:',

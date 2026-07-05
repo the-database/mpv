@@ -312,6 +312,10 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->bitmap = img->bitmap;
             b->stride = img->stride;
             b->libass.color = img->color;
+            // Explicit zero (cached_parts entries are reused across packs):
+            // stays 0 when built against a libass without the fields, which
+            // degrades to the pre-shift whole-pixel behaviour downstream.
+            b->libass.shift_x64 = b->libass.shift_y64 = 0;
             // Fork-only ASS_Image fields (present only with the deferred APIs).
             // Guarded per-symbol so this compiles against stock libass; when a
             // group is absent the fields stay 0 and sd_ass never advertises the
@@ -336,6 +340,10 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->libass.color2 = img->color2;
             b->libass.wipe_x = img->wipe_x;
             b->libass.be = img->be;
+#if HAVE_ASS_SHADOW_SHIFT
+            b->libass.shift_x64 = img->shift_x64;
+            b->libass.shift_y64 = img->shift_y64;
+#endif
             if (format == SUBBITMAP_LIBASS_OUTLINES && img->n_outline > 0) {
                 // Own a copy: libass's tile-export blob is only valid for this
                 // frame. n_outline is the blob's int32 count ([n_tiles, n_segs,
