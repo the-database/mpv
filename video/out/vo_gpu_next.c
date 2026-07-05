@@ -1094,6 +1094,7 @@ struct gc_region {
     uint32_t fill_color2;        // \kf wipe: fill colour right of wipe_x
     int wipe_x;                  // \kf wipe boundary (render x); used iff KF_WIPE
     int be_f, be_b;              // \be [1,2,1]/4 box iterations per layer
+    int shift_x, shift_y;        // shadow-run sub-pixel offset, 1/64 px (0..63)
 };
 
 // Combine a region's glyph list (saturating add) into run_acc at run-local
@@ -1429,6 +1430,56 @@ static void gc_apply_clip(struct priv *p, pl_tex cov, int bw, int bh,
         }
     }
 }
+
+// Sub-pixel shadow shift: exact integer port of libass's ass_shift_bitmap
+// (ass_bitmap.c). The CPU smears the (already blurred) shadow coverage right/
+// down by fx/fy 64ths of a pixel with truncating fixed-point bilinear passes;
+// its in-place high-to-low loop resolves to the closed form
+//   t(x,y)   = C(x,y)   - (C(x,y)*fx   >> 6) + (C(x-1,y)*fx >> 6)
+//   out(x,y) = t(x,y)   - (t(x,y)*fy   >> 6) + (t(x,y-1)*fy >> 6)
+// with C() = 0 outside the slot. (The CPU skips the "- term" on the bitmap's
+// last column/row, but coverage never reaches it: the rasterization bbox
+// keeps >= 1px right/bottom slack, which blur expansion preserves -- see
+// ASS_Image.shift_x64.) All values stay in 0..255, no saturation needed.
+// Cost: 4 texel fetches/px + one copy-back pass, on shadow runs only.
+static const char *const osd_subshift_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x >= bw || g.y >= bh) return;\n"
+    "int c00 = int(texelFetch(src, g, 0).r * 255.0 + 0.5);\n"
+    "int c10 = g.x > 0 ? int(texelFetch(src, ivec2(g.x-1, g.y), 0).r * 255.0 + 0.5) : 0;\n"
+    "int c01 = g.y > 0 ? int(texelFetch(src, ivec2(g.x, g.y-1), 0).r * 255.0 + 0.5) : 0;\n"
+    "int c11 = (g.x > 0 && g.y > 0) ? int(texelFetch(src, ivec2(g.x-1, g.y-1), 0).r * 255.0 + 0.5) : 0;\n"
+    "int t0 = c00 - ((c00 * fx) >> 6) + ((c10 * fx) >> 6);\n"
+    "int t1 = c01 - ((c01 * fx) >> 6) + ((c11 * fx) >> 6);\n"
+    "int o  = t0 - ((t0 * fy) >> 6) + ((t1 * fy) >> 6);\n"
+    "imageStore(dst, g, vec4(float(o) / 255.0, 0.0, 0.0, 0.0));\n";
+
+static void gc_subshift(struct priv *p, pl_tex src, pl_tex dst,
+                        int bw, int bh, int fx, int fy)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name = "src", .type = PL_DESC_SAMPLED_TEX, .binding = 0 },
+          .binding = { .object = src } },
+        { .desc = { .name = "dst", .type = PL_DESC_STORAGE_IMG, .binding = 1,
+                    .access = PL_DESC_ACCESS_WRITEONLY },
+          .binding = { .object = dst } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("bw"), .data = &bw }, { .var = pl_var_int("bh"), .data = &bh },
+        { .var = pl_var_int("fx"), .data = &fx }, { .var = pl_var_int("fy"), .data = &fy },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = { 16, 16 },
+        .descriptors = descs, .num_descriptors = 2,
+        .variables = vars, .num_variables = 4, .body = osd_subshift_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (bw + 15) / 16, (bh + 15) / 16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
 #endif // HAVE_ASS_OUTLINE_DEFERRED
 
 // WP-E: create the persistent glyph atlas ONCE at its full (option) size and set
@@ -1552,6 +1603,8 @@ static void gc_warmup(struct priv *p)
         gc_be_pass3(p, p->run_cov_f, p->run_tmp, 0, 0, D, D);           (*n)++;
         gc_be_scale(p, p->run_cov_f, 0, 0, D, D, 0);                    (*n)++;
     }
+    if (have_r8 && p->run_cov_f && p->run_cov_b)
+        { gc_subshift(p, p->run_cov_f, p->run_cov_b, D, D, 0, 0);       (*n)++; }
     if (have_r8 && p->run_cov_f && p->glyph_atlas) {
         struct clipmask cm = { .w = D, .h = D };
         gc_clip_mult(p, p->run_cov_f, D, D, 0, 0, 0, 0, &cm);          (*n)++;
@@ -1871,7 +1924,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                 .run_flags = b->libass.run_flags, .single_layer = 0xff,
                 .clip_id = b->libass.clip_id,
                 .rcx0 = b->libass.clip_rx0, .rcy0 = b->libass.clip_ry0,
-                .rcx1 = b->libass.clip_rx1, .rcy1 = b->libass.clip_ry1 };
+                .rcx1 = b->libass.clip_rx1, .rcy1 = b->libass.clip_ry1,
+                .shift_x = b->libass.shift_x64, .shift_y = b->libass.shift_y64 };
         }
         r = &regs[ri];
         r->x0 = MPMIN(r->x0, (int) lrint(b->x * gs));
@@ -1953,6 +2007,18 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 #if HAVE_ASS_OUTLINE_DEFERRED
             if (is_outline && r->be_f > 0)
                 gc_be_blur(p, p->run_cov_f, p->run_tmp, 0, 0, bw, bh, r->be_f);
+            // Shadow runs: the whole-pixel part of libass's shadow offset is
+            // in the parts' positions; this sub-pixel remainder is applied to
+            // the final coverage AFTER the gaussian and \be, matching the CPU
+            // order (ass_composite_construct blurs bm_s's source first, then
+            // ass_shift_bitmap). run_cov_b is free scratch here: shadow runs
+            // are fill-only, and a bordered region rebuilds it just below.
+            if (is_outline && (r->run_flags & RUN_FLAG_SHADOW) &&
+                (r->shift_x || r->shift_y)) {
+                gc_subshift(p, p->run_cov_f, p->run_cov_b, bw, bh,
+                            r->shift_x, r->shift_y);
+                osd_copy(p, p->run_cov_b, p->run_cov_f, 0, 0, bw, bh);
+            }
 #endif
             if (r->nbord) {
                 gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos, gs);

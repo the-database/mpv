@@ -87,6 +87,12 @@ struct sub_bitmap {
             int32_t wipe_x;
             // Outline-mode \be: iterations of the [1,2,1]/4 box blur (0 = none).
             int32_t be;
+            // Outline-mode deferred shadow (run_flags bit 5): sub-pixel
+            // fraction of the shadow offset in 1/64 px (0..63 per axis; 0 =
+            // none). Applied to the run's final coverage AFTER blur and \be
+            // with ass_shift_bitmap's exact fixed-point bilinear smear (see
+            // ASS_Image.shift_x64/shift_y64).
+            int32_t shift_x64, shift_y64;
         } libass;
         struct {
             const struct sbr_output_image *image;
