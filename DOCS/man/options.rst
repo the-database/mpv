@@ -2658,6 +2658,53 @@ Subtitles
 
     Default: 0.
 
+``--sub-render-ahead-frames=<0-240>``
+    Render ASS/SSA subtitles for upcoming frames on a background worker thread
+    (this many frames of guaranteed lookahead), so the display thread serves a
+    pre-rendered frame instead of rendering inline. The worker owns a fully
+    independent libass instance and never blocks the subtitle decode path.
+    With the worker enabled the display thread never renders subtitles
+    inline: a frame the worker has not delivered yet is waited for briefly
+    (``--sub-render-ahead-miss-wait``) and then substituted with the most
+    recent earlier frame ("stale") or with no subtitles -- never with a
+    synchronous render. Seeks pre-warm the new position instead of collapsing
+    into inline renders. 0 disables the worker (subtitles render on the
+    display thread, the default).
+
+    Default: 0.
+
+``--sub-render-ahead-threads=<0-64>``
+    Number of libass render threads of the render-ahead worker's private
+    libass instance. Kept deliberately small so the worker does not starve
+    the VO thread and the video filters. 0 uses 1 thread.
+
+    Default: 2.
+
+``--sub-render-ahead-miss-wait=<-1|0|milliseconds>``
+    How long a display-thread subtitle fetch may wait for the render-ahead
+    worker to deliver a frame that is not pre-rendered yet (a "miss"), in
+    milliseconds. Past the deadline, the most recent earlier pre-rendered
+    frame is shown for that frame instead (or no subtitles, right after a
+    seek). -1 means one frame interval of the current video; 0 disables
+    waiting (immediately substitute). Only meaningful with
+    ``--sub-render-ahead-frames``.
+
+    Default: -1.
+
+    For testing the substitution behavior, the environment variable
+    ``MPV_SUB_AHEAD_SLOW_MS`` (debug only) delays every worker render by the
+    given number of milliseconds to simulate a worker that cannot keep up.
+
+``--sub-render-ahead-max-frames=<0-960>``
+    Upper bound for opportunistic render-ahead "banking". When the worker has
+    filled its guaranteed window (``--sub-render-ahead-frames``) and its
+    measured per-frame render cost leaves headroom, it keeps rendering ahead
+    up to this many frames, banking slack during easy passages for dense
+    ones. Banking never delays re-filling the guaranteed window (e.g. after
+    a seek). 0 means 4x ``--sub-render-ahead-frames``.
+
+    Default: 0.
+
 ``--sub-gpu-blur=<yes|no>``
     Apply the gaussian blur of ASS/SSA subtitles (``\blur``, and the blur from
     a soft shadow) on the GPU instead of on the CPU. libass emits the unblurred
@@ -2673,6 +2720,91 @@ Subtitles
     done on the CPU.
 
     Default: no.
+
+``--sub-gpu-raster=<yes|no>``
+    Experimental. Rasterize ASS/SSA subtitle glyphs on the GPU: libass emits
+    each glyph's transformed coverage outline (pre-split into tiles) instead of
+    a rasterized bitmap, and ``--vo=gpu-next`` rasterizes it into a persistent
+    GPU glyph cache with a compute pass — only on a cache miss, so glyphs that
+    merely move (motion-tracked typesetting) cost no CPU rasterization and no
+    upload at all. The GPU also performs the per-run combine, blur and
+    composite (this option implies the deferred composite, and with it the
+    deferred blur). Vector and rectangular ``\clip``/``\iclip``, ``\kf``
+    karaoke wipes, ``\be`` box blur and drop shadows are reproduced on the GPU.
+
+    Requires a libass build with deferred-outline support and ``--vo=gpu-next``
+    with compute shaders and a storable OSD texture format; otherwise it is
+    ignored (with a warning). Coverage matches the CPU rasterizer's analytic
+    anti-aliasing.
+
+    Default: no.
+
+``--sub-glyph-atlas-size=<1024-16384>``
+    Edge length, in pixels, of the square persistent GPU glyph atlas used by
+    ``--sub-gpu-raster`` / ``--sub-gpu-composite`` on ``--vo=gpu-next``. The atlas
+    is created **once** at this size when the video output is configured and is
+    never resized or rebuilt during playback, so no mid-playback atlas
+    reallocation can stall the display thread. Cache space is reclaimed instead by
+    epoch-segmented eviction: the atlas is divided into a fixed number of
+    horizontal segments, and when the packer runs out of room it advances to the
+    next segment (ring-style) and evicts only that segment's glyphs, which are
+    lazily re-rasterized on their next use. The value is clamped to the GPU's
+    maximum 2D texture size.
+
+    A larger atlas caches more glyphs at once (fewer evictions) at a memory cost
+    of ``N×N`` bytes (e.g. the default 8192 uses 64 MiB, 16384 uses 256 MiB).
+    There is normally no reason to change it; the default comfortably holds a
+    dense 8K sign frame's glyphs.
+
+    Default: 8192.
+
+``--sub-glyph-atlas-height=<0-16384>``
+    Debug/development only. Overrides ``--sub-glyph-atlas-size`` with a smaller
+    value at atlas creation. 0 (the default) means no override. A small value
+    (e.g. 256 or 512) shrinks the atlas (the cap is applied to both dimensions,
+    since row-major packing means a short-but-wide atlas would never advance the
+    packing cursor) so that the epoch-segmented eviction machinery is exercised
+    hard: the built-in performance counters (``gcache-epoch-advance``,
+    ``gcache-evict-n`` and, if the working set of a single frame exceeds the whole
+    atlas, ``gcache-overcommit``, all exposed via ``--dump-stats``) can be driven
+    in tests. The full-flush counters (``gcache-flush``, ``atlas-overflow``) stay
+    at 0 regardless — the atlas is never flushed or rebuilt. Not intended for
+    normal playback: a very low cap makes dense subtitle/sign frames flash as
+    glyphs are evicted and re-rasterized more often than they are drawn.
+
+    Default: 0 (no override).
+
+``--sub-present-guard-ms=<-1|0|milliseconds>``
+    Safety mechanism (``--vo=gpu-next``): a hard wall-clock deadline for the
+    per-frame subtitle/OSD overlay build (fetch, upload, GPU compose/raster
+    recording) on the display thread. If the build exceeds the deadline, it is
+    abandoned at the next safe checkpoint and the frame is presented with the
+    *previous* frame's completed subtitle overlays instead — subtitles are at
+    most one frame stale, and presentation never waits on the subtitle path.
+    The next frame then rebuilds normally (a build following an engagement
+    always runs to completion, so subtitles can never freeze). The stale state
+    is never used across a seek, a subtitle track change, a resize or a
+    reconfiguration; if it would be, the frame shows no subtitles instead.
+
+    -1 selects the frame's own duration as the deadline (the default); 0
+    disables the guard; a positive value is a fixed deadline in milliseconds.
+
+    This is last-resort insurance against unforeseeable stalls (driver
+    hiccups, pathological frames). All known stall classes are eliminated
+    structurally, so the guard is expected to *never* engage in normal
+    playback — acceptance configurations assert 0 engagements. Engagements
+    are counted as ``stale-present`` in ``--dump-stats``.
+
+    Default: -1 (auto).
+
+``--sub-debug-stall-ms=<0-10000>``
+    Debug/development only. Sleeps this many milliseconds inside the overlay
+    build section of every presented frame (after the first
+    ``--sub-present-guard-ms`` checkpoint), simulating a pathological stall so
+    the presentation guard can be exercised deterministically in tests. Not
+    for normal use.
+
+    Default: 0 (no injected stall).
 
 ``--sub-ass-styles=<filename>``
     Load all SSA/ASS styles found in the specified file and use them for
@@ -3729,6 +3861,20 @@ Window
     ``vdpau``, ``direct3d``), this can be slightly faster or slower,
     depending on GPU drivers and hardware. For other VOs, this just makes
     rendering slower.
+
+``--osd-render-res-cap=<0-4320>``
+    Experimental. Cap the height (in pixels) at which non-subtitle OSD
+    overlays (the OSD/OSC, the stats display, external overlays except
+    ``overlay-add``) are rendered. When the output is taller than the cap,
+    the OSD is rendered at the capped height (width scaled to keep the
+    aspect) and GPU-upscaled to the output size. A full-screen overlay such
+    as the stats display, re-rendered and re-uploaded on every redraw at
+    very high output resolutions (8K), can otherwise contend with heavy
+    subtitle frames. The OSD is text/UI, so the slight softening is usually
+    acceptable. Subtitles are never affected by this option (see
+    ``--sub-render-res-limit`` for those).
+
+    Default: 0 (no cap).
 
 ``--force-render``
     Forces mpv to always render frames regardless of the visibility of the
