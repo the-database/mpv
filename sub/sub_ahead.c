@@ -130,6 +130,27 @@ static void queue_flush(struct sub_ahead *a)
     a->num_queue = 0;
 }
 
+// In OUTLINES mode (--sub-gpu-raster) each part's coverage blob is owned by
+// the packer that produced it and becomes invalid on that packer's next pack
+// (sub_bitmaps_copy is deliberately shallow for OUTLINES). Anything that
+// outlives one worker render -- ring entries, and copies served to the VO,
+// which the worker may evict concurrently -- must own its blobs: reparent
+// copies onto the sub_bitmaps itself. No-op for all other formats (their
+// pixel data is a refcounted mp_image, which sub_bitmaps_copy already refs).
+static void pin_outline_blobs(struct sub_bitmaps *b)
+{
+    if (!b || b->format != SUBBITMAP_LIBASS_OUTLINES)
+        return;
+    for (int n = 0; n < b->num_parts; n++) {
+        struct sub_bitmap *p = &b->parts[n];
+        if (p->libass.outline && p->libass.n_outline > 0) {
+            p->libass.outline =
+                talloc_memdup(b, (void *)p->libass.outline,
+                              (size_t)p->libass.n_outline * sizeof(int32_t));
+        }
+    }
+}
+
 // Index of a current-gen entry for raw video pts V at the given geometry, or -1.
 // V is matched within half a frame interval.
 static int ahead_find(struct sub_ahead *a, double V, struct mp_osd_res dim,
@@ -258,6 +279,7 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         struct sub_bitmaps *bmp =
             a->worker_sd->driver->get_bitmaps(a->worker_sd, dim, format, sub_pts, 0);
         uint64_t content_id = bmp ? bmp->change_id : 0;
+        pin_outline_blobs(bmp);   // ring entries outlive the packer's blobs
 
         mp_mutex_lock(&a->lock);
         if (gen == a->gen && format == a->cur_format &&
@@ -441,6 +463,8 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
     struct sub_bitmaps *res = NULL;
     if (idx >= 0 && a->ring[idx].bmp) {
         res = sub_bitmaps_copy(NULL, a->ring[idx].bmp);
+        pin_outline_blobs(res);  // the worker may evict the entry while the VO
+                                 // still holds this copy
         // Unified monotonic change_id: report a fresh id only when the content
         // differs from what we last served, else 0 (osd.c treats 0 as "no
         // change, no re-upload").
