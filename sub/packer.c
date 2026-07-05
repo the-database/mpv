@@ -45,6 +45,7 @@ struct mp_sub_packer {
     bool cached_subs_valid;
     struct sub_bitmap rgba_imgs[MP_SUB_BB_LIST_MAX];
     struct bitmap_packer *packer;
+    void *seg_ctx;  // owns copied outline blobs for SUBBITMAP_LIBASS_OUTLINES
 };
 
 // Free with talloc_free().
@@ -274,6 +275,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
 {
     int format = preferred_osd_format == SUBBITMAP_BGRA ? SUBBITMAP_BGRA
                : preferred_osd_format == SUBBITMAP_LIBASS_GLYPHS ? SUBBITMAP_LIBASS_GLYPHS
+               : preferred_osd_format == SUBBITMAP_LIBASS_OUTLINES ? SUBBITMAP_LIBASS_OUTLINES
                : SUBBITMAP_LIBASS;
 
     if (p->cached_subs_valid && !image_lists_changed &&
@@ -285,6 +287,13 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
 
     *out = (struct sub_bitmaps){.change_id = 1};
     p->cached_subs_valid = false;
+
+    // Fresh outline-blob storage for this pack (the previous cached parts'
+    // outline pointers are now stale).
+    if (format == SUBBITMAP_LIBASS_OUTLINES) {
+        talloc_free(p->seg_ctx);
+        p->seg_ctx = talloc_new(p);
+    }
 
     struct sub_bitmaps res = {
         .change_id = image_lists_changed,
@@ -303,11 +312,50 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->bitmap = img->bitmap;
             b->stride = img->stride;
             b->libass.color = img->color;
+            // Explicit zero (cached_parts entries are reused across packs):
+            // stays 0 when built against a libass without the fields, which
+            // degrades to the pre-shift whole-pixel behaviour downstream.
+            b->libass.shift_x64 = b->libass.shift_y64 = 0;
+            // Fork-only ASS_Image fields (present only with the deferred APIs).
+            // Guarded per-symbol so this compiles against stock libass; when a
+            // group is absent the fields stay 0 and sd_ass never advertises the
+            // corresponding deferred mode, so they are never consumed.
+#if HAVE_ASS_BLUR_DEFERRED
             b->libass.blur_x = img->blur_x;
             b->libass.blur_y = img->blur_y;
+#endif
+#if HAVE_ASS_COMPOSITE_DEFERRED
             b->libass.glyph_id = img->glyph_id;
             b->libass.run_id = img->run_id;
             b->libass.run_flags = img->run_flags;
+#endif
+#if HAVE_ASS_OUTLINE_DEFERRED
+            b->libass.outline = NULL;
+            b->libass.n_outline = 0;
+            b->libass.clip_id = img->clip_id;
+            b->libass.clip_rx0 = img->clip_rx0;
+            b->libass.clip_ry0 = img->clip_ry0;
+            b->libass.clip_rx1 = img->clip_rx1;
+            b->libass.clip_ry1 = img->clip_ry1;
+            b->libass.color2 = img->color2;
+            b->libass.wipe_x = img->wipe_x;
+            b->libass.be = img->be;
+#if HAVE_ASS_SHADOW_SHIFT
+            b->libass.shift_x64 = img->shift_x64;
+            b->libass.shift_y64 = img->shift_y64;
+#endif
+            if (format == SUBBITMAP_LIBASS_OUTLINES && img->n_outline > 0) {
+                // Own a copy: libass's tile-export blob is only valid for this
+                // frame. n_outline is the blob's int32 count ([n_tiles, n_segs,
+                // tiles, segs] -- see ASS_Image.outline).
+                b->libass.outline = ta_memdup(p->seg_ctx, (void *) img->outline,
+                                              (size_t) img->n_outline * sizeof(int32_t));
+                b->libass.n_outline = img->n_outline;
+                b->bitmap = NULL;
+                b->stride = 0;
+                b->src_x = b->src_y = 0;   // unused in outline mode; don't leave stale
+            }
+#endif
             b->libass.layer = img->type;   // 0=character/fill, 1=outline, 2=shadow
             b->dw = b->w = img->w;
             b->dh = b->h = img->h;
@@ -326,6 +374,13 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
         // per-frame pack with a persistent GPU glyph cache keyed by glyph_id.)
         r = pack_libass(p, &res);
         res.format = SUBBITMAP_LIBASS_GLYPHS;
+    } else if (format == SUBBITMAP_LIBASS_OUTLINES) {
+        // No atlas: each part carries its coverage outline blob; the GPU
+        // rasterizes it (see compose_glyph_runs in vo_gpu_next.c).
+        res.format = SUBBITMAP_LIBASS_OUTLINES;
+        res.packed = NULL;
+        res.packed_w = res.packed_h = 0;
+        r = true;
     } else if (format == SUBBITMAP_BGRA) {
         r = pack_rgba(p, &res);
     } else {

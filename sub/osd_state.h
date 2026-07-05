@@ -73,6 +73,11 @@ struct osd_state {
     bool render_subs_in_filter;
     _Atomic double force_video_pts;
 
+    // Bumped whenever a sub track is attached/detached/switched (osd_set_sub).
+    // VOs use it to invalidate cached subtitle overlay snapshots across track
+    // changes (see osd_sub_track_epoch()).
+    _Atomic uint64_t sub_track_epoch;
+
     bool want_redraw;
     bool want_redraw_notification;
 
