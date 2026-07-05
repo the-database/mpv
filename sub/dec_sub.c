@@ -328,6 +328,7 @@ void sub_preload(struct dec_sub *sub)
         if (!pkt)
             break;
         sub->sd->driver->decode(sub->sd, pkt);
+        sub_ahead_enqueue(sub->ahead, pkt);   // keep the worker's track a mirror
         MP_TARRAY_APPEND(sub, sub->cached_pkts, sub->num_cached_pkts, pkt);
     }
 
@@ -389,6 +390,10 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
 {
     *packets_read = true;
     mp_mutex_lock(&sub->lock);
+    // Pre-warm hint: the raw video pts playback is about to display. After a
+    // seek (sub_reset -> sub_ahead_flush) this is what lets the worker start
+    // rendering the seek-target window before the VO's first post-seek fetch.
+    sub_ahead_hint_pts(sub->ahead, video_pts);
     video_pts = pts_to_subtitle(sub, video_pts);
     while (1) {
         bool read_more = true;
@@ -453,9 +458,14 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
 void sub_redecode_cached_packets(struct dec_sub *sub)
 {
     mp_mutex_lock(&sub->lock);
+    // The re-decode changes what the packets produce (filters/options); the
+    // worker's private track must mirror it or the ring would keep serving
+    // pre-change frames. Reset it and refeed the still-cached packets.
+    sub_ahead_flush(sub->ahead);
     int index = sub->cached_pkt_pos;
     while (index < sub->num_cached_pkts) {
         sub->sd->driver->decode(sub->sd, sub->cached_pkts[index]);
+        sub_ahead_enqueue(sub->ahead, sub->cached_pkts[index]);
         ++index;
     }
     mp_mutex_unlock(&sub->lock);
@@ -467,12 +477,20 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
 {
     // Render-ahead fast path: serve a worker-rendered frame (keyed on the raw
     // video pts) without taking sub->lock, so a render never blocks the decode
-    // path. A miss falls through to the inline render below.
+    // path. With the worker active this always answers (a miss does a bounded
+    // wait and then serves stale-or-empty inside sub_ahead_get_bitmaps) -- the
+    // VO thread never pays an inline render. The inline path below stays for
+    // render-ahead-off operation and for the one degraded mode the worker
+    // can't serve (reverse playback), where ra-inline counts every inline
+    // render to prove the fast path's claim (it must read 0 in forward play).
     if (sub->ahead) {
-        struct sub_bitmaps *res = sub_ahead_get_bitmaps(sub->ahead, dim, format, pts);
-        if (res)
+        bool handled = false;
+        struct sub_bitmaps *res =
+            sub_ahead_get_bitmaps(sub->ahead, dim, format, pts, &handled);
+        if (handled)
             return res;
-        // Miss: pause the worker so this inline render gets the cores to itself.
+        sub_ahead_note_inline(sub->ahead);
+        // Pause the worker so this inline render gets the cores to itself.
         sub_ahead_inline_begin(sub->ahead);
     }
 

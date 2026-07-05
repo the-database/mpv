@@ -33,6 +33,9 @@ enum sub_bitmap_format {
                         // SUBBITMAP_BGRA during packing
     SUBBITMAP_LIBASS_GLYPHS, // like LIBASS but uncombined per-glyph parts, to be
                         // combined + composited on the GPU (deferred composite)
+    SUBBITMAP_LIBASS_OUTLINES, // like GLYPHS but each part carries the glyph's
+                        // coverage OUTLINE (a tile/segment blob), rasterized on
+                        // the GPU instead of the CPU (deferred outline)
 
     SUBBITMAP_COUNT
 };
@@ -63,6 +66,33 @@ struct sub_bitmap {
             uint32_t run_id;     // coverage-combine within a run, over across
             uint32_t run_flags;  // run FilterDesc flags (fix_outline/shadow)
             uint8_t layer;       // 0=fill, 1=outline, 2=shadow (ASS_Image.type)
+            // Deferred-outline mode (SUBBITMAP_LIBASS_OUTLINES): the glyph's
+            // coverage as a libass tile-export blob of n_outline int32 values
+            // ([n_tiles, n_segs, tiles x 11, segs x 8]; float fields stored
+            // bit-for-bit -- see ASS_Image.outline), to rasterize on the GPU.
+            // bitmap is NULL.
+            const int32_t *outline;
+            int32_t n_outline;
+            // Outline-mode vector \clip: run_flags bit 1 marks a clip-mask part
+            // (its outline rasterizes to a mask; bit 2 = inverse \iclip). A
+            // clipped part carries clip_id == the mask part's run_id (0 = none).
+            uint32_t clip_id;
+            // Outline-mode rectangular \clip: the visible rectangle in storage
+            // px (same space as the part's dst). The consumer intersects the
+            // run's drawn area with it; equals the full frame when unclipped.
+            int32_t clip_rx0, clip_ry0, clip_rx1, clip_ry1;
+            // Outline-mode \kf karaoke wipe (run_flags bit 3): color left of
+            // screen-x wipe_x, color2 to its right.
+            uint32_t color2;
+            int32_t wipe_x;
+            // Outline-mode \be: iterations of the [1,2,1]/4 box blur (0 = none).
+            int32_t be;
+            // Outline-mode deferred shadow (run_flags bit 5): sub-pixel
+            // fraction of the shadow offset in 1/64 px (0..63 per axis; 0 =
+            // none). Applied to the run's final coverage AFTER blur and \be
+            // with ass_shift_bitmap's exact fixed-point bilinear smear (see
+            // ASS_Image.shift_x64/shift_y64).
+            int32_t shift_x64, shift_y64;
         } libass;
         struct {
             const struct sbr_output_image *image;
@@ -212,6 +242,12 @@ bool osd_query_and_reset_want_redraw(struct osd_state *osd);
 
 void osd_set_text(struct osd_state *osd, const char *text);
 void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub);
+
+// Incremented every time a sub track is attached/detached/switched
+// (osd_set_sub). VOs compare it against the value recorded with a cached
+// subtitle overlay snapshot, so a snapshot predating a track change is
+// never presented (see vo_gpu_next's present guard).
+uint64_t osd_sub_track_epoch(struct osd_state *osd);
 
 bool osd_get_render_subs_in_filter(struct osd_state *osd);
 void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);

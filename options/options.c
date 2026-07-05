@@ -360,8 +360,13 @@ const struct m_sub_options mp_subtitle_sub_opts = {
             .flags = UPDATE_SUB_HARD},
         {"sub-render-ahead-threads", OPT_INT(sub_render_ahead_threads), M_RANGE(0, 64),
             .flags = UPDATE_SUB_HARD},
+        {"sub-render-ahead-miss-wait", OPT_DOUBLE(sub_render_ahead_miss_wait),
+            M_RANGE(-1, 1000), .flags = UPDATE_SUB_HARD},
+        {"sub-render-ahead-max-frames", OPT_INT(sub_render_ahead_max_frames),
+            M_RANGE(0, 960), .flags = UPDATE_SUB_HARD},
         {"sub-gpu-blur", OPT_BOOL(sub_gpu_blur), .flags = UPDATE_SUB_HARD},
         {"sub-gpu-composite", OPT_BOOL(sub_gpu_composite), .flags = UPDATE_SUB_HARD},
+        {"sub-gpu-raster", OPT_BOOL(sub_gpu_raster), .flags = UPDATE_SUB_HARD},
         {0}
     },
     .size = sizeof(OPT_BASE_STRUCT),
@@ -385,6 +390,8 @@ const struct m_sub_options mp_subtitle_sub_opts = {
         .sub_render_ahead_frames = 0, // 0 = off (render on the display thread)
         .sub_render_ahead_threads = 2, // worker libass threads (capped, leaves
                                        // cores for the VO + video filters)
+        .sub_render_ahead_miss_wait = -1, // auto: one frame interval; 0 = off
+        .sub_render_ahead_max_frames = 0, // bank cap; 0 = auto (4x depth)
     },
     .change_flags = UPDATE_OSD,
 };
@@ -439,6 +446,7 @@ const struct m_sub_options mp_osd_render_sub_opts = {
         {"osd-selected-color", OPT_COLOR(osd_selected_color)},
         {"osd-selected-outline-color", OPT_COLOR(osd_selected_outline_color)},
         {"force-rgba-osd-rendering", OPT_BOOL(force_rgba_osd)},
+        {"osd-render-res-cap", OPT_INT(osd_render_res_cap), M_RANGE(0, 4320)},
         {"osd-prune-delay", OPT_DOUBLE(osd_ass_prune_delay), M_RANGE(-1.0, 10000.0)},
         {"osd-glyph-limit", OPT_INT(osd_glyph_limit)},
         {"osd-bitmap-max-size", OPT_INT(osd_bitmap_max_size)},

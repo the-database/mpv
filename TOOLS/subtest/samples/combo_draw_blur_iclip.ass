@@ -1,0 +1,16 @@
+[Script Info]
+Title: combo drawing + blur + iclip (blur-carrying)
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,DejaVu Sans,48,&H00FFFFFF,&H000000FF,&H00202020,&H00000000,0,0,0,0,100,100,0,0,1,2,1,5,40,40,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:22.00,Default,,0,0,0,,{\an7\pos(360,180)\p1\1c&H00FFFF&\bord0\blur4\iclip(m 520 300 l 760 300 760 500 520 500)}m 0 0 l 560 0 560 360 0 360{\p0}

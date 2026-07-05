@@ -1,0 +1,17 @@
+[Script Info]
+Title: c3 drawing under vector clip and iclip (fallback path)
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,DejaVu Sans,48,&H00FFFFFF,&H000000FF,&H00202020,&H00000000,0,0,0,0,100,100,0,0,1,2,1,5,40,40,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:22.00,Default,,0,0,0,,{\an7\pos(200,150)\p1\1c&H00FF00&\bord0\clip(m 300 250 l 500 250 500 450 300 450)}m 0 0 l 400 0 400 400 0 400{\p0}
+Dialogue: 0,0:00:00.00,0:00:22.00,Default,,0,0,0,,{\an7\pos(700,150)\p1\1c&HFF00FF&\bord0\iclip(m 800 250 l 1000 250 1000 450 800 450)}m 0 0 l 400 0 400 400 0 400{\p0}

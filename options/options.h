@@ -138,8 +138,11 @@ struct mp_subtitle_opts {
     int sub_ass_render_threads;
     int sub_render_ahead_frames;
     int sub_render_ahead_threads;
+    double sub_render_ahead_miss_wait;
+    int sub_render_ahead_max_frames;
     bool sub_gpu_blur;
     bool sub_gpu_composite;
+    bool sub_gpu_raster;
     char **sub_avopts;
 };
 
@@ -159,6 +162,7 @@ struct mp_osd_render_opts {
     struct osd_style_opts *osd_style;
     struct osd_bar_style_opts *osd_bar_style;
     bool force_rgba_osd;
+    int osd_render_res_cap;
     double osd_ass_prune_delay;
     int osd_glyph_limit;
     int osd_bitmap_max_size;

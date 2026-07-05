@@ -219,9 +219,18 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
         struct osd_object *obj = osd->objs[OSDTYPE_SUB + index];
         obj->sub = dec_sub;
         obj->vo_change_id += 1;
+        // Sub track attached/detached/switched: invalidate any VO-side
+        // stale-overlay snapshots (never show the previous track's subs).
+        atomic_fetch_add_explicit(&osd->sub_track_epoch, 1,
+                                  memory_order_relaxed);
     }
     osd->want_redraw_notification = true;
     mp_mutex_unlock(&osd->lock);
+}
+
+uint64_t osd_sub_track_epoch(struct osd_state *osd)
+{
+    return atomic_load_explicit(&osd->sub_track_epoch, memory_order_relaxed);
 }
 
 bool osd_get_render_subs_in_filter(struct osd_state *osd)
@@ -320,19 +329,45 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
 {
     int format = SUBBITMAP_LIBASS;
     // Prefer uncombined per-glyph output when the VO can composite it on the GPU
-    // (sd_ass falls back to plain LIBASS if --sub-gpu-composite is off). Only
-    // subtitles emit glyph data (sd_ass); the OSD/OSC renderer (osd_libass)
-    // produces plain LIBASS with no glyph_id, so it must NOT request GLYPHS or
+    // (sd_ass falls back to plain LIBASS if --sub-gpu-composite is off). Outlines
+    // are the most capable (the GPU also rasterizes; sd_ass falls back if
+    // --sub-gpu-raster is off), then per-glyph coverage. Only subtitles emit
+    // glyph/outline data (sd_ass); the OSD/OSC renderer (osd_libass) produces
+    // plain LIBASS with no glyph_id, so it must NOT request GLYPHS/OUTLINES or
     // the GPU compositor would read it as a deferred run.
-    if (obj->is_sub && sub_formats[SUBBITMAP_LIBASS_GLYPHS] &&
-        !osd->opts->force_rgba_osd)
-        format = SUBBITMAP_LIBASS_GLYPHS;
+    if (obj->is_sub && !osd->opts->force_rgba_osd) {
+        if (sub_formats[SUBBITMAP_LIBASS_GLYPHS])
+            format = SUBBITMAP_LIBASS_GLYPHS;
+        if (sub_formats[SUBBITMAP_LIBASS_OUTLINES])
+            format = SUBBITMAP_LIBASS_OUTLINES;
+    }
     if (!sub_formats[format] || osd->opts->force_rgba_osd)
         format = SUBBITMAP_BGRA;
 
     struct sub_bitmaps *res = NULL;
 
-    check_obj_resize(osd, osdres, obj);
+    // Cap OSD render resolution (--osd-render-res-cap): a full-screen overlay
+    // such as the stats display, re-rendered and re-uploaded on each redraw at
+    // 8K, contends with heavy subtitle frames and tips them over the frame
+    // budget. Render non-subtitle OSD objects at a capped height and let the GPU
+    // upscale the result — far smaller atlas, upload and composite. The OSD is
+    // text/UI so the slight softening is acceptable; subtitles are never capped
+    // (they have --sub-render-res-limit with a proper capped-composite path).
+    struct mp_osd_res render_res = osdres;
+    int cap = osd->opts->osd_render_res_cap;
+    bool capped = cap > 0 && osdres.h > cap && !obj->is_sub &&
+                  obj->type != OSDTYPE_EXTERNAL2 && !osd->opts->force_rgba_osd;
+    if (capped) {
+        double s = (double) cap / osdres.h;
+        render_res.w  = lrint(osdres.w  * s);
+        render_res.h  = cap;
+        render_res.ml = lrint(osdres.ml * s);
+        render_res.mr = lrint(osdres.mr * s);
+        render_res.mt = lrint(osdres.mt * s);
+        render_res.mb = lrint(osdres.mb * s);
+    }
+
+    check_obj_resize(osd, render_res, obj);
 
     if (obj->type == OSDTYPE_SUB) {
         if (obj->sub && sub_is_primary_visible(obj->sub))
@@ -347,6 +382,20 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
         }
     } else {
         res = osd_object_get_bitmaps(osd, obj, format);
+    }
+
+    // Scale the capped-resolution OSD parts back up to the real output size; the
+    // small packed atlas is sampled into larger dst rects (GPU bilinear upscale).
+    if (res && capped) {
+        double sx = (double) osdres.w / render_res.w;
+        double sy = (double) osdres.h / render_res.h;
+        for (int i = 0; i < res->num_parts; i++) {
+            struct sub_bitmap *b = &res->parts[i];
+            b->x  = lrint(b->x * sx);
+            b->y  = lrint(b->y * sy);
+            b->dw = lrint(b->w * sx);
+            b->dh = lrint(b->h * sy);
+        }
     }
 
     if (obj->vo_had_output != !!res) {
@@ -596,6 +645,17 @@ struct sub_bitmaps *sub_bitmaps_copy(struct sub_bitmap_copy_cache **p_cache,
     *res = *in;
 
     // Note: the p_cache thing is a lie and unused.
+
+    // Outline mode has no packed atlas; each part carries its coverage outline
+    // blob, owned by the packer for this frame. Shallow-copy the parts
+    // (mangle_colors only edits the color field).
+    if (in->format == SUBBITMAP_LIBASS_OUTLINES) {
+        res->packed = NULL;
+        res->parts = NULL;
+        MP_RESIZE_ARRAY(res, res->parts, res->num_parts);
+        memcpy(res->parts, in->parts, sizeof(res->parts[0]) * res->num_parts);
+        return res;
+    }
 
     // The bitmaps being refcounted is essential for performance, and for
     // not invalidating in->parts[*].bitmap pointers.
