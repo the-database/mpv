@@ -83,6 +83,12 @@ struct sub_ahead {
     struct demux_packet **queue;
     int num_queue;
 
+    // Smallest subtitle pts among packets enqueued since the worker last had
+    // the queue fully drained. A render whose target is at/after it raced a
+    // new event and is discarded at store time (the entry re-renders with the
+    // event decoded). INFINITY = nothing pending.
+    double newpkt_min_pts;
+
     // pending controls to apply to worker_sd on the worker thread.
     bool params_pending;
     bool params_set;             // pending_params holds a real value to compare
@@ -250,6 +256,11 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         uint64_t gen = a->gen;
         double interval = a->video_fps > 0 ? 1.0 / a->video_fps : 1.0 / 24.0;
 
+        // The queue is drained at this point, so every event enqueued so far
+        // is in the worker's track; only packets arriving DURING the next
+        // render can invalidate it (checked against newpkt_min_pts at store).
+        a->newpkt_min_pts = INFINITY;
+
         // Nearest upcoming frame not yet in the ring. Start at i=1 (the NEXT
         // frame), never the current one: if the current frame is a miss, the VO
         // renders it inline, and the worker must not render it too -- otherwise
@@ -282,12 +293,16 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         pin_outline_blobs(bmp);   // ring entries outlive the packer's blobs
 
         mp_mutex_lock(&a->lock);
+        // A packet that arrived mid-render may add events at/before this pts:
+        // discard, the entry is still missing and re-renders next iteration
+        // (after the queue drain decodes the packet).
+        bool late_pkt = sub_pts >= a->newpkt_min_pts - 1e-9;
         if (gen == a->gen && format == a->cur_format &&
-            osd_res_equals(dim, a->cur_dim))
+            osd_res_equals(dim, a->cur_dim) && !late_pkt)
         {
             ahead_store(a, target, dim, format, gen, content_id, bmp);
         } else {
-            talloc_free(bmp);    // stale (flush/resize during render)
+            talloc_free(bmp);    // stale (flush/resize/late packet during render)
         }
     }
     mp_mutex_unlock(&a->lock);
@@ -305,6 +320,7 @@ struct sub_ahead *sub_ahead_create(struct dec_sub *sub, struct sd *worker_sd,
     a->worker_sd = worker_sd;
     a->depth = depth;
     a->vo_pts = MP_NOPTS_VALUE;
+    a->newpkt_min_pts = INFINITY;
     a->cur_format = 0;
     a->sub_speed = 1.0;
     a->play_dir = 1;
@@ -359,6 +375,21 @@ void sub_ahead_enqueue(struct sub_ahead *a, struct demux_packet *pkt)
         return;
     mp_mutex_lock(&a->lock);
     MP_TARRAY_APPEND(a, a->queue, a->num_queue, copy);
+    if (pkt->pts != MP_NOPTS_VALUE) {
+        // Ring entries at/after this event's start were rendered without it:
+        // drop them (they re-render once the worker decoded the packet), and
+        // remember the floor so an in-flight render is discarded at store.
+        a->newpkt_min_pts = MPMIN(a->newpkt_min_pts, pkt->pts);
+        for (int n = 0; n < a->ring_len; n++) {
+            struct sub_ahead_entry *e = &a->ring[n];
+            if (e->valid &&
+                ahead_pts_to_subtitle(a, e->video_pts) >= pkt->pts - 1e-9)
+            {
+                talloc_free(e->bmp);
+                *e = (struct sub_ahead_entry){0};
+            }
+        }
+    }
     mp_cond_signal(&a->wakeup);
     mp_mutex_unlock(&a->lock);
 }
@@ -373,6 +404,7 @@ void sub_ahead_flush(struct sub_ahead *a)
     a->gen++;
     a->reset_pending = true;     // flush the worker's own track (on its thread)
     a->vo_pts = MP_NOPTS_VALUE;
+    a->newpkt_min_pts = INFINITY;
     mp_cond_signal(&a->wakeup);
     mp_mutex_unlock(&a->lock);
 }
