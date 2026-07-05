@@ -2658,6 +2658,43 @@ Subtitles
 
     Default: 0.
 
+``--sub-render-ahead-frames=<0-240>``
+    Render ASS/SSA subtitles for upcoming frames on a background worker thread
+    (this many frames of guaranteed lookahead), so the display thread serves a
+    pre-rendered frame instead of rendering inline. The worker owns a fully
+    independent libass instance and never blocks the subtitle decode path.
+    With the worker enabled the display thread never renders subtitles
+    inline: a frame the worker has not delivered yet is waited for briefly
+    (``--sub-render-ahead-miss-wait``) and then substituted with the most
+    recent earlier frame ("stale") or with no subtitles -- never with a
+    synchronous render. Seeks pre-warm the new position instead of collapsing
+    into inline renders. 0 disables the worker (subtitles render on the
+    display thread, the default).
+
+    Default: 0.
+
+``--sub-render-ahead-threads=<0-64>``
+    Number of libass render threads of the render-ahead worker's private
+    libass instance. Kept deliberately small so the worker does not starve
+    the VO thread and the video filters. 0 uses 1 thread.
+
+    Default: 2.
+
+``--sub-render-ahead-miss-wait=<-1|0|milliseconds>``
+    How long a display-thread subtitle fetch may wait for the render-ahead
+    worker to deliver a frame that is not pre-rendered yet (a "miss"), in
+    milliseconds. Past the deadline, the most recent earlier pre-rendered
+    frame is shown for that frame instead (or no subtitles, right after a
+    seek). -1 means one frame interval of the current video; 0 disables
+    waiting (immediately substitute). Only meaningful with
+    ``--sub-render-ahead-frames``.
+
+    Default: -1.
+
+    For testing the substitution behavior, the environment variable
+    ``MPV_SUB_AHEAD_SLOW_MS`` (debug only) delays every worker render by the
+    given number of milliseconds to simulate a worker that cannot keep up.
+
 ``--sub-gpu-blur=<yes|no>``
     Apply the gaussian blur of ASS/SSA subtitles (``\blur``, and the blur from
     a soft shadow) on the GPU instead of on the CPU. libass emits the unblurred
