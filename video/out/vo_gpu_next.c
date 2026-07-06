@@ -1049,6 +1049,29 @@ static inline bool sub_guard_expired(struct priv *p)
     return p->guard_abs && mp_time_ns() > p->guard_abs;
 }
 
+// WP-H1c: (w, h) floor for the legacy-overlay textures (the packed-atlas
+// fallback path: OSD, image subs, non-deferred libass), derived from the
+// display size instead of the historical fixed 2048 -- at 8K the first OSD
+// overlay's packed_w/h exceeds 2048 and used to recreate the texture
+// mid-playback (the measured tex-realloc=1..2 per scene). Width is the next
+// power of two >= the display width because the bitmap packer's internal
+// atlas width grows in powers of two and a row can fill up to it, so
+// packed_w may exceed the display width; height uses the display height
+// (256-aligned) -- packed_h is the packer's USED height, bounded by the
+// (screen-clipped) part areas. Both keep the old 2048 minimum so sub-4K
+// displays behave exactly as before, and are capped by the GPU limit. A
+// truly oversized overlay still grows once via the counted fallback.
+static void overlay_tex_floor(struct priv *p, int *fw, int *fh)
+{
+    int maxd = p->gpu ? p->gpu->limits.max_tex_2d_dim : 2048;
+    int w = 2048;
+    while (w < p->osd_res.w && w * 2 <= maxd)
+        w <<= 1;
+    int h = MPMAX(2048, (p->osd_res.h + 255) & ~255);
+    *fw = MPMIN(w, maxd);
+    *fh = MPMIN(h, maxd);
+}
+
 #if HAVE_ASS_COMPOSITE_DEFERRED
 // Reserve a glyph's slot in the persistent atlas. Cache hit (live entry, same
 // size): *upload stays false. Miss: a ring slot is allocated + the id inserted,
@@ -1565,6 +1588,69 @@ static bool gc_ensure_atlas(struct priv *p)
     return true;
 }
 
+// WP-H1c: per-buffer floor for the legacy-overlay async upload ring, derived
+// from the display size (packed atlas bytes scale with resolution: the ring
+// stages one frame's packed r8/bgra atlas, whose dims scale with the output).
+// A quarter of the floor-texture area covers a full-floor-width r8 band over
+// a quarter of the display height -- comfortably above the heaviest realistic
+// OSD/legacy atlas at that resolution (~2x margin over an --osd-level=3 +
+// stats-page frame) without ballooning the NUM_OVERLAY_BUFS-deep ring; the
+// historical 8 MiB stays as the minimum (sub-4K displays are unchanged) and
+// the counted grow path remains for pathological frames.
+static size_t overlay_buf_floor(struct priv *p)
+{
+    int fw, fh;
+    overlay_tex_floor(p, &fw, &fh);
+    size_t want = MPMAX((size_t) OVERLAY_BUF_MAX_BYTES, (size_t) fw * fh / 4);
+    return (want + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
+}
+
+// WP-H1c: (re)create the legacy overlay texture pool and the overlay upload
+// ring at the current display-derived floor. Called from gc_warmup and again
+// on every reconfig -- i.e. BEFORE playback of the (new) stream, never
+// mid-playback -- so a display-size change re-floors everything while the hot
+// path's pl_tex_recreate / size checks still no-op on the popped objects.
+// The pool holds floor-sized textures with the hot path's exact params; WP-E3
+// double-buffers the overlay state, so two concurrent legacy entries need 4.
+static void ensure_overlay_pool(struct priv *p)
+{
+    pl_gpu gpu = p->gpu;
+    if (!gpu)
+        return;
+    size_t bfloor = overlay_buf_floor(p);
+    for (int i = 0; i < NUM_OVERLAY_BUFS; i++) {
+        if (!p->overlay_bufs[i] || p->overlay_bufs[i]->params.size < bfloor)
+            pl_buf_recreate(gpu, &p->overlay_bufs[i],
+                            pl_buf_params(.size = bfloor, .host_writable = true));
+    }
+    pl_fmt r8 = p->osd_fmt[SUBBITMAP_LIBASS];
+    if (!r8)
+        return;
+    int fw, fh;
+    overlay_tex_floor(p, &fw, &fh);
+    // Drop pooled (unpopped) textures below the floor; textures already
+    // popped into entries keep working and only grow through the counted
+    // path if content actually outgrows them.
+    for (int i = p->num_sub_tex - 1; i >= 0; i--) {
+        if (p->sub_tex[i]->params.w < fw || p->sub_tex[i]->params.h < fh) {
+            pl_tex_destroy(gpu, &p->sub_tex[i]);
+            MP_TARRAY_REMOVE_AT(p->sub_tex, p->num_sub_tex, i);
+        }
+    }
+    while (p->num_sub_tex < 4) {
+        pl_tex t = pl_tex_create(gpu, &(struct pl_tex_params) {
+            .format = r8,
+            .w = fw,
+            .h = fh,
+            .host_writable = true,
+            .sampleable = true,
+        });
+        if (!t)
+            break;
+        MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, t);
+    }
+}
+
 // WP-E (E1.2/E1.3/E4a): one-time, config-time cold-start warm-up, run OFF the hot
 // path before playback. (a) create the glyph atlas at full size, (b) preallocate
 // the upload rings at their worst-frame max so staging-grow/overlay-buf-grow stay
@@ -1590,12 +1676,11 @@ static void gc_warmup(struct priv *p)
     // path only (re)creates a ring when it's too small, so with these in place
     // staging-grow / overlay-buf-grow can no longer fire in normal playback (the
     // grow paths stay as counted safety fallbacks for pathological frames).
+    // WP-H1c: the overlay ring + legacy pool textures are display-size-derived
+    // and re-floored on every reconfig (ensure_overlay_pool below).
     for (int i = 0; i < 3; i++)
         pl_buf_recreate(gpu, &p->glyph_stage[i],
                         pl_buf_params(.size = GLYPH_STAGE_MAX_BYTES, .host_writable = true));
-    for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
-        pl_buf_recreate(gpu, &p->overlay_bufs[i],
-                        pl_buf_params(.size = OVERLAY_BUF_MAX_BYTES, .host_writable = true));
 
     // (c)+(d) warm-up scratch, sized to a representative run so the first real
     // frame rarely regrows them (they grow monotonically; not a full flush).
@@ -1662,29 +1747,9 @@ static void gc_warmup(struct priv *p)
         pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
             .rc = { .x1 = 1, .y1 = 1 }, .row_pitch = 1, .ptr = (void *) &px));
     }
-    // (e) legacy overlay texture pool: the packed-atlas path (fallback parts,
-    // image subs) allocates a per-entry texture on first use -- which lands at
-    // the first subtitle event, mid-playback, and counts as a VO-thread alloc.
-    // Pre-create floor-sized pool textures with the exact params the hot path
-    // uses, so its pl_tex_recreate no-ops on the popped texture. WP-E3: the
-    // present guard double-buffers the overlay state, so each in-use entry
-    // needs TWO pool textures (one per ping-pong buffer); stock 4 to cover
-    // two concurrent legacy entries without a mid-playback alloc.
-    if (r8) {
-        int fl = MPMIN(2048, gpu->limits.max_tex_2d_dim);
-        while (p->num_sub_tex < 4) {
-            pl_tex t = pl_tex_create(gpu, &(struct pl_tex_params) {
-                .format = r8,
-                .w = fl,
-                .h = fl,
-                .host_writable = true,
-                .sampleable = true,
-            });
-            if (!t)
-                break;
-            MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, t);
-        }
-    }
+    // (e) legacy overlay texture pool + overlay upload ring, floored to the
+    // display size (WP-H1c; see ensure_overlay_pool).
+    ensure_overlay_pool(p);
     // Force all compiles + uploads to finish now, before playback starts.
     pl_gpu_finish(gpu);
 }
@@ -2495,17 +2560,21 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
             MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
         // Round the OSD texture up and grow it monotonically so it isn't
         // reallocated every frame as the atlas grows through a dense scene
-        // (each realloc stalls the display thread). WP-E: also floor both dims at
-        // a generous size so the first allocation already covers the whole
-        // scene's overlays -- otherwise the tex creeps up to the scene max over
-        // several frames, and which frame first hits the max (hence the grow) is
-        // decided by --untimed frame dropping, making tex-realloc-after-first
-        // spuriously nonzero. The floor is bounded (a few MiB per entry) and
-        // capped to the GPU's max texture size; a truly oversized overlay still
-        // grows once via the counted fallback below.
-        int fl = MPMIN(2048, p->gpu->limits.max_tex_2d_dim);
-        int want_w = MPMAX((item->packed_w + 255) & ~255, fl);
-        int want_h = MPMAX((item->packed_h + 255) & ~255, fl);
+        // (each realloc stalls the display thread). WP-E: also floor both dims
+        // so the first allocation already covers the whole scene's overlays --
+        // otherwise the tex creeps up to the scene max over several frames, and
+        // which frame first hits the max (hence the grow) is decided by
+        // --untimed frame dropping, making tex-realloc-after-first spuriously
+        // nonzero. WP-H1c: the floor is derived from the display size (the old
+        // fixed 2048 was too small for 8K packed atlases -- the first OSD
+        // overlay recreated the texture mid-playback) and matches the pool
+        // textures pre-created at warm-up/reconfig, so popping one makes the
+        // recreate below a no-op. A truly oversized overlay still grows once
+        // via the counted fallback.
+        int fl_w, fl_h;
+        overlay_tex_floor(p, &fl_w, &fl_h);
+        int want_w = MPMAX((item->packed_w + 255) & ~255, fl_w);
+        int want_h = MPMAX((item->packed_h + 255) & ~255, fl_h);
         int prev_w = entry->tex ? entry->tex->params.w : -1;
         int prev_h = entry->tex ? entry->tex->params.h : -1;
         int new_w = MPMAX(want_w, entry->tex ? entry->tex->params.w : 0);
@@ -4134,6 +4203,10 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     // every OSD compute pass, so no first-use alloc/compile spikes the VO thread
     // once playback begins.
     gc_warmup(p);
+    // WP-H1c: re-floor the legacy overlay pool + upload ring for the (possibly
+    // changed) display size. Reconfig only -- before playback -- never
+    // mid-playback; no-op when already at the right floor.
+    ensure_overlay_pool(p);
 #endif
     return 0;
 }
