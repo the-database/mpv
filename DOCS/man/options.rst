@@ -2806,6 +2806,23 @@ Subtitles
 
     Default: 0 (no injected stall).
 
+``--sub-prefill-budget-ms=<0-20>``
+    ``--vo=gpu-next`` with ``--sub-render-ahead-frames`` and the deferred GPU
+    subtitle paths (``--sub-gpu-composite``/``--sub-gpu-raster``): per-frame
+    wall-clock budget (in milliseconds) for the idle GPU glyph pre-fill. On
+    frames whose subtitle state did not change (no subtitles on screen, or a
+    static line), the display thread spends up to this budget uploading or
+    rasterizing the glyph-cache misses of *upcoming* frames already rendered
+    into the render-ahead ring, so the first frame of a dense subtitle event
+    (cold start, post-seek) does not pay the whole glyph-atlas fill at once.
+    The pre-fill never evicts glyphs the current frame uses, is skipped
+    whenever less than twice its budget remains before the
+    ``--sub-present-guard-ms`` deadline, and resumes across frames when the
+    budget runs out mid-way. Pre-filled glyphs are counted as
+    ``prefill-glyphs`` in ``--dump-stats``. 0 disables the pre-fill.
+
+    Default: 3.
+
 ``--sub-ass-styles=<filename>``
     Load all SSA/ASS styles found in the specified file and use them for
     rendering text subtitles. The syntax of the file is exactly like the ``[V4
