@@ -74,10 +74,15 @@ import parse_stats  # noqa: E402
 
 DEFAULT_BUDGET_MS = 41.7
 
-# The 10 integrity counters that must be 0 to certify a run.
+# The integrity counters that must be 0 to certify a run.
+# gcache-overcommit is the CONTENT-LOSS counter: a frame whose glyph working
+# set exceeds the whole atlas skips glyphs (subtitle text silently missing on
+# screen). It was absent from the original list -- round-1 acceptance could
+# not see it. It must be 0.
 COUNTERS = [
     "gcache-flush",
     "atlas-overflow",
+    "gcache-overcommit",
     "staging-grow",
     "overlay-buf-grow",
     "tex-realloc",
@@ -86,6 +91,14 @@ COUNTERS = [
     "ra-inline",
     "ra-stale",
     "stale-present",
+]
+
+# Informational counters: reported in the table but not gated (nonzero is
+# expected in normal operation; watch for per-frame explosions).
+INFO_COUNTERS = [
+    "gcache-epoch-advance",
+    "gcache-evict-n",
+    "prefill-glyphs",
 ]
 
 # The mis-linked-build tell: stock (non-fork) libass makes mpv warn-and-ignore
@@ -124,7 +137,7 @@ def count_drops(st: parse_stats.Stats) -> tuple[int, dict[str, int]]:
 def read_counters(st: parse_stats.Stats) -> dict[str, float]:
     """counter name -> final value (last value sample; 0.0 if absent)."""
     out = {}
-    for name in COUNTERS:
+    for name in COUNTERS + INFO_COUNTERS:
         samples = st.values.get(name)
         out[name] = samples[-1][1] if samples else 0.0
     return out
@@ -172,7 +185,7 @@ def adjudicate(stats_path: str, default_budget: float,
     if drops > 0:
         detail = ", ".join(f"{k}={v}" for k, v in sorted(drop_breakdown.items()))
         reasons.append(f"frame drops: {drops} ({detail})")
-    fired = {k: v for k, v in counters.items() if round(v) != 0}
+    fired = {k: v for k, v in counters.items() if k in COUNTERS and round(v) != 0}
     if fired:
         detail = ", ".join(f"{k}={int(round(v))}" for k, v in sorted(fired.items()))
         reasons.append(f"integrity counters fired: {detail}")
@@ -496,7 +509,12 @@ def print_scene(r: dict) -> None:
         v = r["counters"][name]
         status = "ok" if v == 0 else "FIRED"
         note = "  (never fired)" if v == 0 else ""
+        if name == "gcache-overcommit" and v != 0:
+            note = "  << CONTENT LOSS: glyphs were skipped on screen"
         print(f"{name:<28} {v:>7}   {status}{note}")
+    for name in INFO_COUNTERS:
+        v = r["counters"].get(name, 0.0)
+        print(f"{name:<28} {v:>7}   info (not gated)")
 
     if r.get("log") and r["log"].get("stock_libass_warn"):
         print(f"\n!! STOCK-LIBASS WARNING in log: {r['log']['warn_line']}")
