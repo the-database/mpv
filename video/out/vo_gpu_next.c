@@ -319,6 +319,18 @@ struct priv {
     // Acceptance runs assert this stays 0; it exists for unknown stall
     // classes. Distinct from ra-stale (dec_sub-level render-ahead staleness).
     int64_t cnt_stale_present, stat_stale_present;
+    // WP-H1b: glyphs uploaded/rasterized into the atlas by the idle pre-fill
+    // (i.e. atlas-fill work moved OFF the frame that first shows them).
+    int64_t cnt_prefill_glyphs, stat_prefill_glyphs;
+    // WP-H1b pre-fill mode for the glyph-cache allocator: never recycle a
+    // segment holding another pass's live glyphs (the current frame's working
+    // set); gc_refused reports that the allocator refused for that reason.
+    bool gc_no_recycle, gc_refused;
+    // WP-H1b: "this frame's sub/OSD state was cheap" (osd_render change_id
+    // unchanged from the previous presented frame -- empty or static subs).
+    // Only such frames run the idle pre-fill.
+    bool sub_state_cheap;
+    int64_t last_sub_change_id;
     bool first_frame_drawn;
     // Phase wall-times (ns) for the MSGL_V [slowframe] line; only computed when
     // MSGL_V is active. The phase start/end dump-stats events themselves come
@@ -349,6 +361,7 @@ struct gl_next_opts {
     int sub_glyph_atlas_height; // WP-A3 debug knob; 0 = default (see option below)
     int sub_present_guard_ms;   // WP-E3: overlay-build deadline; -1 auto, 0 off
     int sub_debug_stall_ms;     // WP-E3 debug: injected overlay-section sleep
+    int sub_prefill_budget_ms;  // WP-H1b: idle glyph pre-fill budget; 0 = off
     char **raw_opts;
 };
 
@@ -408,6 +421,12 @@ const struct m_sub_options gl_next_conf = {
         // (after the first guard checkpoint), so the guard can be exercised
         // deterministically in tests. Not for normal use.
         {"sub-debug-stall-ms", OPT_INT(sub_debug_stall_ms), M_RANGE(0, 10000)},
+        // WP-H1b: per-frame wall-clock budget (ms) for the idle GPU glyph
+        // pre-fill: on frames whose sub state didn't change, upcoming
+        // render-ahead frames' cache-miss glyphs are uploaded/rasterized
+        // into the atlas ahead of time, so the first frame of a dense event
+        // doesn't pay the whole atlas fill. 0 = off.
+        {"sub-prefill-budget-ms", OPT_INT(sub_prefill_budget_ms), M_RANGE(0, 20)},
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
     },
@@ -421,6 +440,7 @@ const struct m_sub_options gl_next_conf = {
         .target_hint_strict = true,
         .sub_glyph_atlas_size = 8192,   // WP-E: 8192^2 r8 = 64 MiB
         .sub_present_guard_ms = -1,     // WP-E3: auto (frame duration)
+        .sub_prefill_budget_ms = 3,     // WP-H1b: idle glyph pre-fill budget
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -976,6 +996,12 @@ static bool gc_place(struct priv *p, int nw, int nh, int *gx, int *gy, int *seg)
         }
         if (p->gc_pass_claims >= p->gnsegs)
             return false;                     // defensive: no unclaimed segment left
+        // WP-H1b: the idle pre-fill must never evict live glyphs placed by
+        // another pass (they may be the CURRENT frame's working set). If the
+        // ring can only advance by recycling a non-empty segment, refuse --
+        // the real frame handles those misses with normal eviction.
+        if (p->gc_no_recycle && p->gseg_count[s] > 0)
+            return false;
         // recycle: evict this segment's (previous-pass) live entries in O(1)
         p->cnt_gcache_evict_n += p->gseg_count[s];
         p->gseg_count[s] = 0;
@@ -1061,11 +1087,19 @@ static bool gcache_reserve(struct priv *p, uint64_t id, int w, int h,
     }
     int nw = w + 1, nh = h + 1;      // 1px pad against bilinear bleed
     if (nw > p->gatlas_w || nh > p->gatlas_h || reuse < 0) {
+        if (p->gc_no_recycle) {      // WP-H1b: a refused pre-fill isn't overcommit
+            p->gc_refused = true;
+            return false;
+        }
         p->cnt_gcache_overcommit++;  // bigger than atlas, or table genuinely full
         return false;
     }
     int gx, gy, seg;
     if (!gc_place(p, nw, nh, &gx, &gy, &seg)) {
+        if (p->gc_no_recycle) {      // WP-H1b: atlas tight; leave it to the frame
+            p->gc_refused = true;
+            return false;
+        }
         p->cnt_gcache_overcommit++;  // ring exhausted this pass: skip (never stall)
         return false;
     }
@@ -1655,6 +1689,122 @@ static void gc_warmup(struct priv *p)
     pl_gpu_finish(gpu);
 }
 
+// A pending glyph-atlas upload (non-outline cache miss): the glyph's slot and
+// its source pixels in the item's packed image.
+struct gmiss { int ax, ay, w, h; const uint8_t *src; };
+
+#if HAVE_ASS_OUTLINE_DEFERRED
+// A pending outline-mode raster job: the glyph's atlas slot plus its
+// tile-export blob's tiles (segments already appended to p->ebuf at sbase).
+struct rjob { int ax, ay, w, h, sbase, nt; const float *tiles; };
+
+// Rasterize queued outline-mode misses: upload the segment pool + a per-tile
+// work-list (one 16x16 tile = one workgroup), then ONE batched dispatch.
+// Shared by compose_glyph_runs (current frame) and the WP-H1b idle pre-fill.
+static void gc_flush_raster(struct priv *p, struct rjob *rjobs, int nrjobs, int ne)
+{
+    pl_gpu gpu = p->gpu;
+    stats_time_start(p->stats, "sub-raster");   // work-list build + dispatch
+    int seg_texels = ne * 2;                                // 2 rgba32f texels per segment
+    int eh = (seg_texels + EDGE_TEX_W - 1) / EDGE_TEX_W;
+    size_t eneed = (size_t) EDGE_TEX_W * eh * 4;
+    if ((size_t) p->ebuf_cap < eneed) {
+        p->ebuf_cap = eneed;
+        p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+    }
+    // 4 texels per tile:
+    // [ax,ay,tx,ty] [w,h,ng,_] group0[type,wind,segoff,cnt] group1[...]
+    int ntiles = 0;
+    for (int j = 0; j < nrjobs; j++)
+        ntiles += rjobs[j].nt;
+    int wh = (4 * ntiles + WORK_TEX_W - 1) / WORK_TEX_W;
+    size_t wneed = (size_t) WORK_TEX_W * wh * 4;
+    if ((size_t) p->wbuf_cap < wneed) {
+        p->wbuf_cap = wneed;
+        p->wbuf = talloc_realloc(p, p->wbuf, float, p->wbuf_cap);
+    }
+    int ti = 0;
+    for (int j = 0; j < nrjobs; j++) {
+        struct rjob *r = &rjobs[j];
+        for (int t = 0; t < r->nt; t++) {
+            const float *T = r->tiles + (size_t) t * TILE_EXPORT_W;  // tx,ty,ng,g0[4],g1[4]
+            float *w0 = &p->wbuf[(4 * ti) * 4];
+            int ng = (int) T[2];
+            w0[0]=r->ax; w0[1]=r->ay; w0[2]=T[0]; w0[3]=T[1];        // ax,ay,tx,ty
+            w0[4]=r->w;  w0[5]=r->h;  w0[6]=T[2]; w0[7]=0;           // w,h,ng
+            w0[8]=T[3];  w0[9]=T[4];  w0[10]=T[5]+r->sbase; w0[11]=T[6];   // group0
+            if (ng >= 2) { w0[12]=T[7]; w0[13]=T[8]; w0[14]=T[9]+r->sbase; w0[15]=T[10]; }
+            else { w0[12]=-1; w0[13]=w0[14]=w0[15]=0; }
+            ti++;
+        }
+    }
+    pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
+    if (ef && gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true, false, false, true) &&
+              gc_ensure(gpu, &p->work_tex, ef, WORK_TEX_W, wh, false, true, false, false, true)) {
+        pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
+            .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
+            .row_pitch = (size_t) EDGE_TEX_W * 4 * sizeof(float), .ptr = p->ebuf));
+        pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->work_tex,
+            .rc = { .x1 = WORK_TEX_W, .y1 = wh },
+            .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = p->wbuf));
+        gc_raster_batch(p, ntiles);
+        p->cnt_raster_dispatches++;
+        p->cnt_raster_tiles += ntiles;
+    }
+    stats_time_end(p->stats, "sub-raster");
+}
+#endif // HAVE_ASS_OUTLINE_DEFERRED
+
+// Flush queued glyph-atlas upload misses: tight-repack into a CPU scratch, one
+// async buffer write, then per-glyph async texture uploads (buffer-backed = no
+// VO-thread stall). Shared by compose_glyph_runs and the WP-H1b idle pre-fill.
+static void gc_flush_misses(struct priv *p, struct gmiss *miss, int nmiss,
+                            size_t miss_bytes, ptrdiff_t pstride)
+{
+    pl_gpu gpu = p->gpu;
+    stats_time_start(p->stats, "sub-upload");   // WP-A3: glyph atlas upload
+    if (p->gstage_cpu_sz < miss_bytes) {
+        p->gstage_cpu = talloc_realloc(p, p->gstage_cpu, uint8_t, miss_bytes);
+        p->gstage_cpu_sz = miss_bytes;
+    }
+    pl_buf *ring = &p->glyph_stage[p->glyph_stage_idx++ % 3];
+    bool buf_ok = (*ring) && (*ring)->params.size >= miss_bytes;
+    if (!buf_ok) {
+        size_t want = (miss_bytes + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);
+        buf_ok = pl_buf_recreate(gpu, ring,
+                                 pl_buf_params(.size = want, .host_writable = true));
+        vo_alloc_bump(p, &p->cnt_staging_grow);   // WP-A3: glyph staging grow
+    }
+    size_t off = 0;
+    size_t *offs = talloc_array(NULL, size_t, nmiss);
+    for (int m = 0; m < nmiss; m++) {           // repack tight into the scratch
+        struct gmiss *g = &miss[m];
+        offs[m] = off;
+        for (int row = 0; row < g->h; row++)
+            memcpy(p->gstage_cpu + off + (size_t) row * g->w,
+                   g->src + (ptrdiff_t) row * pstride, g->w);
+        off += (size_t) g->w * g->h;
+    }
+    if (buf_ok) {
+        pl_buf_write(gpu, *ring, 0, p->gstage_cpu, miss_bytes);
+        for (int m = 0; m < nmiss; m++) {
+            struct gmiss *g = &miss[m];
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
+                .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
+                .row_pitch = g->w, .buf = *ring, .buf_offset = offs[m]));
+        }
+    } else {                                    // fallback: synchronous
+        for (int m = 0; m < nmiss; m++) {
+            struct gmiss *g = &miss[m];
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
+                .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
+                .row_pitch = g->w, .ptr = p->gstage_cpu + offs[m]));
+        }
+    }
+    talloc_free(offs);
+    stats_time_end(p->stats, "sub-upload");
+}
+
 // Composite a SUBBITMAP_LIBASS_GLYPHS item: reproduce libass's per-run combine
 // + blur + fix_outline on the GPU into entry->tex (a result atlas), then emit a
 // single monochrome overlay whose parts reference each run's coverage region.
@@ -1724,13 +1874,12 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // the cached coverage untouched).
     bool is_outline = item->format == SUBBITMAP_LIBASS_OUTLINES;
     struct gpos *cpos = talloc_array(tmp, struct gpos, item->num_parts);
-    struct gmiss { int ax, ay, w, h; const uint8_t *src; };
     struct gmiss *miss = NULL;
     int nmiss = 0;
     size_t miss_bytes = 0;
 #if HAVE_ASS_OUTLINE_DEFERRED
     // outline raster jobs: per missed glyph, its atlas slot + the blob's tiles
-    struct rjob { int ax, ay, w, h, sbase, nt; const float *tiles; } *rjobs = NULL;
+    struct rjob *rjobs = NULL;
     int nrjobs = 0, ne = 0;                  // ne = pooled segments (2 texels each)
     // Vector-\clip masks found in this item: rasterized like glyphs, then used
     // to multiply each clipped run's coverage (gc_outline_features).
@@ -1793,104 +1942,14 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     }
 
 #if HAVE_ASS_OUTLINE_DEFERRED
-    // Rasterize the outline-mode misses: upload the segment pool + a per-tile
-    // work-list (one 16x16 tile = one workgroup), then ONE batched dispatch.
-    if (ne) {
-        stats_time_start(p->stats, "sub-raster");   // work-list build + dispatch
-        int seg_texels = ne * 2;                                // 2 rgba32f texels per segment
-        int eh = (seg_texels + EDGE_TEX_W - 1) / EDGE_TEX_W;
-        size_t eneed = (size_t) EDGE_TEX_W * eh * 4;
-        if ((size_t) p->ebuf_cap < eneed) {
-            p->ebuf_cap = eneed;
-            p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
-        }
-        // 4 texels per tile:
-        // [ax,ay,tx,ty] [w,h,ng,_] group0[type,wind,segoff,cnt] group1[...]
-        int ntiles = 0;
-        for (int j = 0; j < nrjobs; j++)
-            ntiles += rjobs[j].nt;
-        int wh = (4 * ntiles + WORK_TEX_W - 1) / WORK_TEX_W;
-        size_t wneed = (size_t) WORK_TEX_W * wh * 4;
-        if ((size_t) p->wbuf_cap < wneed) {
-            p->wbuf_cap = wneed;
-            p->wbuf = talloc_realloc(p, p->wbuf, float, p->wbuf_cap);
-        }
-        int ti = 0;
-        for (int j = 0; j < nrjobs; j++) {
-            struct rjob *r = &rjobs[j];
-            for (int t = 0; t < r->nt; t++) {
-                const float *T = r->tiles + (size_t) t * TILE_EXPORT_W;  // tx,ty,ng,g0[4],g1[4]
-                float *w0 = &p->wbuf[(4 * ti) * 4];
-                int ng = (int) T[2];
-                w0[0]=r->ax; w0[1]=r->ay; w0[2]=T[0]; w0[3]=T[1];        // ax,ay,tx,ty
-                w0[4]=r->w;  w0[5]=r->h;  w0[6]=T[2]; w0[7]=0;           // w,h,ng
-                w0[8]=T[3];  w0[9]=T[4];  w0[10]=T[5]+r->sbase; w0[11]=T[6];   // group0
-                if (ng >= 2) { w0[12]=T[7]; w0[13]=T[8]; w0[14]=T[9]+r->sbase; w0[15]=T[10]; }
-                else { w0[12]=-1; w0[13]=w0[14]=w0[15]=0; }
-                ti++;
-            }
-        }
-        pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
-        if (ef && gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true, false, false, true) &&
-                  gc_ensure(gpu, &p->work_tex, ef, WORK_TEX_W, wh, false, true, false, false, true)) {
-            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
-                .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
-                .row_pitch = (size_t) EDGE_TEX_W * 4 * sizeof(float), .ptr = p->ebuf));
-            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->work_tex,
-                .rc = { .x1 = WORK_TEX_W, .y1 = wh },
-                .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = p->wbuf));
-            gc_raster_batch(p, ntiles);
-            p->cnt_raster_dispatches++;
-            p->cnt_raster_tiles += ntiles;
-        }
-        stats_time_end(p->stats, "sub-raster");
-    }
+    // Rasterize the outline-mode misses (one batched dispatch).
+    if (ne)
+        gc_flush_raster(p, rjobs, nrjobs, ne);
 #endif // HAVE_ASS_OUTLINE_DEFERRED
 
-    // Flush the misses: tight-repack into a CPU scratch, one async buffer write,
-    // then per-glyph async texture uploads (buffer-backed = no VO-thread stall).
-    if (nmiss) {
-        stats_time_start(p->stats, "sub-upload");   // WP-A3: glyph atlas upload
-        if (p->gstage_cpu_sz < miss_bytes) {
-            p->gstage_cpu = talloc_realloc(p, p->gstage_cpu, uint8_t, miss_bytes);
-            p->gstage_cpu_sz = miss_bytes;
-        }
-        pl_buf *ring = &p->glyph_stage[p->glyph_stage_idx++ % 3];
-        bool buf_ok = (*ring) && (*ring)->params.size >= miss_bytes;
-        if (!buf_ok) {
-            size_t want = (miss_bytes + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);
-            buf_ok = pl_buf_recreate(gpu, ring,
-                                     pl_buf_params(.size = want, .host_writable = true));
-            vo_alloc_bump(p, &p->cnt_staging_grow);   // WP-A3: glyph staging grow
-        }
-        size_t off = 0;
-        size_t *offs = talloc_array(tmp, size_t, nmiss);
-        for (int m = 0; m < nmiss; m++) {           // repack tight into the scratch
-            struct gmiss *g = &miss[m];
-            offs[m] = off;
-            for (int row = 0; row < g->h; row++)
-                memcpy(p->gstage_cpu + off + (size_t) row * g->w,
-                       g->src + (ptrdiff_t) row * pstride, g->w);
-            off += (size_t) g->w * g->h;
-        }
-        if (buf_ok) {
-            pl_buf_write(gpu, *ring, 0, p->gstage_cpu, miss_bytes);
-            for (int m = 0; m < nmiss; m++) {
-                struct gmiss *g = &miss[m];
-                pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
-                    .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
-                    .row_pitch = g->w, .buf = *ring, .buf_offset = offs[m]));
-            }
-        } else {                                    // fallback: synchronous
-            for (int m = 0; m < nmiss; m++) {
-                struct gmiss *g = &miss[m];
-                pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
-                    .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
-                    .row_pitch = g->w, .ptr = p->gstage_cpu + offs[m]));
-            }
-        }
-        stats_time_end(p->stats, "sub-upload");
-    }
+    // Flush the upload misses (async, buffer-backed).
+    if (nmiss)
+        gc_flush_misses(p, miss, nmiss, miss_bytes, pstride);
 
     // WP-E3 checkpoint: the miss flush is recorded (every claimed atlas slot
     // has its raster/upload in flight), so the glyph cache is consistent again
@@ -2157,6 +2216,149 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         ol->color = src->params.color;
     return true;
 }
+
+// WP-H1b: warm the glyph atlas for ONE upcoming render-ahead frame (a served
+// ring copy the VO hasn't drawn yet): resolve its deferred glyphs against the
+// cache and upload/rasterize the misses, exactly like the resolve+flush phase
+// of compose_glyph_runs but with nothing composed. Runs in no-recycle mode so
+// it can never evict the current frame's live glyphs (if the atlas is that
+// tight it refuses and the entry is treated as done -- the real frame handles
+// its misses with normal eviction). Budget: stop RESOLVING once deadline_ns
+// passes, but always flush what was reserved (a reserved slot whose pixels
+// are never written would cache-hit garbage forever -- same invariant as the
+// resolve->flush span in compose_glyph_runs). Returns true when the item
+// needs no further pre-fill passes; false = budget ran out mid-item (the
+// caller re-peeks it on a later frame; resolved glyphs then hit).
+static bool gc_prefill_item(struct priv *p, const struct sub_bitmaps *item,
+                            int64_t deadline_ns)
+{
+    bool is_outline = item->format == SUBBITMAP_LIBASS_OUTLINES;
+#if !HAVE_ASS_OUTLINE_DEFERRED
+    if (is_outline)
+        return true;
+#endif
+    ptrdiff_t pstride = 0;
+    if (!is_outline) {
+        if (!item->packed)
+            return true;
+        pstride = item->packed->stride[0];
+    }
+    if (!gc_ensure_atlas(p))
+        return true;
+
+    void *tmp = talloc_new(NULL);
+    // Same eviction-pass semantics as a real compose item (a segment claimed
+    // by this pass is never recycled mid-pass), plus no-recycle (see above).
+    p->gc_pass++;
+    p->gc_pass_claims = 0;
+    p->gc_no_recycle = true;
+    p->gc_refused = false;
+    struct gmiss *miss = NULL;
+    int nmiss = 0;
+    size_t miss_bytes = 0;
+#if HAVE_ASS_OUTLINE_DEFERRED
+    struct rjob *rjobs = NULL;
+    int nrjobs = 0, ne = 0;
+#endif
+    bool complete = true;
+    for (int i = 0; i < item->num_parts; i++) {
+        if ((i & 15) == 0 && mp_time_ns() > deadline_ns) {
+            complete = false;         // budget: stop resolving, flush, resume later
+            break;
+        }
+        const struct sub_bitmap *b = &item->parts[i];
+        if (b->libass.glyph_id == 0)
+            continue;
+        bool up;
+        struct gpos pos;
+        if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &pos, &up)) {
+            if (p->gc_refused)
+                break;                // atlas tight: give up on this entry
+            continue;                 // oversized glyph: nothing to pre-fill
+        }
+        if (!up)
+            continue;                 // already resident
+#if HAVE_ASS_OUTLINE_DEFERRED
+        if (is_outline) {
+            // Queue the raster job (same blob unpacking as compose_glyph_runs).
+            const int32_t *blob = b->libass.outline;
+            if (!blob || b->libass.n_outline < 2)
+                continue;
+            int nt = blob[0], ns = blob[1];
+            const float *gtiles = (const float *)(blob + 2);
+            const float *gsegs  = (const float *)(blob + 2 + (size_t) nt * TILE_EXPORT_W);
+            if (p->ebuf_cap < (ne + ns) * SEG_EXPORT_W) {
+                p->ebuf_cap = MPMAX((ne + ns) * SEG_EXPORT_W * 2, 8192);
+                p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+            }
+            memcpy(p->ebuf + (size_t) ne * SEG_EXPORT_W, gsegs,
+                   (size_t) ns * SEG_EXPORT_W * sizeof(float));
+            MP_TARRAY_APPEND(tmp, rjobs, nrjobs,
+                ((struct rjob){ pos.ax, pos.ay, b->w, b->h, ne, nt, gtiles }));
+            ne += ns;
+            continue;
+        }
+#endif
+        const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
+                            + (ptrdiff_t) b->src_y * pstride + b->src_x;
+        MP_TARRAY_APPEND(tmp, miss, nmiss,
+            ((struct gmiss){ pos.ax, pos.ay, b->w, b->h, gsrc }));
+        miss_bytes += (size_t) b->w * b->h;
+    }
+    p->gc_no_recycle = false;
+#if HAVE_ASS_OUTLINE_DEFERRED
+    if (ne) {
+        gc_flush_raster(p, rjobs, nrjobs, ne);
+        p->cnt_prefill_glyphs += nrjobs;
+    }
+#endif
+    if (nmiss) {
+        gc_flush_misses(p, miss, nmiss, miss_bytes, pstride);
+        p->cnt_prefill_glyphs += nmiss;
+    }
+    if (p->gc_refused)
+        complete = true;              // never spin on a refused entry
+    talloc_free(tmp);
+    return complete;
+}
+
+// WP-H1b idle GPU pre-fill: on frames whose sub state didn't change (empty or
+// static subs -- exactly the frames with headroom), warm the glyph atlas for
+// upcoming frames already banked in the render-ahead ring, so the FIRST frame
+// of a dense event doesn't pay the whole atlas fill (cold start, post-seek).
+// The work is budgeted (--sub-prefill-budget-ms of wall clock per frame) and
+// counts toward the frame's WP-E3 deadline: it only runs when at least twice
+// its budget remains before the present-guard deadline, so it can never be
+// what pushes a frame over. Runs after the frame's own overlay build + render
+// recording; the extra dispatches ride the same submission.
+static void sub_prefill_idle(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    int budget_ms = p->next_opts->sub_prefill_budget_ms;
+    if (budget_ms <= 0 || !p->gc_warmed || !p->glyph_atlas)
+        return;
+    if (!p->sub_state_cheap || p->guard_fired)
+        return;
+    int64_t now = mp_time_ns();
+    int64_t budget_ns = budget_ms * INT64_C(1000000);
+    if (p->guard_deadline_ns > 0 &&
+        p->guard_t0 + p->guard_deadline_ns - now < 2 * budget_ns)
+        return;
+    double pts = 0;
+    struct sub_bitmaps *item = osd_sub_peek_ahead(vo->osd, &pts);
+    if (!item)
+        return;
+    bool done = true;
+    if ((item->format == SUBBITMAP_LIBASS_GLYPHS ||
+         item->format == SUBBITMAP_LIBASS_OUTLINES) && item->num_parts) {
+        stats_time_start(p->stats, "sub-prefill");
+        done = gc_prefill_item(p, item, now + budget_ns);
+        stats_time_end(p->stats, "sub-prefill");
+    }
+    talloc_free(item);
+    if (done)
+        osd_sub_peek_ahead_done(vo->osd, pts);
+}
 #endif // HAVE_ASS_COMPOSITE_DEFERRED
 
 // Build the overlay set for `frame` into one of g's ping-pong buffers.
@@ -2211,6 +2413,15 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
     if (want_t)
         p->dbg_subrender_ns = mp_time_ns() - sr0;
     stats_time_end(p->stats, "sub-render");
+
+    // WP-H1b: an unchanged osd_render change_id means this frame's sub/OSD
+    // state is static or empty -- the cheap frames the idle glyph pre-fill is
+    // allowed to use. Main presentation consumer only (the blend-subs path
+    // has its own per-frame sync and the screenshot path must not vote).
+    if (present && g == &p->osd_guard) {
+        p->sub_state_cheap = subs->change_id == p->last_sub_change_id;
+        p->last_sub_change_id = subs->change_id;
+    }
 
     frame->overlays = state->overlays;
     frame->num_overlays = 0;
@@ -3769,6 +3980,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     struct pl_frame ref_frame;
     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
 
+#if HAVE_ASS_COMPOSITE_DEFERRED
+    // WP-H1b: idle GPU glyph pre-fill for upcoming render-ahead frames. After
+    // the frame's own work is recorded, so its budget check sees the true
+    // remaining headroom before the present-guard deadline.
+    sub_prefill_idle(vo);
+#endif
+
     // WP-A3: per-frame counter samples (emit-on-change; no-op unless --dump-stats)
     // and the MSGL_V [slowframe] breakdown line (format kept byte-compatible with
     // the historical logs + TOOLS/subtest/parse_stats.py).
@@ -3790,6 +4008,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     if (p->guard_fired)
         p->cnt_stale_present++;
     emit_counter(vo, "stale-present",             p->cnt_stale_present,       &p->stat_stale_present);
+    emit_counter(vo, "prefill-glyphs",            p->cnt_prefill_glyphs,      &p->stat_prefill_glyphs);
     if (want_slow) {
         int64_t gpu_ns = 0;
         for (int i = 0; i < p->perf_fresh.count; i++)
@@ -4622,6 +4841,7 @@ static int preinit(struct vo *vo)
     p->stat_gcache_epoch_advance = p->stat_gcache_evict_n = p->stat_gcache_overcommit = -1;
     p->stat_shader_warmups = -1;
     p->stat_stale_present = -1;
+    p->stat_prefill_glyphs = -1;
     p->osd_guard.good = -1;   // WP-E3: no complete overlay build yet
 
     struct gl_video_opts *gl_opts = p->opts_cache->opts;

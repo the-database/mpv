@@ -249,6 +249,14 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub);
 // never presented (see vo_gpu_next's present guard).
 uint64_t osd_sub_track_epoch(struct osd_state *osd);
 
+// WP-H1b idle GPU pre-fill: peek the primary sub track's render-ahead ring
+// for an upcoming, not-yet-consumed frame (see sub_ahead_peek_prefill for the
+// contract; free the result with talloc_free, ack full processing with
+// osd_sub_peek_ahead_done). Returns NULL when render-ahead is off, no sub
+// track is attached, or nothing is pending.
+struct sub_bitmaps *osd_sub_peek_ahead(struct osd_state *osd, double *out_pts);
+void osd_sub_peek_ahead_done(struct osd_state *osd, double video_pts);
+
 bool osd_get_render_subs_in_filter(struct osd_state *osd);
 void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);
 void osd_set_force_video_pts(struct osd_state *osd, double video_pts);
