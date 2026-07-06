@@ -514,6 +514,24 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
     return res;
 }
 
+// WP-H1b idle GPU pre-fill: peek the render-ahead ring for an upcoming frame
+// whose glyphs the VO may want to warm into its atlas. Does NOT take
+// sub->lock: sub->ahead is set once at creation and joined in sub_destroy
+// (which the player only calls after detaching the track from the OSD), and
+// sub_ahead has its own lock -- same locking story as the fetch fast path.
+struct sub_bitmaps *sub_peek_ahead_bitmaps(struct dec_sub *sub, double *out_pts)
+{
+    if (!sub->ahead)
+        return NULL;
+    return sub_ahead_peek_prefill(sub->ahead, out_pts);
+}
+
+void sub_peek_ahead_done(struct dec_sub *sub, double video_pts)
+{
+    if (sub->ahead)
+        sub_ahead_prefill_done(sub->ahead, video_pts);
+}
+
 // The returned string is talloc'ed.
 char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type)
 {

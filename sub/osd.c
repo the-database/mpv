@@ -233,6 +233,26 @@ uint64_t osd_sub_track_epoch(struct osd_state *osd)
     return atomic_load_explicit(&osd->sub_track_epoch, memory_order_relaxed);
 }
 
+struct sub_bitmaps *osd_sub_peek_ahead(struct osd_state *osd, double *out_pts)
+{
+    mp_mutex_lock(&osd->lock);
+    struct osd_object *obj = osd->objs[OSDTYPE_SUB];
+    struct sub_bitmaps *res = NULL;
+    if (obj->sub && sub_is_primary_visible(obj->sub))
+        res = sub_peek_ahead_bitmaps(obj->sub, out_pts);
+    mp_mutex_unlock(&osd->lock);
+    return res;
+}
+
+void osd_sub_peek_ahead_done(struct osd_state *osd, double video_pts)
+{
+    mp_mutex_lock(&osd->lock);
+    struct osd_object *obj = osd->objs[OSDTYPE_SUB];
+    if (obj->sub)
+        sub_peek_ahead_done(obj->sub, video_pts);
+    mp_mutex_unlock(&osd->lock);
+}
+
 bool osd_get_render_subs_in_filter(struct osd_state *osd)
 {
     mp_mutex_lock(&osd->lock);

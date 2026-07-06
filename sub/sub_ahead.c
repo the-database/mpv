@@ -127,6 +127,8 @@ struct sub_ahead_entry {
     int format;
     uint64_t gen;
     uint64_t content_id;         // for change_id unification
+    bool prefilled;              // consumed by a serve or by the VO's GPU
+                                 // glyph pre-fill (sub_ahead_peek_prefill)
     struct ahead_payload *pl;    // ring's reference; NULL = "no subtitles"
 };
 
@@ -827,6 +829,11 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
         // worker evicts the entry while the VO still holds the serve.
         res = payload_serve(a->ring[src].pl);
     }
+    if (src >= 0) {
+        // Whatever the VO draws this frame it also resolves against the GPU
+        // glyph cache, so the idle pre-fill must not reprocess this entry.
+        a->ring[src].prefilled = true;
+    }
     if (res) {
         // Unified monotonic change_id: report a fresh id only when the content
         // differs from what we last served, else 0 (osd.c treats 0 as "no
@@ -845,4 +852,45 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
     mp_mutex_unlock(&a->lock);
     mp_cond_signal(&a->wakeup);  // nudge the worker to refill ahead of us
     return res;
+}
+
+struct sub_bitmaps *sub_ahead_peek_prefill(struct sub_ahead *a, double *out_pts)
+{
+    if (!a)
+        return NULL;
+    struct sub_bitmaps *res = NULL;
+    mp_mutex_lock(&a->lock);
+    // Lowest-pts first: after a seek the pre-warm target (i=0) is the first
+    // frame the VO will fetch, so it must also be the first one pre-filled.
+    int best = -1;
+    for (int n = 0; n < a->ring_len; n++) {
+        struct sub_ahead_entry *e = &a->ring[n];
+        if (e->valid && e->gen == a->gen && !e->prefilled && e->pl &&
+            (best < 0 || e->video_pts < a->ring[best].video_pts))
+            best = n;
+    }
+    if (best >= 0) {
+        res = payload_serve(a->ring[best].pl);
+        if (res) {
+            *out_pts = a->ring[best].video_pts;
+        } else {
+            // No renderable parts: nothing to pre-fill, never return it again.
+            a->ring[best].prefilled = true;
+        }
+    }
+    mp_mutex_unlock(&a->lock);
+    return res;
+}
+
+void sub_ahead_prefill_done(struct sub_ahead *a, double video_pts)
+{
+    if (!a)
+        return;
+    mp_mutex_lock(&a->lock);
+    for (int n = 0; n < a->ring_len; n++) {
+        struct sub_ahead_entry *e = &a->ring[n];
+        if (e->valid && e->video_pts == video_pts)
+            e->prefilled = true;
+    }
+    mp_mutex_unlock(&a->lock);
 }
