@@ -20,6 +20,9 @@ ACCEPTANCE BAR (a scene PASSES only if all three hold):
   3. ALL of these integrity counters == 0:
        gcache-flush atlas-overflow staging-grow overlay-buf-grow tex-realloc
        vo-alloc-after-first-frame ra-miss ra-inline ra-stale stale-present
+       guard-empty
+     (gcache-overcommit is NOT gated -- post-H1d it is the lossless per-frame
+     transient-glyph path, an informational tuning signal, not content loss.)
      mpv emits these with emit_counter() (vo_gpu_next.c) / MP_STATS value lines
      (sub_ahead.c). vo_gpu_next's emit_counter is *emit-on-change* starting from
      0, so a counter that never left 0 for the whole run produces NO line at
@@ -75,14 +78,18 @@ import parse_stats  # noqa: E402
 DEFAULT_BUDGET_MS = 41.7
 
 # The integrity counters that must be 0 to certify a run.
-# gcache-overcommit is the CONTENT-LOSS counter: a frame whose glyph working
-# set exceeds the whole atlas skips glyphs (subtitle text silently missing on
-# screen). It was absent from the original list -- round-1 acceptance could
-# not see it. It must be 0.
+#   stale-present -- a present-guard bail served the previous (stale) overlay
+#                    state (subs 1 frame behind); a stall we don't want clean.
+#   guard-empty   -- a present-guard bail presented NO overlays (subtitles
+#                    briefly VANISHED) because no valid previous snapshot
+#                    existed. This is a visible error in steady playback, so it
+#                    is gated ==0. (Post-seek/cold-start stalls can legitimately
+#                    produce it -- stale there would be wrong content -- but a
+#                    clean acceptance run seeks only where the guard does not
+#                    fire, so it must stay 0.)
 COUNTERS = [
     "gcache-flush",
     "atlas-overflow",
-    "gcache-overcommit",
     "staging-grow",
     "overlay-buf-grow",
     "tex-realloc",
@@ -91,11 +98,19 @@ COUNTERS = [
     "ra-inline",
     "ra-stale",
     "stale-present",
+    "guard-empty",
 ]
 
 # Informational counters: reported in the table but not gated (nonzero is
 # expected in normal operation; watch for per-frame explosions).
+# gcache-overcommit: post-H1d this means "took the lossless per-frame transient
+# path for a big/overflow glyph" -- NOT content loss (that is structurally
+# impossible now, proven pixel-identical to CPU). Its only cost (per-frame
+# re-raster) is already gated by the video-draw budget, so gating it ==0 would
+# falsely fail a valid 8K run (dense signs legitimately trip it). When nonzero
+# it prints a tuning hint.
 INFO_COUNTERS = [
+    "gcache-overcommit",
     "gcache-epoch-advance",
     "gcache-evict-n",
     "prefill-glyphs",
@@ -509,12 +524,16 @@ def print_scene(r: dict) -> None:
         v = r["counters"][name]
         status = "ok" if v == 0 else "FIRED"
         note = "  (never fired)" if v == 0 else ""
-        if name == "gcache-overcommit" and v != 0:
-            note = "  << CONTENT LOSS: glyphs were skipped on screen"
+        if name == "guard-empty" and v != 0:
+            note = "  << SUBS VANISHED: guard presented no overlays"
         print(f"{name:<28} {v:>7}   {status}{note}")
     for name in INFO_COUNTERS:
         v = r["counters"].get(name, 0.0)
-        print(f"{name:<28} {v:>7}   info (not gated)")
+        note = "info (not gated)"
+        if name == "gcache-overcommit" and v != 0:
+            note = ("info -- transient fallback active (lossless; raise "
+                    "--sub-glyph-atlas-size if any frames are over budget)")
+        print(f"{name:<28} {v:>7}   {note}")
 
     if r.get("log") and r["log"].get("stock_libass_warn"):
         print(f"\n!! STOCK-LIBASS WARNING in log: {r['log']['warn_line']}")
