@@ -234,6 +234,23 @@ struct priv {
     int gseg_h, gnsegs;                      // segment height (px) and count (<=GC_SEGMENTS)
     uint32_t gseg_gen[GC_SEGMENTS];          // per-segment generation (bumped on recycle)
     uint32_t gseg_pass[GC_SEGMENTS];         // gc_pass that last claimed each segment
+    uint32_t gseg_pin[GC_SEGMENTS];          // WP-H1d: gc_pass that last cache-HIT
+                                             // into each segment; such a segment is
+                                             // never recycled later in that pass (the
+                                             // hit's coverage is still to be composed)
+                                             // -- the placement falls back to the
+                                             // transient store instead
+    uint32_t gseg_claim_wrap[GC_SEGMENTS];   // WP-H1d: gc_pass_wraps value when the
+                                             // segment was claimed by the current
+                                             // pass (re-entering it after another
+                                             // wrap would overwrite own placements)
+    uint32_t gc_pass_wraps;                  // ring wraps performed by this pass
+    bool gseg_spanned[GC_SEGMENTS];          // WP-H1d: segment holds the LOWER rows
+                                             // of glyph(s) tagged to an earlier
+                                             // segment; gseg_count[s]==0 does NOT
+                                             // mean its rows are free then (the
+                                             // pre-fill's no-recycle mode must not
+                                             // claim it as empty)
     int gseg_count[GC_SEGMENTS];             // live entries per segment (for evict-n)
     uint32_t gc_pass;                        // per-compose-item pass id (overcommit scope)
     int gc_pass_claims;                      // segments claimed by the current pass
@@ -241,6 +258,18 @@ struct priv {
     pl_buf glyph_stage[3];                   // async upload staging ring (no VO stall)
     unsigned glyph_stage_idx;
     uint8_t *gstage_cpu; size_t gstage_cpu_sz; // tight-repack scratch for misses
+
+    // WP-H1d: per-item transient glyph store. Glyphs that are not cached --
+    // above the size cap (gc_cacheable) or refused by the allocator when a
+    // single item's working set exceeds the whole atlas -- are rasterized/
+    // uploaded here EVERY frame instead of being silently skipped (the old
+    // overcommit skip rendered runs from cpos {0,0}: wrong-glyph garbage or
+    // missing text, non-deterministic with eviction history). Shelf-packed,
+    // cursor reset per compose item; contents live only from an item's
+    // resolve+flush to its region composes, so committed overlays never
+    // reference it (guard-safe like the run_* scratch).
+    pl_tex trans_atlas;
+    int tr_x, tr_y, tr_rowh;                 // per-item shelf cursor
 
     // GPU glyph rasterizer (SUBBITMAP_LIBASS_OUTLINES): cache misses are
     // rasterized into glyph_atlas from libass's tile-export blobs instead of
@@ -259,10 +288,14 @@ struct priv {
     // absolute bail time for the update_overlays call currently running
     // (0 = guard inactive for that call). guard_fired latches any bail this
     // frame so stale-present counts once per frame, not once per overlay set.
+    // guard_presented_empty latches when a bail this frame presented NO
+    // overlays (a vanish) so it is counted as guard-empty rather than
+    // stale-present; sticky across the frame's overlay builds (any vanish wins).
     int64_t guard_t0;
     int64_t guard_deadline_ns;
     int64_t guard_abs;
     bool guard_fired;
+    bool guard_presented_empty;
 
     uint64_t last_id;
     uint64_t osd_sync;
@@ -316,11 +349,41 @@ struct priv {
     int64_t cnt_shader_warmups;
     int64_t stat_gcache_epoch_advance, stat_gcache_evict_n, stat_gcache_overcommit;
     int64_t stat_shader_warmups;
-    // WP-E3: presentation-guard engagements (frames presented with the
-    // previous complete overlay state because the build blew its deadline).
-    // Acceptance runs assert this stays 0; it exists for unknown stall
-    // classes. Distinct from ra-stale (dec_sub-level render-ahead staleness).
+    // WP-E3: presentation-guard engagements. Split by what the bail served:
+    //   stale-present -- the previous complete overlay state was still valid
+    //                    for this frame and was presented (subs at most one
+    //                    frame stale). This is the guard working as designed.
+    //   guard-empty   -- the bail presented NO overlays (a visible sub vanish)
+    //                    because no valid previous snapshot existed: cold start
+    //                    (good == -1), post-seek/track-change (reset), a pts
+    //                    discontinuity, or a >0.5 s content gap where the stale
+    //                    snapshot would be wrong content. Reachable only in
+    //                    those genuinely-invalid cases -- in steady-state
+    //                    continuous playback the must_complete alternation keeps
+    //                    the last good build <=2 frames back (well inside the
+    //                    0.5 s backstop) so an overrun always serves stale.
+    // Acceptance gates BOTH at 0 (guard-empty is a visible error; stale-present
+    // is 1-frame-stale but still a stall we don't want on a clean run). Distinct
+    // from ra-stale (dec_sub-level render-ahead staleness).
     int64_t cnt_stale_present, stat_stale_present;
+    int64_t cnt_guard_empty, stat_guard_empty;
+    // WP-H1b: glyphs uploaded/rasterized into the atlas by the idle pre-fill
+    // (i.e. atlas-fill work moved OFF the frame that first shows them).
+    int64_t cnt_prefill_glyphs, stat_prefill_glyphs;
+    // WP-H1d: glyphs handled per-frame via the transient store because they
+    // are above the cache size cap (giant sign glyphs; caching them evicts
+    // hundreds of small glyphs for zero reuse value -- the measured 8K atlas
+    // thrash). Informational; expected nonzero on heavy typesetting.
+    int64_t cnt_glyph_uncached, stat_glyph_uncached;
+    // WP-H1b pre-fill mode for the glyph-cache allocator: never recycle a
+    // segment holding another pass's live glyphs (the current frame's working
+    // set); gc_refused reports that the allocator refused for that reason.
+    bool gc_no_recycle, gc_refused;
+    // WP-H1b: "this frame's sub/OSD state was cheap" (osd_render change_id
+    // unchanged from the previous presented frame -- empty or static subs).
+    // Only such frames run the idle pre-fill.
+    bool sub_state_cheap;
+    int64_t last_sub_change_id;
     bool first_frame_drawn;
     // Phase wall-times (ns) for the MSGL_V [slowframe] line; only computed when
     // MSGL_V is active. The phase start/end dump-stats events themselves come
@@ -351,6 +414,7 @@ struct gl_next_opts {
     int sub_glyph_atlas_height; // WP-A3 debug knob; 0 = default (see option below)
     int sub_present_guard_ms;   // WP-E3: overlay-build deadline; -1 auto, 0 off
     int sub_debug_stall_ms;     // WP-E3 debug: injected overlay-section sleep
+    int sub_prefill_budget_ms;  // WP-H1b: idle glyph pre-fill budget; 0 = off
     char **raw_opts;
 };
 
@@ -392,9 +456,11 @@ const struct m_sub_options gl_next_conf = {
         // rebuilt during playback (epoch-segmented eviction reclaims space), so
         // no mid-playback atlas realloc can stall the VO thread. Clamped to the
         // GPU's max 2D texture size. Bigger = more glyphs cached at once (fewer
-        // epoch advances) at a memory cost (NxN r8 bytes). The debug
-        // --sub-glyph-atlas-height override below still wins for tests.
-        {"sub-glyph-atlas-size", OPT_INT(sub_glyph_atlas_size), M_RANGE(1024, 16384)},
+        // epoch advances) at a memory cost (NxN r8 bytes). WP-H1d: 0 = auto
+        // (8192, or 16384 on 4K+ displays where the scaled working set
+        // overflows 8192^2). The debug --sub-glyph-atlas-height override
+        // below still wins for tests.
+        {"sub-glyph-atlas-size", OPT_INT(sub_glyph_atlas_size), M_RANGE(0, 16384)},
         // DEBUG/dev only: cap the GPU glyph atlas size (pixels) at creation.
         // 0 = default (GPU max, up to 16384). A small value (e.g. 256) shrinks
         // the atlas to N x N and forces glyph-atlas overflow / cache-flush storms
@@ -410,6 +476,12 @@ const struct m_sub_options gl_next_conf = {
         // (after the first guard checkpoint), so the guard can be exercised
         // deterministically in tests. Not for normal use.
         {"sub-debug-stall-ms", OPT_INT(sub_debug_stall_ms), M_RANGE(0, 10000)},
+        // WP-H1b: per-frame wall-clock budget (ms) for the idle GPU glyph
+        // pre-fill: on frames whose sub state didn't change, upcoming
+        // render-ahead frames' cache-miss glyphs are uploaded/rasterized
+        // into the atlas ahead of time, so the first frame of a dense event
+        // doesn't pay the whole atlas fill. 0 = off.
+        {"sub-prefill-budget-ms", OPT_INT(sub_prefill_budget_ms), M_RANGE(0, 20)},
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
     },
@@ -421,8 +493,9 @@ const struct m_sub_options gl_next_conf = {
         .image_subs_hdr_peak = 1000,
         .target_hint = -1,
         .target_hint_strict = true,
-        .sub_glyph_atlas_size = 8192,   // WP-E: 8192^2 r8 = 64 MiB
+        .sub_glyph_atlas_size = 0,      // WP-H1d: auto (8192; 16384 on 4K+)
         .sub_present_guard_ms = -1,     // WP-E3: auto (frame duration)
+        .sub_prefill_budget_ms = 3,     // WP-H1b: idle glyph pre-fill budget
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -922,7 +995,8 @@ static int blur_expand_pad(float sigma)
     return ((radius + 4) << level) - 4;
 }
 
-struct gpos { int ax, ay; };   // a glyph's position in the persistent atlas
+struct gpos { int ax, ay; int t; };   // a glyph's position; t=1: in the per-item
+                                      // transient store instead of the atlas
 
 // WP-E: an entry is live iff its generation still matches its segment's current
 // generation. A segment recycle bumps that generation, so all its entries become
@@ -945,52 +1019,106 @@ static void gcache_reset(struct priv *p)
     for (int s = 0; s < GC_SEGMENTS; s++) {
         p->gseg_gen[s] = 0;
         p->gseg_pass[s] = 0;
+        p->gseg_pin[s] = 0;
+        p->gseg_spanned[s] = false;
+        p->gseg_claim_wrap[s] = 0;
         p->gseg_count[s] = 0;
     }
+    p->gc_pass_wraps = 0;
 }
 
 // WP-E: allocate a ring slot for a glyph (padded nw x nh), recycling only the
 // segment(s) the glyph lands in when they still hold a previous pass's entries.
-// Never flushes; returns false (overcommit) iff the current pass has already
-// used the whole atlas and would have to overwrite its OWN just-placed glyphs.
+// Never flushes. WP-H1d: segments that must not be recycled right now -- ones
+// this pass cache-HIT into (their coverage is still to be composed), and, in
+// the pre-fill's no-recycle mode, any segment with live coverage -- are
+// SKIPPED: the cursor jumps past them and tries the next segment, so a hot
+// pinned segment (e.g. long-lived dialogue glyphs re-hit every frame) doesn't
+// wedge the ring and force every later placement into the transient store.
+// Returns false (overcommit -> the caller falls back to the transient store)
+// only when no segment can take the glyph this pass -- also covering the
+// historical case of a pass wrapping around onto its OWN placements.
 // On success returns the position and the glyph's home (top) segment.
 static bool gc_place(struct priv *p, int nw, int nh, int *gx, int *gy, int *seg)
 {
-    if (p->gsx + nw > p->gatlas_w) { p->gsy += p->growh; p->gsx = 0; p->growh = 0; }
-    if (p->gsy + nh > p->gatlas_h) {
-        if (nh > p->gatlas_h)
-            return false;                     // taller than the whole atlas: skip
-        p->gsy = 0; p->gsx = 0; p->growh = 0; // ring wrap back to the top
-    }
-    // Clamp both ends: gseg_h*gnsegs may be < gatlas_h (integer remainder), so a
-    // glyph in the last few rows would otherwise index a segment past gnsegs-1.
-    int s0 = MPMIN(p->gsy / p->gseg_h, p->gnsegs - 1);
-    int s1 = MPMIN((p->gsy + nh - 1) / p->gseg_h, p->gnsegs - 1);
-    // Claim/recycle every segment the glyph's rows touch. A segment already
-    // claimed by THIS pass is either being appended to (fine) or, once the pass
-    // has claimed every segment, a wrap-around re-entry into its own earlier
-    // glyphs -- which is the overcommit case (skip, never stall/overwrite).
-    for (int s = s0; s <= s1; s++) {
-        if (p->gseg_pass[s] == p->gc_pass) {
-            if (p->gc_pass_claims >= p->gnsegs)
-                return false;                 // wrapped onto our own glyphs: overcommit
-            continue;                         // appending within a claimed segment
+    if (nh > p->gatlas_h)
+        return false;                         // taller than the whole atlas
+    for (int attempt = 0; attempt < 2 * p->gnsegs + 2; attempt++) {
+        if (p->gsx + nw > p->gatlas_w) { p->gsy += p->growh; p->gsx = 0; p->growh = 0; }
+        if (p->gsy + nh > p->gatlas_h) {
+            p->gsy = 0; p->gsx = 0; p->growh = 0; // ring wrap back to the top
+            p->gc_pass_wraps++;
         }
-        if (p->gc_pass_claims >= p->gnsegs)
-            return false;                     // defensive: no unclaimed segment left
-        // recycle: evict this segment's (previous-pass) live entries in O(1)
-        p->cnt_gcache_evict_n += p->gseg_count[s];
-        p->gseg_count[s] = 0;
-        p->gseg_gen[s]++;
-        p->gseg_pass[s] = p->gc_pass;
-        p->gc_pass_claims++;
-        p->cnt_gcache_epoch_advance++;
+        // Clamp both ends: gseg_h*gnsegs may be < gatlas_h (integer remainder),
+        // so a glyph in the last few rows would otherwise index a segment past
+        // gnsegs-1.
+        int s0 = MPMIN(p->gsy / p->gseg_h, p->gnsegs - 1);
+        int s1 = MPMIN((p->gsy + nh - 1) / p->gseg_h, p->gnsegs - 1);
+        // First check every segment the glyph's rows touch; a protected one
+        // makes the cursor jump past it and retry (bounded by `attempt`).
+        int skip = -1;
+        for (int s = s0; s <= s1; s++) {
+            if (p->gseg_pass[s] == p->gc_pass) {
+                // Appending within a segment this pass claimed since the last
+                // ring wrap is fine (the cursor moves monotonically within
+                // it); re-entering a claim from BEFORE a wrap would overwrite
+                // this pass's OWN earlier placements (the historical
+                // overcommit case) -- skip it instead.
+                if (p->gseg_claim_wrap[s] != p->gc_pass_wraps) {
+                    skip = s;
+                    break;
+                }
+                continue;
+            }
+            // WP-H1b/H1d: the pre-fill's no-recycle mode may only claim
+            // segments whose rows hold NO live coverage: neither their own
+            // entries (gseg_count) nor the lower rows of glyphs tagged to an
+            // earlier segment (gseg_spanned -- those don't show in this
+            // segment's count, and rastering over them corrupted still-live
+            // cached glyphs).
+            if (p->gc_no_recycle && (p->gseg_count[s] > 0 || p->gseg_spanned[s])) {
+                skip = s;
+                break;
+            }
+            // WP-H1d: never recycle a segment this pass already cache-HIT
+            // into -- the hit's coverage is resolved into cpos[] but not yet
+            // composed, so evicting it would compose freshly rastered other-
+            // glyph data (one of the pressure corruption paths behind the
+            // missing-text artifact).
+            if (p->gseg_pin[s] == p->gc_pass && p->gseg_count[s] > 0) {
+                skip = s;
+                break;
+            }
+        }
+        if (skip >= 0) {
+            p->gsy = (skip + 1) * p->gseg_h;  // jump past the protected segment
+            p->gsx = 0;
+            p->growh = 0;
+            continue;
+        }
+        // Claim/recycle the spanned segments, then place at the cursor.
+        for (int s = s0; s <= s1; s++) {
+            if (p->gseg_pass[s] == p->gc_pass)
+                continue;                     // appending within a claimed segment
+            // recycle: evict this segment's (previous-pass) live entries in O(1)
+            p->cnt_gcache_evict_n += p->gseg_count[s];
+            p->gseg_count[s] = 0;
+            p->gseg_spanned[s] = false;       // its rows are free again (WP-H1d)
+            p->gseg_gen[s]++;
+            p->gseg_pass[s] = p->gc_pass;
+            p->gseg_claim_wrap[s] = p->gc_pass_wraps;
+            p->gc_pass_claims++;
+            p->cnt_gcache_epoch_advance++;
+        }
+        *gx = p->gsx; *gy = p->gsy; *seg = s0;
+        p->gsx += nw;
+        if (nh > p->growh) p->growh = nh;
+        p->gseg_count[s0]++;
+        for (int s = s0 + 1; s <= s1; s++)
+            p->gseg_spanned[s] = true;        // lower rows in use; see gseg_spanned
+        return true;
     }
-    *gx = p->gsx; *gy = p->gsy; *seg = s0;
-    p->gsx += nw;
-    if (nh > p->growh) p->growh = nh;
-    p->gseg_count[s0]++;
-    return true;
+    return false;                             // nowhere to place it this pass
 }
 #endif // HAVE_ASS_COMPOSITE_DEFERRED (resumes at gcache_reserve)
 
@@ -1025,13 +1153,44 @@ static inline bool sub_guard_expired(struct priv *p)
     return p->guard_abs && mp_time_ns() > p->guard_abs;
 }
 
+// WP-H1c: (w, h) floor for the legacy-overlay textures (the packed-atlas
+// fallback path: OSD, image subs, non-deferred libass), derived from the
+// display size instead of the historical fixed 2048 -- at 8K the first OSD
+// overlay's packed_w/h exceeds 2048 and used to recreate the texture
+// mid-playback (the measured tex-realloc=1..2 per scene). Width is the next
+// power of two >= the display width because the bitmap packer's internal
+// atlas width grows in powers of two and a row can fill up to it, so
+// packed_w may exceed the display width; height uses the display height
+// (256-aligned) -- packed_h is the packer's USED height, bounded by the
+// (screen-clipped) part areas. Both keep the old 2048 minimum so sub-4K
+// displays behave exactly as before, and are capped by the GPU limit. A
+// truly oversized overlay still grows once via the counted fallback.
+static void overlay_tex_floor(struct priv *p, int *fw, int *fh)
+{
+    int maxd = p->gpu ? p->gpu->limits.max_tex_2d_dim : 2048;
+    int w = 2048;
+    while (w < p->osd_res.w && w * 2 <= maxd)
+        w <<= 1;
+    int h = MPMAX(2048, (p->osd_res.h + 255) & ~255);
+    *fw = MPMIN(w, maxd);
+    *fh = MPMIN(h, maxd);
+}
+
 #if HAVE_ASS_COMPOSITE_DEFERRED
 // Reserve a glyph's slot in the persistent atlas. Cache hit (live entry, same
 // size): *upload stays false. Miss: a ring slot is allocated + the id inserted,
 // *upload set true (the caller uploads/rasterizes the pixels). Returns false
-// only when the glyph is skipped this pass (bigger than the atlas, or overcommit
-// -- the current item's working set exceeded the whole atlas); the caller counts
-// that and drops the glyph, never stalling.
+// only when no slot could be claimed this pass (bigger than the atlas, or
+// overcommit -- the current item's working set exceeded the whole atlas);
+// WP-H1d: the caller then falls back to the per-item transient store
+// (gc_trans_place) so the glyph is still drawn -- NEVER skipped (the old skip
+// was silent content loss). The overcommit counter thus now means "took the
+// lossless per-frame transient path for a big/overflow glyph" (proven pixel-
+// identical to CPU under atlas pressure), NOT content loss. Post-H1d it is an
+// ungated tuning signal in acceptance (INFO, not gated ==0): dense 8K signs
+// legitimately trip it; its only cost is per-frame re-raster, already gated by
+// the video-draw budget. Nonzero => raise --sub-glyph-atlas-size if any frames
+// are over budget.
 //
 // One open-addressed probe locates the id (if present) and the first reusable
 // (empty or stale) slot. Stale slots act as reusable tombstones that stay
@@ -1056,6 +1215,13 @@ static bool gcache_reserve(struct priv *p, uint64_t id, int w, int h,
     if (found >= 0) {
         struct gcache_slot *s = &p->gcache[found];
         if (gc_slot_live(p, s) && s->w == w && s->h == h) {
+            // WP-H1d: pin every segment the hit's rows span for this pass, so
+            // a later placement can't recycle the coverage out from under the
+            // pending compose (gc_place refuses and overflows transiently).
+            int ps0 = MPMIN(s->ay / p->gseg_h, p->gnsegs - 1);
+            int ps1 = MPMIN((s->ay + h) / p->gseg_h, p->gnsegs - 1);
+            for (int ps = ps0; ps <= ps1; ps++)
+                p->gseg_pin[ps] = p->gc_pass;
             out->ax = s->ax; out->ay = s->ay;
             return true;                                          // live cache hit
         }
@@ -1063,17 +1229,94 @@ static bool gcache_reserve(struct priv *p, uint64_t id, int w, int h,
     }
     int nw = w + 1, nh = h + 1;      // 1px pad against bilinear bleed
     if (nw > p->gatlas_w || nh > p->gatlas_h || reuse < 0) {
+        if (p->gc_no_recycle) {      // WP-H1b: a refused pre-fill isn't overcommit
+            p->gc_refused = true;
+            return false;
+        }
         p->cnt_gcache_overcommit++;  // bigger than atlas, or table genuinely full
         return false;
     }
     int gx, gy, seg;
     if (!gc_place(p, nw, nh, &gx, &gy, &seg)) {
+        if (p->gc_no_recycle) {      // WP-H1b: atlas tight; leave it to the frame
+            p->gc_refused = true;
+            return false;
+        }
         p->cnt_gcache_overcommit++;  // ring exhausted this pass: skip (never stall)
         return false;
     }
     p->gcache[reuse] = (struct gcache_slot){ id, gx, gy, w, h, p->gseg_gen[seg], seg };
     out->ax = gx; out->ay = gy;
     *upload = true;
+    return true;
+}
+
+// WP-H1d cache admission policy: giant glyphs are never cached. A single
+// 8K-scaled sign glyph can cover more area than several eviction segments;
+// admitting it evicts hundreds of small (dialogue) glyphs for near-zero reuse
+// value -- the measured 8K acceptance runs thrashed the atlas with thousands
+// of epoch advances per scene. Anything above 1/64 of the atlas area goes to
+// the per-item transient store instead (re-rasterized each frame; the GPU
+// raster is cheap and the historical cache-less raster config already met
+// budget).
+static bool gc_cacheable(struct priv *p, int w, int h)
+{
+    return (int64_t) (w + 1) * (h + 1) <=
+           (int64_t) p->gatlas_w * p->gatlas_h / 64;
+}
+
+// WP-H1d: allocate a slot in the per-item transient store (uncached and
+// overflow glyphs; see priv.trans_atlas). Shelf packing; the cursor is reset
+// at the start of every compose item. Grows the texture on demand (counted
+// via tex-realloc -- it is pre-created at warm-up so this should never fire
+// in normal playback; growth happens before the item's raster/upload flush,
+// so no already-flushed coverage is lost). Only fails when a single item
+// needs more transient area than the GPU's max texture allows (> 8x the 8K
+// screen area of uncached coverage) -- unreachable for real content.
+static bool gc_trans_place(struct priv *p, int w, int h, struct gpos *out)
+{
+    pl_gpu gpu = p->gpu;
+    pl_fmt r8 = p->osd_fmt[SUBBITMAP_LIBASS];
+    int maxd = gpu->limits.max_tex_2d_dim;
+    int nw = w + 1, nh = h + 1;          // 1px pad against bilinear bleed
+    if (!r8 || nw > maxd || nh > maxd)
+        return false;
+    int tw = p->trans_atlas ? p->trans_atlas->params.w : 0;
+    int th = p->trans_atlas ? p->trans_atlas->params.h : 0;
+    if (p->tr_x + nw > tw) {             // shelf advance
+        p->tr_y += p->tr_rowh;
+        p->tr_x = 0;
+        p->tr_rowh = 0;
+    }
+    if (nw > tw || p->tr_y + nh > th) {
+        // Grow: width at least the atlas width (and this glyph; 4096 minimum
+        // so a debug-shrunk atlas doesn't force a needle-thin store), height
+        // to fit the current shelf; both doubled up to the GPU limit so
+        // growth is O(log) over a scene.
+        int target_w = MPMIN(MPMAX(MPMAX(p->gatlas_w, nw), 4096), maxd);
+        int want_w = tw, want_h = th;
+        while (want_w < target_w)
+            want_w = want_w ? MPMIN(want_w * 2, maxd) : target_w;
+        while (want_h < p->tr_y + nh) {
+            if (want_h >= maxd)
+                return false;            // theoretical bound; see above
+            want_h = want_h ? MPMIN(want_h * 2, maxd) : 2048;
+        }
+#if HAVE_ASS_OUTLINE_DEFERRED
+        const bool storable = true;      // the raster batch writes coverage here
+#else
+        const bool storable = false;
+#endif
+        if (!gc_ensure(gpu, &p->trans_atlas, r8, want_w, want_h,
+                       storable, true, false, false, true))
+            return false;
+        vo_alloc_bump(p, &p->cnt_tex_realloc);
+    }
+    out->ax = p->tr_x;
+    out->ay = p->tr_y;
+    out->t = 1;
+    p->tr_x += nw;
+    p->tr_rowh = MPMAX(p->tr_rowh, nh);
     return true;
 }
 
@@ -1112,9 +1355,14 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
         // Glyph coverage (b->w x b->h) is at the capped render resolution; place
         // it in the run accumulator in that same capped space (gs scales the
         // display-space part position down to it).
+        if (cpos[parts[k]].t < 0)
+            continue;   // unplaceable (theoretical; see gc_trans_place)
         int dx = lrint(b->x * gs) - r->x0 + r->margin;
         int dy = lrint(b->y * gs) - r->y0 + r->margin;
-        osd_combine_part(p, p->glyph_atlas, p->run_acc, cpos[parts[k]].ax,
+        // WP-H1d: uncached/overflow glyphs live in the per-item transient
+        // store instead of the persistent atlas.
+        pl_tex src = cpos[parts[k]].t > 0 ? p->trans_atlas : p->glyph_atlas;
+        osd_combine_part(p, src, p->run_acc, cpos[parts[k]].ax,
                          cpos[parts[k]].ay, dx, dy, b->w, b->h);
     }
     osd_unop(p, p->run_acc, cov, bw, bh, "acc", false, "dst", osd_resolve_body);
@@ -1240,14 +1488,17 @@ static const char *const osd_raster_body =
     "imageStore(dst, ivec2(ax+tx+lx, ay+ty+ly), vec4(float(cov)/255.0, 0.0, 0.0, 0.0));\n";
 
 // Rasterize ALL collected glyphs in one dispatch: ntiles 16x16 work-list tiles.
-static void gc_raster_batch(struct priv *p, int ntiles)
+// dst is the persistent glyph atlas for cache misses, or the per-item
+// transient store for uncached/overflow glyphs (WP-H1d) -- same pipeline
+// (compilation is keyed by the GLSL, not the bound object).
+static void gc_raster_batch(struct priv *p, int ntiles, pl_tex dst)
 {
     int ew = EDGE_TEX_W, ww = WORK_TEX_W;
     int gridx = MPMIN(ntiles, 32768), gridy = (ntiles + gridx - 1) / gridx;
     pl_shader sh = pl_dispatch_begin(p->osd_dp);
     struct pl_shader_desc descs[] = {
         { .desc = { .name = "dst", .type = PL_DESC_STORAGE_IMG, .binding = 0,
-                    .access = PL_DESC_ACCESS_WRITEONLY }, .binding = { .object = p->glyph_atlas } },
+                    .access = PL_DESC_ACCESS_WRITEONLY }, .binding = { .object = dst } },
         { .desc = { .name = "edges", .type = PL_DESC_SAMPLED_TEX, .binding = 1 },
           .binding = { .object = p->edge_tex } },
         { .desc = { .name = "work", .type = PL_DESC_SAMPLED_TEX, .binding = 2 },
@@ -1363,9 +1614,11 @@ static void gc_be_blur(struct priv *p, pl_tex res, pl_tex tmp,
         osd_copy(p, cur, res, ax, ay, bw, bh);
 }
 
-// A vector-\clip mask, rasterized into the glyph atlas (like a glyph) at (ax,ay)
-// and corresponding to screen origin (sx,sy); multiply a run's coverage by it.
-struct clipmask { uint32_t id; int ax, ay, sx, sy, w, h, inv; };
+// A vector-\clip mask, rasterized like a glyph at (ax,ay) -- into the glyph
+// atlas, or the per-item transient store when uncached/overflow (t=1; screen-
+// sized masks usually are, WP-H1d) -- with screen origin (sx,sy); multiply a
+// run's coverage by it.
+struct clipmask { uint32_t id; int ax, ay, sx, sy, w, h, inv, t; };
 
 // Integer-exact vs libass's CPU clip multiply (ass_mul_bitmaps_c /
 // ass_imul_bitmaps_c): out = (cov * mask + 255) >> 8, inverse uses 255-mask.
@@ -1393,7 +1646,7 @@ static void gc_clip_mult(struct priv *p, pl_tex cov, int bw, int bh,
         { .desc = { .name = "cov", .type = PL_DESC_STORAGE_IMG, .binding = 0,
                     .access = PL_DESC_ACCESS_READWRITE }, .binding = { .object = cov } },
         { .desc = { .name = "mask", .type = PL_DESC_SAMPLED_TEX, .binding = 1 },
-          .binding = { .object = p->glyph_atlas } },
+          .binding = { .object = cm->t ? p->trans_atlas : p->glyph_atlas } },
     };
     struct pl_shader_var vars[] = {
         { .var = pl_var_int("bw"), .data = &bw }, { .var = pl_var_int("bh"), .data = &bh },
@@ -1497,9 +1750,17 @@ static bool gc_ensure_atlas(struct priv *p)
     pl_fmt r8 = p->osd_fmt[SUBBITMAP_LIBASS];
     if (!r8)
         return false;
-    int want = p->next_opts->sub_glyph_atlas_size;   // WP-E option (default 8192)
-    if (want <= 0)
-        want = 8192;
+    int want = p->next_opts->sub_glyph_atlas_size;   // WP-E option (0 = auto)
+    if (want <= 0) {
+        // WP-H1d auto default: 8192^2 r8 (64 MiB), but 16384^2 (256 MiB) on
+        // 4K+ displays -- glyph dimensions scale with the output size, and
+        // the 8K-scaled small/medium working set (dialogue + typical signs;
+        // giant glyphs are not cached, see gc_cacheable) overflows an
+        // 8192^2 atlas, which thrashed it (thousands of epoch advances per
+        // scene) and overflowed into per-frame fallbacks.
+        bool big = p->osd_res.w >= 3840 || p->osd_res.h >= 2160;
+        want = big ? 16384 : 8192;
+    }
     want = MPMIN(want, gpu->limits.max_tex_2d_dim);
     p->gatlas_w = p->gatlas_h = want;
     // WP-A3 debug override (--sub-glyph-atlas-height): shrink the atlas so tests
@@ -1533,6 +1794,69 @@ static bool gc_ensure_atlas(struct priv *p)
     return true;
 }
 
+// WP-H1c: per-buffer floor for the legacy-overlay async upload ring, derived
+// from the display size (packed atlas bytes scale with resolution: the ring
+// stages one frame's packed r8/bgra atlas, whose dims scale with the output).
+// A quarter of the floor-texture area covers a full-floor-width r8 band over
+// a quarter of the display height -- comfortably above the heaviest realistic
+// OSD/legacy atlas at that resolution (~2x margin over an --osd-level=3 +
+// stats-page frame) without ballooning the NUM_OVERLAY_BUFS-deep ring; the
+// historical 8 MiB stays as the minimum (sub-4K displays are unchanged) and
+// the counted grow path remains for pathological frames.
+static size_t overlay_buf_floor(struct priv *p)
+{
+    int fw, fh;
+    overlay_tex_floor(p, &fw, &fh);
+    size_t want = MPMAX((size_t) OVERLAY_BUF_MAX_BYTES, (size_t) fw * fh / 4);
+    return (want + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
+}
+
+// WP-H1c: (re)create the legacy overlay texture pool and the overlay upload
+// ring at the current display-derived floor. Called from gc_warmup and again
+// on every reconfig -- i.e. BEFORE playback of the (new) stream, never
+// mid-playback -- so a display-size change re-floors everything while the hot
+// path's pl_tex_recreate / size checks still no-op on the popped objects.
+// The pool holds floor-sized textures with the hot path's exact params; WP-E3
+// double-buffers the overlay state, so two concurrent legacy entries need 4.
+static void ensure_overlay_pool(struct priv *p)
+{
+    pl_gpu gpu = p->gpu;
+    if (!gpu)
+        return;
+    size_t bfloor = overlay_buf_floor(p);
+    for (int i = 0; i < NUM_OVERLAY_BUFS; i++) {
+        if (!p->overlay_bufs[i] || p->overlay_bufs[i]->params.size < bfloor)
+            pl_buf_recreate(gpu, &p->overlay_bufs[i],
+                            pl_buf_params(.size = bfloor, .host_writable = true));
+    }
+    pl_fmt r8 = p->osd_fmt[SUBBITMAP_LIBASS];
+    if (!r8)
+        return;
+    int fw, fh;
+    overlay_tex_floor(p, &fw, &fh);
+    // Drop pooled (unpopped) textures below the floor; textures already
+    // popped into entries keep working and only grow through the counted
+    // path if content actually outgrows them.
+    for (int i = p->num_sub_tex - 1; i >= 0; i--) {
+        if (p->sub_tex[i]->params.w < fw || p->sub_tex[i]->params.h < fh) {
+            pl_tex_destroy(gpu, &p->sub_tex[i]);
+            MP_TARRAY_REMOVE_AT(p->sub_tex, p->num_sub_tex, i);
+        }
+    }
+    while (p->num_sub_tex < 4) {
+        pl_tex t = pl_tex_create(gpu, &(struct pl_tex_params) {
+            .format = r8,
+            .w = fw,
+            .h = fh,
+            .host_writable = true,
+            .sampleable = true,
+        });
+        if (!t)
+            break;
+        MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, t);
+    }
+}
+
 // WP-E (E1.2/E1.3/E4a): one-time, config-time cold-start warm-up, run OFF the hot
 // path before playback. (a) create the glyph atlas at full size, (b) preallocate
 // the upload rings at their worst-frame max so staging-grow/overlay-buf-grow stay
@@ -1554,16 +1878,33 @@ static void gc_warmup(struct priv *p)
     // (a) atlas + id table + segment epochs (created once, never rebuilt).
     gc_ensure_atlas(p);
 
+    // WP-H1d: pre-create the per-item transient store for uncached/overflow
+    // glyphs at the atlas dimensions (one frame's worth of giant-sign
+    // coverage; at 8K a handful of screen-scale glyphs is ~100Mpx, within a
+    // 16384x16384 store), so no giant-glyph frame pays the allocation
+    // mid-playback (gc_trans_place still grows it, counted, if a frame
+    // needs even more).
+    if (p->glyph_atlas) {
+        pl_fmt tr8 = p->osd_fmt[SUBBITMAP_LIBASS];
+#if HAVE_ASS_OUTLINE_DEFERRED
+        const bool tr_storable = true;
+#else
+        const bool tr_storable = false;
+#endif
+        if (tr8)
+            gc_ensure(gpu, &p->trans_atlas, tr8, p->gatlas_w, p->gatlas_h,
+                      tr_storable, true, false, false, true);
+    }
+
     // (b) preallocate the async upload rings at their worst-frame maxima. The hot
     // path only (re)creates a ring when it's too small, so with these in place
     // staging-grow / overlay-buf-grow can no longer fire in normal playback (the
     // grow paths stay as counted safety fallbacks for pathological frames).
+    // WP-H1c: the overlay ring + legacy pool textures are display-size-derived
+    // and re-floored on every reconfig (ensure_overlay_pool below).
     for (int i = 0; i < 3; i++)
         pl_buf_recreate(gpu, &p->glyph_stage[i],
                         pl_buf_params(.size = GLYPH_STAGE_MAX_BYTES, .host_writable = true));
-    for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
-        pl_buf_recreate(gpu, &p->overlay_bufs[i],
-                        pl_buf_params(.size = OVERLAY_BUF_MAX_BYTES, .host_writable = true));
 
     // (c)+(d) warm-up scratch, sized to a representative run so the first real
     // frame rarely regrows them (they grow monotonically; not a full flush).
@@ -1621,7 +1962,7 @@ static void gc_warmup(struct priv *p)
         pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->work_tex,
             .rc = { .x1 = WORK_TEX_W, .y1 = 1 },
             .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = (void *) zeros));
-        gc_raster_batch(p, 1);                                          (*n)++;
+        gc_raster_batch(p, 1, p->glyph_atlas);                          (*n)++;
     }
 #endif
     // (d) touch the glyph atlas with a 1px host upload so it's fully resident.
@@ -1630,31 +1971,142 @@ static void gc_warmup(struct priv *p)
         pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
             .rc = { .x1 = 1, .y1 = 1 }, .row_pitch = 1, .ptr = (void *) &px));
     }
-    // (e) legacy overlay texture pool: the packed-atlas path (fallback parts,
-    // image subs) allocates a per-entry texture on first use -- which lands at
-    // the first subtitle event, mid-playback, and counts as a VO-thread alloc.
-    // Pre-create floor-sized pool textures with the exact params the hot path
-    // uses, so its pl_tex_recreate no-ops on the popped texture. WP-E3: the
-    // present guard double-buffers the overlay state, so each in-use entry
-    // needs TWO pool textures (one per ping-pong buffer); stock 4 to cover
-    // two concurrent legacy entries without a mid-playback alloc.
-    if (r8) {
-        int fl = MPMIN(2048, gpu->limits.max_tex_2d_dim);
-        while (p->num_sub_tex < 4) {
-            pl_tex t = pl_tex_create(gpu, &(struct pl_tex_params) {
-                .format = r8,
-                .w = fl,
-                .h = fl,
-                .host_writable = true,
-                .sampleable = true,
-            });
-            if (!t)
-                break;
-            MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, t);
-        }
-    }
+    // (e) legacy overlay texture pool + overlay upload ring, floored to the
+    // display size (WP-H1c; see ensure_overlay_pool).
+    ensure_overlay_pool(p);
     // Force all compiles + uploads to finish now, before playback starts.
     pl_gpu_finish(gpu);
+}
+
+// A pending glyph-atlas upload (non-outline cache miss): the glyph's slot and
+// its source pixels in the item's packed image.
+struct gmiss { int ax, ay, w, h; const uint8_t *src; };
+
+#if HAVE_ASS_OUTLINE_DEFERRED
+// A pending outline-mode raster job: the glyph's atlas slot plus its
+// tile-export blob's tiles (segments already appended to p->ebuf at sbase).
+struct rjob { int ax, ay, w, h, sbase, nt; const float *tiles; };
+
+// Upload the shared CPU segment pool (p->ebuf, filled by the resolve loops)
+// to edge_tex. Done once per flush round, before the per-target raster
+// dispatches (persistent atlas and, WP-H1d, the transient store share it).
+static bool gc_flush_edges(struct priv *p, int ne)
+{
+    pl_gpu gpu = p->gpu;
+    int seg_texels = ne * 2;                                // 2 rgba32f texels per segment
+    int eh = (seg_texels + EDGE_TEX_W - 1) / EDGE_TEX_W;
+    size_t eneed = (size_t) EDGE_TEX_W * eh * 4;
+    if ((size_t) p->ebuf_cap < eneed) {
+        p->ebuf_cap = eneed;
+        p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+    }
+    pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
+    if (!ef || !gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true,
+                          false, false, true))
+        return false;
+    pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
+        .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
+        .row_pitch = (size_t) EDGE_TEX_W * 4 * sizeof(float), .ptr = p->ebuf));
+    return true;
+}
+
+// Rasterize queued outline-mode raster jobs into dst: build the per-tile
+// work-list (one 16x16 tile = one workgroup), then ONE batched dispatch.
+// Shared by compose_glyph_runs (current frame, both atlases) and the WP-H1b
+// idle pre-fill (persistent atlas only). gc_flush_edges must have run.
+static void gc_flush_raster(struct priv *p, struct rjob *rjobs, int nrjobs,
+                            pl_tex dst)
+{
+    pl_gpu gpu = p->gpu;
+    stats_time_start(p->stats, "sub-raster");   // work-list build + dispatch
+    // 4 texels per tile:
+    // [ax,ay,tx,ty] [w,h,ng,_] group0[type,wind,segoff,cnt] group1[...]
+    int ntiles = 0;
+    for (int j = 0; j < nrjobs; j++)
+        ntiles += rjobs[j].nt;
+    int wh = (4 * ntiles + WORK_TEX_W - 1) / WORK_TEX_W;
+    size_t wneed = (size_t) WORK_TEX_W * wh * 4;
+    if ((size_t) p->wbuf_cap < wneed) {
+        p->wbuf_cap = wneed;
+        p->wbuf = talloc_realloc(p, p->wbuf, float, p->wbuf_cap);
+    }
+    int ti = 0;
+    for (int j = 0; j < nrjobs; j++) {
+        struct rjob *r = &rjobs[j];
+        for (int t = 0; t < r->nt; t++) {
+            const float *T = r->tiles + (size_t) t * TILE_EXPORT_W;  // tx,ty,ng,g0[4],g1[4]
+            float *w0 = &p->wbuf[(4 * ti) * 4];
+            int ng = (int) T[2];
+            w0[0]=r->ax; w0[1]=r->ay; w0[2]=T[0]; w0[3]=T[1];        // ax,ay,tx,ty
+            w0[4]=r->w;  w0[5]=r->h;  w0[6]=T[2]; w0[7]=0;           // w,h,ng
+            w0[8]=T[3];  w0[9]=T[4];  w0[10]=T[5]+r->sbase; w0[11]=T[6];   // group0
+            if (ng >= 2) { w0[12]=T[7]; w0[13]=T[8]; w0[14]=T[9]+r->sbase; w0[15]=T[10]; }
+            else { w0[12]=-1; w0[13]=w0[14]=w0[15]=0; }
+            ti++;
+        }
+    }
+    if (gc_ensure(gpu, &p->work_tex, pl_find_named_fmt(gpu, "rgba32f"),
+                  WORK_TEX_W, wh, false, true, false, false, true)) {
+        pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->work_tex,
+            .rc = { .x1 = WORK_TEX_W, .y1 = wh },
+            .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = p->wbuf));
+        gc_raster_batch(p, ntiles, dst);
+        p->cnt_raster_dispatches++;
+        p->cnt_raster_tiles += ntiles;
+    }
+    stats_time_end(p->stats, "sub-raster");
+}
+#endif // HAVE_ASS_OUTLINE_DEFERRED
+
+// Flush queued glyph upload misses into dst (the persistent atlas, or WP-H1d
+// the per-item transient store): tight-repack into a CPU scratch, one async
+// buffer write, then per-glyph async texture uploads (buffer-backed = no
+// VO-thread stall). Shared by compose_glyph_runs and the WP-H1b idle pre-fill.
+static void gc_flush_misses(struct priv *p, struct gmiss *miss, int nmiss,
+                            size_t miss_bytes, ptrdiff_t pstride, pl_tex dst)
+{
+    pl_gpu gpu = p->gpu;
+    stats_time_start(p->stats, "sub-upload");   // WP-A3: glyph atlas upload
+    if (p->gstage_cpu_sz < miss_bytes) {
+        p->gstage_cpu = talloc_realloc(p, p->gstage_cpu, uint8_t, miss_bytes);
+        p->gstage_cpu_sz = miss_bytes;
+    }
+    pl_buf *ring = &p->glyph_stage[p->glyph_stage_idx++ % 3];
+    bool buf_ok = (*ring) && (*ring)->params.size >= miss_bytes;
+    if (!buf_ok) {
+        size_t want = (miss_bytes + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);
+        buf_ok = pl_buf_recreate(gpu, ring,
+                                 pl_buf_params(.size = want, .host_writable = true));
+        vo_alloc_bump(p, &p->cnt_staging_grow);   // WP-A3: glyph staging grow
+    }
+    size_t off = 0;
+    size_t *offs = talloc_array(NULL, size_t, nmiss);
+    for (int m = 0; m < nmiss; m++) {           // repack tight into the scratch
+        struct gmiss *g = &miss[m];
+        offs[m] = off;
+        for (int row = 0; row < g->h; row++)
+            memcpy(p->gstage_cpu + off + (size_t) row * g->w,
+                   g->src + (ptrdiff_t) row * pstride, g->w);
+        off += (size_t) g->w * g->h;
+    }
+    if (buf_ok) {
+        pl_buf_write(gpu, *ring, 0, p->gstage_cpu, miss_bytes);
+        for (int m = 0; m < nmiss; m++) {
+            struct gmiss *g = &miss[m];
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = dst,
+                .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
+                .row_pitch = g->w, .buf = *ring, .buf_offset = offs[m]));
+        }
+    } else {                                    // fallback: synchronous
+        for (int m = 0; m < nmiss; m++) {
+            struct gmiss *g = &miss[m];
+            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = dst,
+                .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
+                .row_pitch = g->w, .ptr = p->gstage_cpu + offs[m]));
+        }
+    }
+    talloc_free(offs);
+    stats_time_end(p->stats, "sub-upload");
 }
 
 // Composite a SUBBITMAP_LIBASS_GLYPHS item: reproduce libass's per-run combine
@@ -1710,10 +2162,15 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         return false;
     // WP-E: each compose item is one eviction "pass". A segment claimed earlier
     // in this pass is never recycled mid-pass, so a glyph resolved into cpos[]
-    // here stays valid through this item's raster+composite below (overcommit
-    // skips extra glyphs instead of overwriting already-placed ones).
+    // here stays valid through this item's raster+composite below (WP-H1d:
+    // extra glyphs overflow into the per-item transient store instead of
+    // overwriting already-placed ones -- or being skipped).
     p->gc_pass++;
     p->gc_pass_claims = 0;
+    p->gc_pass_wraps = 0;
+    // WP-H1d: the transient store is per-item; its content from the previous
+    // item was consumed by that item's composes.
+    p->tr_x = p->tr_y = p->tr_rowh = 0;
 
     void *tmp = talloc_new(NULL);
 
@@ -1726,14 +2183,16 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // the cached coverage untouched).
     bool is_outline = item->format == SUBBITMAP_LIBASS_OUTLINES;
     struct gpos *cpos = talloc_array(tmp, struct gpos, item->num_parts);
-    struct gmiss { int ax, ay, w, h; const uint8_t *src; };
-    struct gmiss *miss = NULL;
-    int nmiss = 0;
-    size_t miss_bytes = 0;
+    // Pending uploads/raster jobs, split by destination: the persistent atlas
+    // (cache misses) vs the per-item transient store (WP-H1d: uncached giants
+    // + overflow -- never skipped).
+    struct gmiss *miss = NULL, *tmiss = NULL;
+    int nmiss = 0, ntmiss = 0;
+    size_t miss_bytes = 0, tmiss_bytes = 0;
 #if HAVE_ASS_OUTLINE_DEFERRED
-    // outline raster jobs: per missed glyph, its atlas slot + the blob's tiles
-    struct rjob { int ax, ay, w, h, sbase, nt; const float *tiles; } *rjobs = NULL;
-    int nrjobs = 0, ne = 0;                  // ne = pooled segments (2 texels each)
+    // outline raster jobs: per missed glyph, its slot + the blob's tiles
+    struct rjob *rjobs = NULL, *trjobs = NULL;
+    int nrjobs = 0, ntrjobs = 0, ne = 0;     // ne = pooled segments (2 texels each)
     // Vector-\clip masks found in this item: rasterized like glyphs, then used
     // to multiply each clipped run's coverage (gc_outline_features).
     struct clipmask *clips = NULL;
@@ -1741,18 +2200,37 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 #endif
     ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
     // WP-E: resolve each glyph via the epoch-evicting cache (gc_place). A miss
-    // recycles at most one ring segment (bounded); nothing full-flushes. On skip
-    // (glyph bigger than the atlas, or this item overcommitting the whole atlas)
-    // gcache_reserve counts it and we drop that glyph -- never a stall, never a
-    // rebuild retry (the old atlas-overflow gc_restart path is gone).
+    // recycles at most one ring segment (bounded); nothing full-flushes.
+    // WP-H1d: a glyph the cache does not admit (above the size cap) or cannot
+    // place (this item overcommitting the whole atlas; counted in
+    // gcache_reserve) goes to the per-item transient store and is re-
+    // rasterized/uploaded THIS frame -- never dropped. The old skip left
+    // cpos at {0,0}, so affected runs composed whatever lived at the atlas
+    // origin: wrong-glyph garbage or missing text, varying with eviction
+    // history (the "signs without their text" 8K artifact).
     for (int i = 0; i < item->num_parts; i++) {
         const struct sub_bitmap *b = &item->parts[i];
-        cpos[i] = (struct gpos){0, 0};
+        cpos[i] = (struct gpos){0, 0, 0};
         if (b->libass.glyph_id == 0)
             continue;
-        bool up;
-        if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &cpos[i], &up))
-            continue;   // skipped this pass (overcommit); counted in gcache_reserve
+        bool up = false;
+        bool placed = gc_cacheable(p, b->w, b->h) &&
+                      gcache_reserve(p, b->libass.glyph_id, b->w, b->h,
+                                     &cpos[i], &up);
+        if (!placed) {
+            if (!gc_trans_place(p, b->w, b->h, &cpos[i])) {
+                // Theoretical bound (> max-texture transient demand): make
+                // the glyph invisible rather than compose garbage, and let
+                // the acceptance gate catch it.
+                cpos[i].t = -1;
+                p->cnt_gcache_overcommit++;
+                continue;
+            }
+            if (!gc_cacheable(p, b->w, b->h))
+                p->cnt_glyph_uncached++;  // policy (giant glyph); allocator
+                                          // overflow was counted as overcommit
+            up = true;                    // transient content is per-item
+        }
 #if HAVE_ASS_OUTLINE_DEFERRED
         if (b->libass.run_flags & RUN_FLAG_CLIP_MASK) {
             // Record the mask (rasterized below like a glyph on a miss). Its
@@ -1761,7 +2239,7 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             MP_TARRAY_APPEND(tmp, clips, nclips, ((struct clipmask){
                 b->libass.run_id, cpos[i].ax, cpos[i].ay,
                 (int) lrint(b->x * gs), (int) lrint(b->y * gs), b->w, b->h,
-                !!(b->libass.run_flags & RUN_FLAG_CLIP_INVERSE) }));
+                !!(b->libass.run_flags & RUN_FLAG_CLIP_INVERSE), cpos[i].t }));
         }
         if (up && is_outline) {
             // libass tile-export blob: [n_tiles, n_segs, tiles(11f), segs(8f)].
@@ -1779,8 +2257,12 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             }
             memcpy(p->ebuf + (size_t) ne * SEG_EXPORT_W, gsegs,
                    (size_t) ns * SEG_EXPORT_W * sizeof(float));
-            MP_TARRAY_APPEND(tmp, rjobs, nrjobs,
-                ((struct rjob){ cpos[i].ax, cpos[i].ay, b->w, b->h, ne, nt, gtiles }));
+            struct rjob rj = { cpos[i].ax, cpos[i].ay, b->w, b->h, ne, nt, gtiles };
+            if (cpos[i].t) {
+                MP_TARRAY_APPEND(tmp, trjobs, ntrjobs, rj);
+            } else {
+                MP_TARRAY_APPEND(tmp, rjobs, nrjobs, rj);
+            }
             ne += ns;
             continue;
         }
@@ -1788,111 +2270,33 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         if (up) {
             const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
                                 + (ptrdiff_t) b->src_y * pstride + b->src_x;
-            MP_TARRAY_APPEND(tmp, miss, nmiss,
-                ((struct gmiss){ cpos[i].ax, cpos[i].ay, b->w, b->h, gsrc }));
-            miss_bytes += (size_t) b->w * b->h;
+            struct gmiss gm = { cpos[i].ax, cpos[i].ay, b->w, b->h, gsrc };
+            if (cpos[i].t) {
+                MP_TARRAY_APPEND(tmp, tmiss, ntmiss, gm);
+                tmiss_bytes += (size_t) b->w * b->h;
+            } else {
+                MP_TARRAY_APPEND(tmp, miss, nmiss, gm);
+                miss_bytes += (size_t) b->w * b->h;
+            }
         }
     }
 
 #if HAVE_ASS_OUTLINE_DEFERRED
-    // Rasterize the outline-mode misses: upload the segment pool + a per-tile
-    // work-list (one 16x16 tile = one workgroup), then ONE batched dispatch.
-    if (ne) {
-        stats_time_start(p->stats, "sub-raster");   // work-list build + dispatch
-        int seg_texels = ne * 2;                                // 2 rgba32f texels per segment
-        int eh = (seg_texels + EDGE_TEX_W - 1) / EDGE_TEX_W;
-        size_t eneed = (size_t) EDGE_TEX_W * eh * 4;
-        if ((size_t) p->ebuf_cap < eneed) {
-            p->ebuf_cap = eneed;
-            p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
-        }
-        // 4 texels per tile:
-        // [ax,ay,tx,ty] [w,h,ng,_] group0[type,wind,segoff,cnt] group1[...]
-        int ntiles = 0;
-        for (int j = 0; j < nrjobs; j++)
-            ntiles += rjobs[j].nt;
-        int wh = (4 * ntiles + WORK_TEX_W - 1) / WORK_TEX_W;
-        size_t wneed = (size_t) WORK_TEX_W * wh * 4;
-        if ((size_t) p->wbuf_cap < wneed) {
-            p->wbuf_cap = wneed;
-            p->wbuf = talloc_realloc(p, p->wbuf, float, p->wbuf_cap);
-        }
-        int ti = 0;
-        for (int j = 0; j < nrjobs; j++) {
-            struct rjob *r = &rjobs[j];
-            for (int t = 0; t < r->nt; t++) {
-                const float *T = r->tiles + (size_t) t * TILE_EXPORT_W;  // tx,ty,ng,g0[4],g1[4]
-                float *w0 = &p->wbuf[(4 * ti) * 4];
-                int ng = (int) T[2];
-                w0[0]=r->ax; w0[1]=r->ay; w0[2]=T[0]; w0[3]=T[1];        // ax,ay,tx,ty
-                w0[4]=r->w;  w0[5]=r->h;  w0[6]=T[2]; w0[7]=0;           // w,h,ng
-                w0[8]=T[3];  w0[9]=T[4];  w0[10]=T[5]+r->sbase; w0[11]=T[6];   // group0
-                if (ng >= 2) { w0[12]=T[7]; w0[13]=T[8]; w0[14]=T[9]+r->sbase; w0[15]=T[10]; }
-                else { w0[12]=-1; w0[13]=w0[14]=w0[15]=0; }
-                ti++;
-            }
-        }
-        pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
-        if (ef && gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true, false, false, true) &&
-                  gc_ensure(gpu, &p->work_tex, ef, WORK_TEX_W, wh, false, true, false, false, true)) {
-            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
-                .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
-                .row_pitch = (size_t) EDGE_TEX_W * 4 * sizeof(float), .ptr = p->ebuf));
-            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->work_tex,
-                .rc = { .x1 = WORK_TEX_W, .y1 = wh },
-                .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = p->wbuf));
-            gc_raster_batch(p, ntiles);
-            p->cnt_raster_dispatches++;
-            p->cnt_raster_tiles += ntiles;
-        }
-        stats_time_end(p->stats, "sub-raster");
+    // Rasterize the outline-mode misses: the shared segment pool once, then
+    // one batched dispatch per destination.
+    if (ne && gc_flush_edges(p, ne)) {
+        if (nrjobs)
+            gc_flush_raster(p, rjobs, nrjobs, p->glyph_atlas);
+        if (ntrjobs)
+            gc_flush_raster(p, trjobs, ntrjobs, p->trans_atlas);
     }
 #endif // HAVE_ASS_OUTLINE_DEFERRED
 
-    // Flush the misses: tight-repack into a CPU scratch, one async buffer write,
-    // then per-glyph async texture uploads (buffer-backed = no VO-thread stall).
-    if (nmiss) {
-        stats_time_start(p->stats, "sub-upload");   // WP-A3: glyph atlas upload
-        if (p->gstage_cpu_sz < miss_bytes) {
-            p->gstage_cpu = talloc_realloc(p, p->gstage_cpu, uint8_t, miss_bytes);
-            p->gstage_cpu_sz = miss_bytes;
-        }
-        pl_buf *ring = &p->glyph_stage[p->glyph_stage_idx++ % 3];
-        bool buf_ok = (*ring) && (*ring)->params.size >= miss_bytes;
-        if (!buf_ok) {
-            size_t want = (miss_bytes + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);
-            buf_ok = pl_buf_recreate(gpu, ring,
-                                     pl_buf_params(.size = want, .host_writable = true));
-            vo_alloc_bump(p, &p->cnt_staging_grow);   // WP-A3: glyph staging grow
-        }
-        size_t off = 0;
-        size_t *offs = talloc_array(tmp, size_t, nmiss);
-        for (int m = 0; m < nmiss; m++) {           // repack tight into the scratch
-            struct gmiss *g = &miss[m];
-            offs[m] = off;
-            for (int row = 0; row < g->h; row++)
-                memcpy(p->gstage_cpu + off + (size_t) row * g->w,
-                       g->src + (ptrdiff_t) row * pstride, g->w);
-            off += (size_t) g->w * g->h;
-        }
-        if (buf_ok) {
-            pl_buf_write(gpu, *ring, 0, p->gstage_cpu, miss_bytes);
-            for (int m = 0; m < nmiss; m++) {
-                struct gmiss *g = &miss[m];
-                pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
-                    .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
-                    .row_pitch = g->w, .buf = *ring, .buf_offset = offs[m]));
-            }
-        } else {                                    // fallback: synchronous
-            for (int m = 0; m < nmiss; m++) {
-                struct gmiss *g = &miss[m];
-                pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->glyph_atlas,
-                    .rc = { .x0 = g->ax, .y0 = g->ay, .x1 = g->ax + g->w, .y1 = g->ay + g->h },
-                    .row_pitch = g->w, .ptr = p->gstage_cpu + offs[m]));
-            }
-        }
-        stats_time_end(p->stats, "sub-upload");
-    }
+    // Flush the upload misses (async, buffer-backed).
+    if (nmiss)
+        gc_flush_misses(p, miss, nmiss, miss_bytes, pstride, p->glyph_atlas);
+    if (ntmiss)
+        gc_flush_misses(p, tmiss, ntmiss, tmiss_bytes, pstride, p->trans_atlas);
 
     // WP-E3 checkpoint: the miss flush is recorded (every claimed atlas slot
     // has its raster/upload in flight), so the glyph cache is consistent again
@@ -2159,6 +2563,153 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         ol->color = src->params.color;
     return true;
 }
+
+// WP-H1b: warm the glyph atlas for ONE upcoming render-ahead frame (a served
+// ring copy the VO hasn't drawn yet): resolve its deferred glyphs against the
+// cache and upload/rasterize the misses, exactly like the resolve+flush phase
+// of compose_glyph_runs but with nothing composed. Runs in no-recycle mode so
+// it can never evict the current frame's live glyphs (if the atlas is that
+// tight it refuses and the entry is treated as done -- the real frame handles
+// its misses with normal eviction). Budget: stop RESOLVING once deadline_ns
+// passes, but always flush what was reserved (a reserved slot whose pixels
+// are never written would cache-hit garbage forever -- same invariant as the
+// resolve->flush span in compose_glyph_runs). Returns true when the item
+// needs no further pre-fill passes; false = budget ran out mid-item (the
+// caller re-peeks it on a later frame; resolved glyphs then hit).
+static bool gc_prefill_item(struct priv *p, const struct sub_bitmaps *item,
+                            int64_t deadline_ns)
+{
+    bool is_outline = item->format == SUBBITMAP_LIBASS_OUTLINES;
+#if !HAVE_ASS_OUTLINE_DEFERRED
+    if (is_outline)
+        return true;
+#endif
+    ptrdiff_t pstride = 0;
+    if (!is_outline) {
+        if (!item->packed)
+            return true;
+        pstride = item->packed->stride[0];
+    }
+    if (!gc_ensure_atlas(p))
+        return true;
+
+    void *tmp = talloc_new(NULL);
+    // Same eviction-pass semantics as a real compose item (a segment claimed
+    // by this pass is never recycled mid-pass), plus no-recycle (see above).
+    p->gc_pass++;
+    p->gc_pass_claims = 0;
+    p->gc_pass_wraps = 0;
+    p->gc_no_recycle = true;
+    p->gc_refused = false;
+    struct gmiss *miss = NULL;
+    int nmiss = 0;
+    size_t miss_bytes = 0;
+#if HAVE_ASS_OUTLINE_DEFERRED
+    struct rjob *rjobs = NULL;
+    int nrjobs = 0, ne = 0;
+#endif
+    bool complete = true;
+    for (int i = 0; i < item->num_parts; i++) {
+        if ((i & 15) == 0 && mp_time_ns() > deadline_ns) {
+            complete = false;         // budget: stop resolving, flush, resume later
+            break;
+        }
+        const struct sub_bitmap *b = &item->parts[i];
+        if (b->libass.glyph_id == 0)
+            continue;
+        if (!gc_cacheable(p, b->w, b->h))
+            continue;                 // WP-H1d: giant glyphs are never cached --
+                                      // the frame rasterizes them transiently
+        bool up;
+        struct gpos pos;
+        if (!gcache_reserve(p, b->libass.glyph_id, b->w, b->h, &pos, &up)) {
+            if (p->gc_refused)
+                break;                // atlas tight: give up on this entry
+            continue;                 // table full: nothing to pre-fill
+        }
+        if (!up)
+            continue;                 // already resident
+#if HAVE_ASS_OUTLINE_DEFERRED
+        if (is_outline) {
+            // Queue the raster job (same blob unpacking as compose_glyph_runs).
+            const int32_t *blob = b->libass.outline;
+            if (!blob || b->libass.n_outline < 2)
+                continue;
+            int nt = blob[0], ns = blob[1];
+            const float *gtiles = (const float *)(blob + 2);
+            const float *gsegs  = (const float *)(blob + 2 + (size_t) nt * TILE_EXPORT_W);
+            if (p->ebuf_cap < (ne + ns) * SEG_EXPORT_W) {
+                p->ebuf_cap = MPMAX((ne + ns) * SEG_EXPORT_W * 2, 8192);
+                p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
+            }
+            memcpy(p->ebuf + (size_t) ne * SEG_EXPORT_W, gsegs,
+                   (size_t) ns * SEG_EXPORT_W * sizeof(float));
+            MP_TARRAY_APPEND(tmp, rjobs, nrjobs,
+                ((struct rjob){ pos.ax, pos.ay, b->w, b->h, ne, nt, gtiles }));
+            ne += ns;
+            continue;
+        }
+#endif
+        const uint8_t *gsrc = (const uint8_t *) item->packed->planes[0]
+                            + (ptrdiff_t) b->src_y * pstride + b->src_x;
+        MP_TARRAY_APPEND(tmp, miss, nmiss,
+            ((struct gmiss){ pos.ax, pos.ay, b->w, b->h, gsrc }));
+        miss_bytes += (size_t) b->w * b->h;
+    }
+    p->gc_no_recycle = false;
+#if HAVE_ASS_OUTLINE_DEFERRED
+    if (ne && gc_flush_edges(p, ne)) {
+        gc_flush_raster(p, rjobs, nrjobs, p->glyph_atlas);
+        p->cnt_prefill_glyphs += nrjobs;
+    }
+#endif
+    if (nmiss) {
+        gc_flush_misses(p, miss, nmiss, miss_bytes, pstride, p->glyph_atlas);
+        p->cnt_prefill_glyphs += nmiss;
+    }
+    if (p->gc_refused)
+        complete = true;              // never spin on a refused entry
+    talloc_free(tmp);
+    return complete;
+}
+
+// WP-H1b idle GPU pre-fill: on frames whose sub state didn't change (empty or
+// static subs -- exactly the frames with headroom), warm the glyph atlas for
+// upcoming frames already banked in the render-ahead ring, so the FIRST frame
+// of a dense event doesn't pay the whole atlas fill (cold start, post-seek).
+// The work is budgeted (--sub-prefill-budget-ms of wall clock per frame) and
+// counts toward the frame's WP-E3 deadline: it only runs when at least twice
+// its budget remains before the present-guard deadline, so it can never be
+// what pushes a frame over. Runs after the frame's own overlay build + render
+// recording; the extra dispatches ride the same submission.
+static void sub_prefill_idle(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    int budget_ms = p->next_opts->sub_prefill_budget_ms;
+    if (budget_ms <= 0 || !p->gc_warmed || !p->glyph_atlas)
+        return;
+    if (!p->sub_state_cheap || p->guard_fired)
+        return;
+    int64_t now = mp_time_ns();
+    int64_t budget_ns = budget_ms * INT64_C(1000000);
+    if (p->guard_deadline_ns > 0 &&
+        p->guard_t0 + p->guard_deadline_ns - now < 2 * budget_ns)
+        return;
+    double pts = 0;
+    struct sub_bitmaps *item = osd_sub_peek_ahead(vo->osd, &pts);
+    if (!item)
+        return;
+    bool done = true;
+    if ((item->format == SUBBITMAP_LIBASS_GLYPHS ||
+         item->format == SUBBITMAP_LIBASS_OUTLINES) && item->num_parts) {
+        stats_time_start(p->stats, "sub-prefill");
+        done = gc_prefill_item(p, item, now + budget_ns);
+        stats_time_end(p->stats, "sub-prefill");
+    }
+    talloc_free(item);
+    if (done)
+        osd_sub_peek_ahead_done(vo->osd, pts);
+}
 #endif // HAVE_ASS_COMPOSITE_DEFERRED
 
 // Build the overlay set for `frame` into one of g's ping-pong buffers.
@@ -2213,6 +2764,15 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
     if (want_t)
         p->dbg_subrender_ns = mp_time_ns() - sr0;
     stats_time_end(p->stats, "sub-render");
+
+    // WP-H1b: an unchanged osd_render change_id means this frame's sub/OSD
+    // state is static or empty -- the cheap frames the idle glyph pre-fill is
+    // allowed to use. Main presentation consumer only (the blend-subs path
+    // has its own per-frame sync and the screenshot path must not vote).
+    if (present && g == &p->osd_guard) {
+        p->sub_state_cheap = subs->change_id == p->last_sub_change_id;
+        p->last_sub_change_id = subs->change_id;
+    }
 
     frame->overlays = state->overlays;
     frame->num_overlays = 0;
@@ -2286,17 +2846,21 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
             MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
         // Round the OSD texture up and grow it monotonically so it isn't
         // reallocated every frame as the atlas grows through a dense scene
-        // (each realloc stalls the display thread). WP-E: also floor both dims at
-        // a generous size so the first allocation already covers the whole
-        // scene's overlays -- otherwise the tex creeps up to the scene max over
-        // several frames, and which frame first hits the max (hence the grow) is
-        // decided by --untimed frame dropping, making tex-realloc-after-first
-        // spuriously nonzero. The floor is bounded (a few MiB per entry) and
-        // capped to the GPU's max texture size; a truly oversized overlay still
-        // grows once via the counted fallback below.
-        int fl = MPMIN(2048, p->gpu->limits.max_tex_2d_dim);
-        int want_w = MPMAX((item->packed_w + 255) & ~255, fl);
-        int want_h = MPMAX((item->packed_h + 255) & ~255, fl);
+        // (each realloc stalls the display thread). WP-E: also floor both dims
+        // so the first allocation already covers the whole scene's overlays --
+        // otherwise the tex creeps up to the scene max over several frames, and
+        // which frame first hits the max (hence the grow) is decided by
+        // --untimed frame dropping, making tex-realloc-after-first spuriously
+        // nonzero. WP-H1c: the floor is derived from the display size (the old
+        // fixed 2048 was too small for 8K packed atlases -- the first OSD
+        // overlay recreated the texture mid-playback) and matches the pool
+        // textures pre-created at warm-up/reconfig, so popping one makes the
+        // recreate below a no-op. A truly oversized overlay still grows once
+        // via the counted fallback.
+        int fl_w, fl_h;
+        overlay_tex_floor(p, &fl_w, &fl_h);
+        int want_w = MPMAX((item->packed_w + 255) & ~255, fl_w);
+        int want_h = MPMAX((item->packed_h + 255) & ~255, fl_h);
         int prev_w = entry->tex ? entry->tex->params.w : -1;
         int prev_h = entry->tex ? entry->tex->params.h : -1;
         int new_w = MPMAX(want_w, entry->tex ? entry->tex->params.w : 0);
@@ -2663,11 +3227,15 @@ bail:
     }
     // Off the fast path (fires are exceptional); lets tests attribute exactly
     // what a guard engagement presented (stale snapshot pts vs no overlays).
+    // A presented-nothing bail (no valid previous snapshot: cold start,
+    // post-seek/reset, pts discontinuity, or >0.5 s content gap) is the visible
+    // vanish -- count it as guard-empty, not stale-present. Sticky per frame.
     if (frame->num_overlays) {
         MP_VERBOSE(vo, "[present-guard] deadline exceeded at pts %f: presenting "
                    "previous overlays (pts %f)\n",
                    src ? src->pts : MP_NOPTS_VALUE, g->good_pts);
     } else {
+        p->guard_presented_empty = true;
         MP_VERBOSE(vo, "[present-guard] deadline exceeded at pts %f: presenting "
                    "no overlays\n", src ? src->pts : MP_NOPTS_VALUE);
     }
@@ -3736,6 +4304,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // approx_duration (there is no container fps at the vo level), then to a
     // ~24 fps budget.
     p->guard_fired = false;
+    p->guard_presented_empty = false;
     int64_t gdl = 0;
     int gms = p->next_opts->sub_present_guard_ms;
     if (gms > 0) {
@@ -3879,6 +4448,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     struct pl_frame ref_frame;
     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
 
+#if HAVE_ASS_COMPOSITE_DEFERRED
+    // WP-H1b: idle GPU glyph pre-fill for upcoming render-ahead frames. After
+    // the frame's own work is recorded, so its budget check sees the true
+    // remaining headroom before the present-guard deadline.
+    sub_prefill_idle(vo);
+#endif
+
     // WP-A3: per-frame counter samples (emit-on-change; no-op unless --dump-stats)
     // and the MSGL_V [slowframe] breakdown line (format kept byte-compatible with
     // the historical logs + TOOLS/subtest/parse_stats.py).
@@ -3896,10 +4472,19 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "shader-warmups",            p->cnt_shader_warmups,      &p->stat_shader_warmups);
     // WP-E3: guard engagements, once per frame no matter how many overlay
     // sets bailed (ra-stale counts dec_sub-level staleness separately; the
-    // two layers are independent and never double-count).
-    if (p->guard_fired)
-        p->cnt_stale_present++;
+    // two layers are independent and never double-count). A bail that served
+    // the previous overlays is stale-present; one that presented nothing (no
+    // valid snapshot -- cold start / post-seek / discontinuity) is guard-empty.
+    if (p->guard_fired) {
+        if (p->guard_presented_empty)
+            p->cnt_guard_empty++;
+        else
+            p->cnt_stale_present++;
+    }
     emit_counter(vo, "stale-present",             p->cnt_stale_present,       &p->stat_stale_present);
+    emit_counter(vo, "guard-empty",               p->cnt_guard_empty,         &p->stat_guard_empty);
+    emit_counter(vo, "prefill-glyphs",            p->cnt_prefill_glyphs,      &p->stat_prefill_glyphs);
+    emit_counter(vo, "glyphs-uncached",           p->cnt_glyph_uncached,      &p->stat_glyph_uncached);
     if (want_slow) {
         int64_t gpu_ns = 0;
         for (int i = 0; i < p->perf_fresh.count; i++)
@@ -4025,6 +4610,10 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     // every OSD compute pass, so no first-use alloc/compile spikes the VO thread
     // once playback begins.
     gc_warmup(p);
+    // WP-H1c: re-floor the legacy overlay pool + upload ring for the (possibly
+    // changed) display size. Reconfig only -- before playback -- never
+    // mid-playback; no-op when already at the right floor.
+    ensure_overlay_pool(p);
 #endif
     return 0;
 }
@@ -4734,6 +5323,8 @@ static int preinit(struct vo *vo)
     p->stat_gcache_epoch_advance = p->stat_gcache_evict_n = p->stat_gcache_overcommit = -1;
     p->stat_shader_warmups = -1;
     p->stat_stale_present = -1;
+    p->stat_prefill_glyphs = -1;
+    p->stat_glyph_uncached = -1;
     p->osd_guard.good = -1;   // WP-E3: no complete overlay build yet
 
     struct gl_video_opts *gl_opts = p->opts_cache->opts;

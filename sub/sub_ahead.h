@@ -68,6 +68,19 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
                                           struct mp_osd_res dim, int format,
                                           double raw_video_pts, bool *handled);
 
+// WP-H1b idle GPU pre-fill support. Peek returns a refcounted served copy
+// (same ownership contract as sub_ahead_get_bitmaps: free with talloc_free)
+// of the lowest-pts ring entry that has renderable parts and was neither
+// served to the VO nor pre-filled yet, or NULL when there is nothing to do.
+// *out_pts receives the entry's raw video pts. The VO uses it to warm its GPU
+// glyph atlas for UPCOMING frames during cheap frames, then acknowledges with
+// sub_ahead_prefill_done(pts) once the entry's glyphs are resident (a
+// budget-interrupted pre-fill simply omits the ack and resumes on a later
+// frame; already-warmed glyphs are cache hits). Serving an entry to the VO
+// marks it consumed implicitly (the VO resolves what it draws anyway).
+struct sub_bitmaps *sub_ahead_peek_prefill(struct sub_ahead *a, double *out_pts);
+void sub_ahead_prefill_done(struct sub_ahead *a, double video_pts);
+
 // Count an inline render performed on the VO thread while the worker exists
 // (the ra-inline counter). Must stay 0 in normal forward playback; nonzero is
 // expected only in the documented degraded modes (reverse playback).

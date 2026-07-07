@@ -61,6 +61,11 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
                       bool *packets_read, bool *sub_updated);
 struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
                                     int format, double pts, int draw_flags);
+// WP-H1b: peek an upcoming render-ahead frame for GPU glyph pre-fill (NULL
+// when render-ahead is off or nothing is pending); ack with _done. See
+// sub_ahead_peek_prefill in sub_ahead.h for the exact contract.
+struct sub_bitmaps *sub_peek_ahead_bitmaps(struct dec_sub *sub, double *out_pts);
+void sub_peek_ahead_done(struct dec_sub *sub, double video_pts);
 char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
 char *sub_ass_get_extradata(struct dec_sub *sub);
 struct sd_times sub_get_times(struct dec_sub *sub, double pts);

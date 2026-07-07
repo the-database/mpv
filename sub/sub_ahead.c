@@ -64,12 +64,30 @@
  *
  * OUTLINES lifetime: in --sub-gpu-raster mode the parts of a sub_bitmaps carry
  * tile/segment blobs owned by the producing packer's seg_ctx, which is only
- * valid until that sd's NEXT pack. Ring entries (and copies served from them)
- * outlive that, so pin_outline_blobs() reparents private blob copies onto the
- * sub_bitmaps itself before it is stored or handed out.
+ * valid until that sd's NEXT pack. Ring entries outlive that, so
+ * pin_outline_blobs() reparents private blob copies onto the sub_bitmaps
+ * itself ONCE, on the worker thread, before the render is stored.
+ *
+ * Serve-by-reference (WP-H1a): a completed render is immutable -- the worker
+ * only ever stores whole entries and frees them on eviction, it never writes
+ * into a stored sub_bitmaps -- so the fetch path serves it WITHOUT deep-
+ * copying the payload. Deep-copying was measured as the dominant VO-thread
+ * cost on dense OUTLINES content (thousands of parts x pinned tile blobs =
+ * MBs of memcpy per changed frame, all inside sub_ahead_get_bitmaps). The
+ * render was already banked; the copy was the bill. Instead each stored
+ * render lives in a refcounted payload: the ring holds one reference,
+ * every served sub_bitmaps pins one more (released by a talloc destructor
+ * when the consumer frees it). The serve itself allocates only a small
+ * struct plus a private parts[] array -- consumers legitimately write to
+ * the returned STRUCT (osd.c stamps render_index/change_id) and osd.c's
+ * capped-OSD path may rescale part rects, so the parts array is per-serve;
+ * the payload (blobs, packed image) is shared read-only. Eviction while a
+ * serve is outstanding just drops the ring's reference; the memory is
+ * reclaimed when the last consumer copy is freed.
  */
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 
 #include "common/msg.h"
@@ -92,6 +110,16 @@
 // outdated subtitle can stay on screen when the worker is badly behind.
 #define STALE_MAX_AGE 2.0
 
+// A completed render, shared by reference between the ring and served copies
+// (see "Serve-by-reference" above). bmp is a talloc child of the payload and
+// is IMMUTABLE once the payload exists. The refcount is atomic because the
+// last unref can happen on whatever thread frees the served copy (the VO
+// thread's talloc_free of its overlay list), without taking the ring lock.
+struct ahead_payload {
+    _Atomic int refs;
+    struct sub_bitmaps *bmp;
+};
+
 struct sub_ahead_entry {
     bool valid;
     double video_pts;            // raw (pre-conversion) video pts -- the key
@@ -99,8 +127,59 @@ struct sub_ahead_entry {
     int format;
     uint64_t gen;
     uint64_t content_id;         // for change_id unification
-    struct sub_bitmaps *bmp;     // owned; NULL means "no subtitles at this pts"
+    bool prefilled;              // consumed by a serve or by the VO's GPU
+                                 // glyph pre-fill (sub_ahead_peek_prefill)
+    struct ahead_payload *pl;    // ring's reference; NULL = "no subtitles"
 };
+
+static struct ahead_payload *payload_new(struct sub_bitmaps *bmp)
+{
+    if (!bmp)
+        return NULL;
+    struct ahead_payload *pl = talloc_zero(NULL, struct ahead_payload);
+    atomic_init(&pl->refs, 1);
+    pl->bmp = talloc_steal(pl, bmp);
+    return pl;
+}
+
+static void payload_unref(struct ahead_payload *pl)
+{
+    if (pl && atomic_fetch_sub_explicit(&pl->refs, 1, memory_order_acq_rel) == 1)
+        talloc_free(pl);
+}
+
+// Hidden talloc child of a served sub_bitmaps; its destructor releases the
+// payload pin when the consumer talloc_free()s the serve.
+struct ahead_pin {
+    struct ahead_payload *pl;
+};
+
+static void ahead_pin_destroy(void *ptr)
+{
+    struct ahead_pin *pin = ptr;
+    payload_unref(pin->pl);
+}
+
+// Serve a payload by reference: a fresh sub_bitmaps STRUCT (callers write
+// render_index/change_id into it) with a private parts[] array (osd.c's
+// capped-OSD path may edit part rects) whose blob/bitmap/packed pointers
+// alias the pinned payload. Free with talloc_free(); NULL when the render
+// had no parts (same contract as the old sub_bitmaps_copy serve).
+static struct sub_bitmaps *payload_serve(struct ahead_payload *pl)
+{
+    struct sub_bitmaps *in = pl->bmp;
+    if (!in || !in->num_parts)
+        return NULL;
+    struct sub_bitmaps *res = talloc(NULL, struct sub_bitmaps);
+    *res = *in;
+    res->parts = talloc_memdup(res, in->parts,
+                               sizeof(in->parts[0]) * in->num_parts);
+    struct ahead_pin *pin = talloc(res, struct ahead_pin);
+    pin->pl = pl;
+    atomic_fetch_add_explicit(&pl->refs, 1, memory_order_relaxed);
+    talloc_set_destructor(pin, ahead_pin_destroy);
+    return res;
+}
 
 struct sub_ahead {
     struct mp_log *log;
@@ -192,7 +271,7 @@ static void ahead_clear(struct sub_ahead *a)
 {
     for (int n = 0; n < a->ring_len; n++) {
         if (a->ring[n].valid) {
-            talloc_free(a->ring[n].bmp);
+            payload_unref(a->ring[n].pl);
             a->ring[n] = (struct sub_ahead_entry){0};
         }
     }
@@ -206,11 +285,11 @@ static void queue_flush(struct sub_ahead *a)
 }
 
 // In OUTLINES mode each part's coverage blob is owned by the packer that
-// produced it and becomes invalid on that packer's next pack. Anything that
-// outlives one worker render (ring entries, copies served to the VO, which the
-// worker may evict concurrently) must own its blobs: reparent copies onto the
-// sub_bitmaps itself. No-op for all other formats (their pixel data is a
-// refcounted mp_image, which sub_bitmaps_copy already refs).
+// produced it and becomes invalid on that packer's next pack. A ring entry
+// outlives that, so the worker reparents private blob copies onto the
+// sub_bitmaps itself ONCE before storing it; serves then share those pinned
+// blobs by reference (payload_serve). No-op for all other formats (their
+// pixel data is a refcounted mp_image owned by the same payload).
 static void pin_outline_blobs(struct sub_bitmaps *b)
 {
     if (!b || b->format != SUBBITMAP_LIBASS_OUTLINES)
@@ -285,10 +364,10 @@ static void ahead_store(struct sub_ahead *a, double V, struct mp_osd_res dim,
         }
     }
     if (a->ring[slot].valid)
-        talloc_free(a->ring[slot].bmp);
+        payload_unref(a->ring[slot].pl);
     a->ring[slot] = (struct sub_ahead_entry){
         .valid = true, .video_pts = V, .dim = dim, .format = format,
-        .gen = gen, .content_id = content_id, .bmp = bmp,
+        .gen = gen, .content_id = content_id, .pl = payload_new(bmp),
     };
 }
 
@@ -562,7 +641,7 @@ void sub_ahead_enqueue(struct sub_ahead *a, struct demux_packet *pkt)
             if (e->valid &&
                 ahead_pts_to_subtitle(a, e->video_pts) >= pkt->pts - 1e-9)
             {
-                talloc_free(e->bmp);
+                payload_unref(e->pl);
                 *e = (struct sub_ahead_entry){0};
             }
         }
@@ -718,7 +797,7 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
     }
     int src = idx;
     if (idx >= 0) {
-        if (a->ring[idx].bmp) {
+        if (a->ring[idx].pl) {
             a->dbg_served++;
         } else {
             a->dbg_empty++;  // rendered, no subtitles at this pts (a real answer)
@@ -743,10 +822,19 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
     if (a->dbg_served && a->dbg_served % 250 == 0)
         ahead_verbose_line(a);
     struct sub_bitmaps *res = NULL;
-    if (src >= 0 && a->ring[src].bmp) {
-        res = sub_bitmaps_copy(NULL, a->ring[src].bmp);
-        pin_outline_blobs(res);  // the worker may evict the entry while the VO
-                                 // still holds this copy
+    if (src >= 0 && a->ring[src].pl) {
+        // Serve by reference: pin the entry's payload instead of deep-copying
+        // parts + blobs (the copy was the dominant VO-thread cost on dense
+        // OUTLINES frames). The pin keeps the payload alive even if the
+        // worker evicts the entry while the VO still holds the serve.
+        res = payload_serve(a->ring[src].pl);
+    }
+    if (src >= 0) {
+        // Whatever the VO draws this frame it also resolves against the GPU
+        // glyph cache, so the idle pre-fill must not reprocess this entry.
+        a->ring[src].prefilled = true;
+    }
+    if (res) {
         // Unified monotonic change_id: report a fresh id only when the content
         // differs from what we last served, else 0 (osd.c treats 0 as "no
         // change, no re-upload"). A stale re-serve of the last served frame
@@ -764,4 +852,45 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
     mp_mutex_unlock(&a->lock);
     mp_cond_signal(&a->wakeup);  // nudge the worker to refill ahead of us
     return res;
+}
+
+struct sub_bitmaps *sub_ahead_peek_prefill(struct sub_ahead *a, double *out_pts)
+{
+    if (!a)
+        return NULL;
+    struct sub_bitmaps *res = NULL;
+    mp_mutex_lock(&a->lock);
+    // Lowest-pts first: after a seek the pre-warm target (i=0) is the first
+    // frame the VO will fetch, so it must also be the first one pre-filled.
+    int best = -1;
+    for (int n = 0; n < a->ring_len; n++) {
+        struct sub_ahead_entry *e = &a->ring[n];
+        if (e->valid && e->gen == a->gen && !e->prefilled && e->pl &&
+            (best < 0 || e->video_pts < a->ring[best].video_pts))
+            best = n;
+    }
+    if (best >= 0) {
+        res = payload_serve(a->ring[best].pl);
+        if (res) {
+            *out_pts = a->ring[best].video_pts;
+        } else {
+            // No renderable parts: nothing to pre-fill, never return it again.
+            a->ring[best].prefilled = true;
+        }
+    }
+    mp_mutex_unlock(&a->lock);
+    return res;
+}
+
+void sub_ahead_prefill_done(struct sub_ahead *a, double video_pts)
+{
+    if (!a)
+        return;
+    mp_mutex_lock(&a->lock);
+    for (int n = 0; n < a->ring_len; n++) {
+        struct sub_ahead_entry *e = &a->ring[n];
+        if (e->valid && e->video_pts == video_pts)
+            e->prefilled = true;
+    }
+    mp_mutex_unlock(&a->lock);
 }
