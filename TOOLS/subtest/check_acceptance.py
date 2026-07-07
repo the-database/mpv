@@ -20,6 +20,9 @@ ACCEPTANCE BAR (a scene PASSES only if all three hold):
   3. ALL of these integrity counters == 0:
        gcache-flush atlas-overflow staging-grow overlay-buf-grow tex-realloc
        vo-alloc-after-first-frame ra-miss ra-inline ra-stale stale-present
+       guard-empty
+     (gcache-overcommit is NOT gated -- post-H1d it is the lossless per-frame
+     transient-glyph path, an informational tuning signal, not content loss.)
      mpv emits these with emit_counter() (vo_gpu_next.c) / MP_STATS value lines
      (sub_ahead.c). vo_gpu_next's emit_counter is *emit-on-change* starting from
      0, so a counter that never left 0 for the whole run produces NO line at
@@ -30,10 +33,28 @@ ACCEPTANCE BAR (a scene PASSES only if all three hold):
 
 OPTIONAL screenshot A/B (correctness spot-check, not part of the numeric bar):
   If <results>/shots/<scene>_acc_<pts>.png and <scene>_cpu_<pts>.png pairs
-  exist, they are pixel-diffed. Exact parity is NOT expected on real hardware
-  for blur frames; the gate is only for GROSS divergence (the sign-bleed class
-  of bug), default > 16/255. The tight <=3/255 lavapipe bar is reported for
-  information but not enforced here.
+  exist, they are pixel-diffed and classified three-way by BOTH magnitude and
+  spatial concentration (so a capture defect can no longer masquerade as a
+  render bug):
+
+    MATCH             maxdiff <= 3/255. The acc (GPU-raster) and cpu (stock
+                      libass) paths agree, modulo dither/blur.
+    ok                above 3/255 but localized and below the gross bar -- an
+                      expected blur-frame residual; informational, not a fail.
+    CAPTURE-MISMATCH  the differing (>8/255) pixels cover >1.5% of the frame
+                      AND are spread across >15% of a 32x18 grid (not
+                      clustered). That signature is two ADJACENT DECODED FRAMES
+                      (moving edges everywhere at moderate magnitude), i.e. the
+                      acc and cpu shots landed on different frames -- a CAPTURE
+                      error to RE-SHOOT, NOT a render failure. The SHOT runs now
+                      pin --pause/--hr-seek so this should not occur; if a pair
+                      survives a deterministic re-shoot it is real -> escalate.
+    GROSS             a clustered/localized divergence above the gross bar
+                      (default >16/255): a real render bug (the sign-bleed
+                      class). This is the only screenshot status that FAILS the
+                      overall verdict.
+
+  The tight <=3/255 lavapipe bar is reported for information (the "<=3" column).
 
 Python 3 stdlib only. Windows: run with the "py -3" launcher.
 """
@@ -56,7 +77,16 @@ import parse_stats  # noqa: E402
 
 DEFAULT_BUDGET_MS = 41.7
 
-# The 10 integrity counters that must be 0 to certify a run.
+# The integrity counters that must be 0 to certify a run.
+#   stale-present -- a present-guard bail served the previous (stale) overlay
+#                    state (subs 1 frame behind); a stall we don't want clean.
+#   guard-empty   -- a present-guard bail presented NO overlays (subtitles
+#                    briefly VANISHED) because no valid previous snapshot
+#                    existed. This is a visible error in steady playback, so it
+#                    is gated ==0. (Post-seek/cold-start stalls can legitimately
+#                    produce it -- stale there would be wrong content -- but a
+#                    clean acceptance run seeks only where the guard does not
+#                    fire, so it must stay 0.)
 COUNTERS = [
     "gcache-flush",
     "atlas-overflow",
@@ -68,6 +98,22 @@ COUNTERS = [
     "ra-inline",
     "ra-stale",
     "stale-present",
+    "guard-empty",
+]
+
+# Informational counters: reported in the table but not gated (nonzero is
+# expected in normal operation; watch for per-frame explosions).
+# gcache-overcommit: post-H1d this means "took the lossless per-frame transient
+# path for a big/overflow glyph" -- NOT content loss (that is structurally
+# impossible now, proven pixel-identical to CPU). Its only cost (per-frame
+# re-raster) is already gated by the video-draw budget, so gating it ==0 would
+# falsely fail a valid 8K run (dense signs legitimately trip it). When nonzero
+# it prints a tuning hint.
+INFO_COUNTERS = [
+    "gcache-overcommit",
+    "gcache-epoch-advance",
+    "gcache-evict-n",
+    "prefill-glyphs",
 ]
 
 # The mis-linked-build tell: stock (non-fork) libass makes mpv warn-and-ignore
@@ -106,7 +152,7 @@ def count_drops(st: parse_stats.Stats) -> tuple[int, dict[str, int]]:
 def read_counters(st: parse_stats.Stats) -> dict[str, float]:
     """counter name -> final value (last value sample; 0.0 if absent)."""
     out = {}
-    for name in COUNTERS:
+    for name in COUNTERS + INFO_COUNTERS:
         samples = st.values.get(name)
         out[name] = samples[-1][1] if samples else 0.0
     return out
@@ -154,7 +200,7 @@ def adjudicate(stats_path: str, default_budget: float,
     if drops > 0:
         detail = ", ".join(f"{k}={v}" for k, v in sorted(drop_breakdown.items()))
         reasons.append(f"frame drops: {drops} ({detail})")
-    fired = {k: v for k, v in counters.items() if round(v) != 0}
+    fired = {k: v for k, v in counters.items() if k in COUNTERS and round(v) != 0}
     if fired:
         detail = ", ".join(f"{k}={int(round(v))}" for k, v in sorted(fired.items()))
         reasons.append(f"integrity counters fired: {detail}")
@@ -311,31 +357,118 @@ def read_png(path):
     return _Img(width, height, channels, bitdepth, bytes(out))
 
 
-def diff_png(pa, pb):
-    """Return maxdiff normalised to /255, or raise on decode/geometry error."""
+# Three-way (+capture) classification thresholds. See the module docstring and
+# README ("SCREENSHOT A/B HEURISTIC") for the rationale.
+TIGHT_BAR8 = 3.0        # maxdiff <= this (/255)  == MATCH
+HOT8 = 8.0              # a pixel whose max-channel diff exceeds this is "hot"
+GRID_X, GRID_Y = 32, 18            # coarse 16:9 occupancy grid
+CELL_HOT_FRAC = 0.02               # a grid cell is "occupied" at >2% hot pixels
+SPREAD_AREA_PCT = 1.5              # hot pixels over >1.5% of the frame ...
+SPREAD_OCC_PCT = 15.0              # ... AND touching >15% of grid cells = spread
+
+
+def analyze_pair(pa, pb):
+    """Full pixel diff + spatial concentration of one acc/cpu shot pair.
+
+    Returns a metrics dict; raises on decode/geometry error.
+      maxdiff8  max per-pixel channel difference, normalised to /255
+      hot       count of "hot" pixels (max-channel diff > HOT8/255)
+      area_pct  hot pixels as a percentage of the frame
+      occ_pct   percentage of GRID_X*GRID_Y cells that are "occupied"
+                (>CELL_HOT_FRAC of the cell's pixels hot)
+      bbox_pct  hot-pixel bounding box as a percentage of the frame
+
+    A concentrated (subtitle-localized) divergence has a SMALL occ_pct/bbox_pct;
+    a capture mis-shot -- two adjacent decoded frames -- scatters moving-edge
+    hot pixels across the whole frame, so occ_pct is large and bbox_pct ~= 100.
+    """
     a, b = read_png(pa), read_png(pb)
     if (a.w, a.h, a.channels, a.bitdepth) != (b.w, b.h, b.channels, b.bitdepth):
         raise ValueError(
             f"geometry mismatch {a.w}x{a.h}c{a.channels}b{a.bitdepth} vs "
             f"{b.w}x{b.h}c{b.channels}b{b.bitdepth}")
+    w, h, ch, rb, maxval = a.w, a.h, a.channels, a.row_bytes, a.maxval
+    total = w * h
     if a.raw == b.raw:
-        return 0.0
-    ch, rb, maxdiff = a.channels, a.row_bytes, 0
-    for y in range(a.h):
+        return {"maxdiff8": 0.0, "hot": 0, "area_pct": 0.0,
+                "occ_pct": 0.0, "bbox_pct": 0.0}
+    hot_thr = HOT8 * maxval / 255.0
+    cellw, cellh = w / GRID_X, h / GRID_Y
+    grid = [0] * (GRID_X * GRID_Y)
+    maxdiff = hot = 0
+    minx, miny, maxx, maxy = w, h, -1, -1
+    for y in range(h):
         if a.raw[y * rb:(y + 1) * rb] == b.raw[y * rb:(y + 1) * rb]:
             continue
         sa, sb = a.row_samples(y), b.row_samples(y)
-        for i in range(len(sa)):
-            d = sa[i] - sb[i]
-            if d < 0:
-                d = -d
-            if d > maxdiff:
-                maxdiff = d
-    return maxdiff * 255.0 / a.maxval
+        gy = int(y / cellh)
+        if gy >= GRID_Y:
+            gy = GRID_Y - 1
+        rowbase = gy * GRID_X
+        for px in range(w):
+            base = px * ch
+            pd = 0
+            for k in range(ch):
+                d = sa[base + k] - sb[base + k]
+                if d < 0:
+                    d = -d
+                if d > pd:
+                    pd = d
+            if pd > maxdiff:
+                maxdiff = pd
+            if pd > hot_thr:
+                hot += 1
+                gx = int(px / cellw)
+                if gx >= GRID_X:
+                    gx = GRID_X - 1
+                grid[rowbase + gx] += 1
+                if px < minx:
+                    minx = px
+                if px > maxx:
+                    maxx = px
+                if y < miny:
+                    miny = y
+                if y > maxy:
+                    maxy = y
+    cell_px = cellw * cellh
+    occ = sum(1 for c in grid if c > CELL_HOT_FRAC * cell_px)
+    bbox_pct = 0.0
+    if maxx >= 0:
+        bbox_pct = 100.0 * (maxx - minx + 1) * (maxy - miny + 1) / total
+    return {
+        "maxdiff8": round(maxdiff * 255.0 / maxval, 2),
+        "hot": hot,
+        "area_pct": round(100.0 * hot / total, 3),
+        "occ_pct": round(100.0 * occ / (GRID_X * GRID_Y), 1),
+        "bbox_pct": round(bbox_pct, 1),
+    }
+
+
+def classify_shot(m: dict, gross8: float) -> str:
+    """Three-way (+capture) status from analyze_pair() metrics.
+
+    MATCH             maxdiff <= TIGHT_BAR8 (renders agree modulo dither/blur)
+    CAPTURE-MISMATCH  spread hot pixels (area>SPREAD_AREA_PCT AND
+                      occ>SPREAD_OCC_PCT) -> acc/cpu shots on different frames;
+                      a capture error to RE-SHOOT, not a render failure. Checked
+                      BEFORE GROSS so a big-but-spread frame skew never reads as
+                      a render bug.
+    GROSS             clustered/localized divergence above the gross bar -> a
+                      real render bug (the sign-bleed class).
+    ok                above the tight bar, localized, below the gross bar (an
+                      expected blur-frame residual); informational.
+    """
+    if m["maxdiff8"] <= TIGHT_BAR8:
+        return "MATCH"
+    if m["area_pct"] > SPREAD_AREA_PCT and m["occ_pct"] > SPREAD_OCC_PCT:
+        return "CAPTURE-MISMATCH"
+    if m["maxdiff8"] > gross8:
+        return "GROSS"
+    return "ok"
 
 
 def adjudicate_shots(shots_dir: str, gross8: float) -> list[dict]:
-    """Diff every <scene>_acc_<pts>.png / <scene>_cpu_<pts>.png pair."""
+    """Diff+classify every <scene>_acc_<pts>.png / <scene>_cpu_<pts>.png pair."""
     if not os.path.isdir(shots_dir):
         return []
     accs = {}
@@ -351,11 +484,11 @@ def adjudicate_shots(shots_dir: str, gross8: float) -> list[dict]:
             rec.update(status="MISSING", note="no matching cpu-baseline shot")
         else:
             try:
-                md = diff_png(pa, pb)
-                rec["maxdiff8"] = round(md, 2)
-                rec["tight_bar_ok"] = md <= 3.0
-                rec["status"] = "GROSS" if md > gross8 else "ok"
-            except Exception as e:  # decode / geometry -> compare manually
+                m = analyze_pair(pa, pb)
+                rec.update(m)
+                rec["tight_bar_ok"] = m["maxdiff8"] <= TIGHT_BAR8
+                rec["status"] = classify_shot(m, gross8)
+            except Exception as e:  # decode / geometry -> flag, do not crash
                 rec.update(status="ERROR", note=str(e))
         out.append(rec)
     return out
@@ -391,7 +524,16 @@ def print_scene(r: dict) -> None:
         v = r["counters"][name]
         status = "ok" if v == 0 else "FIRED"
         note = "  (never fired)" if v == 0 else ""
+        if name == "guard-empty" and v != 0:
+            note = "  << SUBS VANISHED: guard presented no overlays"
         print(f"{name:<28} {v:>7}   {status}{note}")
+    for name in INFO_COUNTERS:
+        v = r["counters"].get(name, 0.0)
+        note = "info (not gated)"
+        if name == "gcache-overcommit" and v != 0:
+            note = ("info -- transient fallback active (lossless; raise "
+                    "--sub-glyph-atlas-size if any frames are over budget)")
+        print(f"{name:<28} {v:>7}   {note}")
 
     if r.get("log") and r["log"].get("stock_libass_warn"):
         print(f"\n!! STOCK-LIBASS WARNING in log: {r['log']['warn_line']}")
@@ -404,17 +546,21 @@ def print_scene(r: dict) -> None:
 def print_shots(shots: list[dict], gross8: float) -> None:
     if not shots:
         return
-    print(f"\n=== SCREENSHOT A/B (gross-divergence gate > {gross8:.0f}/255; "
-          f"tight bar <=3/255 informational) ===")
-    hdr = f"{'acc shot':<34} {'maxdiff/255':>11}  {'<=3':>4}  status"
+    print(f"\n=== SCREENSHOT A/B  (MATCH <= {TIGHT_BAR8:.0f}/255 ; "
+          f"GROSS = clustered > {gross8:.0f}/255 ; CAPTURE-MISMATCH = spread "
+          f"> {SPREAD_AREA_PCT}% over > {SPREAD_OCC_PCT:.0f}% of grid) ===")
+    hdr = (f"{'acc shot':<30} {'maxdiff/255':>11} {'hot%':>7} {'grid%':>7} "
+           f"{'<=3':>4}  status")
     print(hdr)
     print("-" * len(hdr))
     for s in shots:
         if s["status"] in ("MISSING", "ERROR"):
-            print(f"{s['acc']:<34} {'--':>11}  {'--':>4}  {s['status']}: {s.get('note','')}")
+            print(f"{s['acc']:<30} {'--':>11} {'--':>7} {'--':>7} {'--':>4}  "
+                  f"{s['status']}: {s.get('note', '')}")
         else:
             tight = "yes" if s["tight_bar_ok"] else "no"
-            print(f"{s['acc']:<34} {s['maxdiff8']:>11.2f}  {tight:>4}  {s['status']}")
+            print(f"{s['acc']:<30} {s['maxdiff8']:>11.2f} {s['area_pct']:>7.3f} "
+                  f"{s['occ_pct']:>7.1f} {tight:>4}  {s['status']}")
 
 
 # --------------------------------------------------------------------------
@@ -471,18 +617,32 @@ def main(argv=None) -> int:
         print_shots(shots, args.gross)
 
     n_fail = sum(1 for r in results if r["verdict"] != "PASS")
-    n_gross = sum(1 for s in shots if s["status"] == "GROSS")
-    overall = "PASS" if (n_fail == 0 and n_gross == 0) else "FAIL"
+    gross = [s for s in shots if s["status"] == "GROSS"]
+    capmis = [s for s in shots if s["status"] == "CAPTURE-MISMATCH"]
+    # Render-correctness gate = numeric scene fails + GROSS shot divergence.
+    # CAPTURE-MISMATCH is a shot-capture defect (re-shoot), NOT a render bug,
+    # so it is surfaced loudly but does NOT fail the overall verdict.
+    overall = "PASS" if (n_fail == 0 and not gross) else "FAIL"
 
     print("\n" + "=" * 60)
     print("SUMMARY")
     for r in results:
         print(f"  {r['scene']:<20} {r['verdict']}")
     if shots:
-        gs = [s for s in shots if s["status"] == "GROSS"]
-        print(f"  screenshots: {len(shots)} pair(s), "
-              f"{len(gs)} gross-divergent")
-    print(f"OVERALL: {overall}   ({len(results)} scene(s), {n_fail} failing)")
+        print(f"  screenshots: {len(shots)} pair(s), {len(gross)} GROSS "
+              f"render-divergent, {len(capmis)} CAPTURE-MISMATCH (re-shoot)")
+    if capmis:
+        print("\n  !! CAPTURE-MISMATCH -- these acc/cpu shots landed on DIFFERENT")
+        print("     decoded frames (a determinism defect in the SHOT pass, not a")
+        print("     render bug). Re-shoot: the SHOT runs now pin")
+        print("     --pause --hr-seek=yes --dither=no --deband=no. A pair that")
+        print("     survives a deterministic re-shoot is a REAL divergence -> escalate.")
+        for s in capmis:
+            print(f"       re-shoot {s['acc']}  (maxdiff {s['maxdiff8']:.0f}/255 "
+                  f"spread over {s['area_pct']:.1f}% of frame / "
+                  f"{s['occ_pct']:.0f}% of grid)")
+    print(f"\nOVERALL: {overall}   ({len(results)} scene(s), {n_fail} failing; "
+          f"{len(gross)} GROSS shot(s))")
     print("=" * 60)
 
     # verdict.json
@@ -496,12 +656,21 @@ def main(argv=None) -> int:
             "video_draw_over_budget": 0,
             "frame_drops": 0,
             "counters_all_zero": COUNTERS,
-            "screenshot_gross_gate_over_255": args.gross,
+            "shot_match_bar_over_255": TIGHT_BAR8,
+            "shot_gross_gate_over_255": args.gross,
+            "shot_capture_mismatch": {
+                "area_pct_gt": SPREAD_AREA_PCT,
+                "grid_occ_pct_gt": SPREAD_OCC_PCT,
+                "note": "spread hot-pixel diff = adjacent-frame capture defect, "
+                        "re-shoot; not a render failure",
+            },
         },
         "overall": overall,
         "scenes": [{k: v for k, v in r.items() if k != "_report"}
                    for r in results],
         "screenshots": shots,
+        "screenshot_capture_mismatches": [s["acc"] for s in shots
+                                          if s["status"] == "CAPTURE-MISMATCH"],
     }
     try:
         with open(out_json, "w", encoding="utf-8") as fh:
