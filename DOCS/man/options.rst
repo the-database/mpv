@@ -2739,7 +2739,7 @@ Subtitles
 
     Default: no.
 
-``--sub-glyph-atlas-size=<1024-16384>``
+``--sub-glyph-atlas-size=<0|1024-16384>``
     Edge length, in pixels, of the square persistent GPU glyph atlas used by
     ``--sub-gpu-raster`` / ``--sub-gpu-composite`` on ``--vo=gpu-next``. The atlas
     is created **once** at this size when the video output is configured and is
@@ -2751,12 +2751,19 @@ Subtitles
     lazily re-rasterized on their next use. The value is clamped to the GPU's
     maximum 2D texture size.
 
-    A larger atlas caches more glyphs at once (fewer evictions) at a memory cost
-    of ``N×N`` bytes (e.g. the default 8192 uses 64 MiB, 16384 uses 256 MiB).
-    There is normally no reason to change it; the default comfortably holds a
-    dense 8K sign frame's glyphs.
+    Glyphs larger than 1/64 of the atlas area are never cached: they are
+    rasterized each frame into a transient store instead (a giant sign glyph
+    would evict hundreds of dialogue glyphs for no reuse value), as is any
+    overflow when a single frame's working set exceeds the whole atlas — a
+    glyph is never dropped.
 
-    Default: 8192.
+    A larger atlas caches more glyphs at once (fewer evictions) at a memory cost
+    of ``N×N`` bytes (8192 uses 64 MiB, 16384 uses 256 MiB; plus half that for
+    the transient store). 0 selects automatically: 8192, or 16384 when the
+    display is 4K or larger (glyph dimensions scale with the output size, so
+    the scaled working set of dense typesetting overflows 8192² there).
+
+    Default: 0 (auto).
 
 ``--sub-glyph-atlas-height=<0-16384>``
     Debug/development only. Overrides ``--sub-glyph-atlas-size`` with a smaller
