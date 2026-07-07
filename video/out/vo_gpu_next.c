@@ -286,10 +286,14 @@ struct priv {
     // absolute bail time for the update_overlays call currently running
     // (0 = guard inactive for that call). guard_fired latches any bail this
     // frame so stale-present counts once per frame, not once per overlay set.
+    // guard_presented_empty latches when a bail this frame presented NO
+    // overlays (a vanish) so it is counted as guard-empty rather than
+    // stale-present; sticky across the frame's overlay builds (any vanish wins).
     int64_t guard_t0;
     int64_t guard_deadline_ns;
     int64_t guard_abs;
     bool guard_fired;
+    bool guard_presented_empty;
 
     uint64_t last_id;
     uint64_t osd_sync;
@@ -343,11 +347,24 @@ struct priv {
     int64_t cnt_shader_warmups;
     int64_t stat_gcache_epoch_advance, stat_gcache_evict_n, stat_gcache_overcommit;
     int64_t stat_shader_warmups;
-    // WP-E3: presentation-guard engagements (frames presented with the
-    // previous complete overlay state because the build blew its deadline).
-    // Acceptance runs assert this stays 0; it exists for unknown stall
-    // classes. Distinct from ra-stale (dec_sub-level render-ahead staleness).
+    // WP-E3: presentation-guard engagements. Split by what the bail served:
+    //   stale-present -- the previous complete overlay state was still valid
+    //                    for this frame and was presented (subs at most one
+    //                    frame stale). This is the guard working as designed.
+    //   guard-empty   -- the bail presented NO overlays (a visible sub vanish)
+    //                    because no valid previous snapshot existed: cold start
+    //                    (good == -1), post-seek/track-change (reset), a pts
+    //                    discontinuity, or a >0.5 s content gap where the stale
+    //                    snapshot would be wrong content. Reachable only in
+    //                    those genuinely-invalid cases -- in steady-state
+    //                    continuous playback the must_complete alternation keeps
+    //                    the last good build <=2 frames back (well inside the
+    //                    0.5 s backstop) so an overrun always serves stale.
+    // Acceptance gates BOTH at 0 (guard-empty is a visible error; stale-present
+    // is 1-frame-stale but still a stall we don't want on a clean run). Distinct
+    // from ra-stale (dec_sub-level render-ahead staleness).
     int64_t cnt_stale_present, stat_stale_present;
+    int64_t cnt_guard_empty, stat_guard_empty;
     // WP-H1b: glyphs uploaded/rasterized into the atlas by the idle pre-fill
     // (i.e. atlas-fill work moved OFF the frame that first shows them).
     int64_t cnt_prefill_glyphs, stat_prefill_glyphs;
@@ -1165,8 +1182,13 @@ static void overlay_tex_floor(struct priv *p, int *fw, int *fh)
 // overcommit -- the current item's working set exceeded the whole atlas);
 // WP-H1d: the caller then falls back to the per-item transient store
 // (gc_trans_place) so the glyph is still drawn -- NEVER skipped (the old skip
-// was silent content loss). The overcommit counter thus now means "fell back
-// to the transient path", and acceptance runs assert it stays 0.
+// was silent content loss). The overcommit counter thus now means "took the
+// lossless per-frame transient path for a big/overflow glyph" (proven pixel-
+// identical to CPU under atlas pressure), NOT content loss. Post-H1d it is an
+// ungated tuning signal in acceptance (INFO, not gated ==0): dense 8K signs
+// legitimately trip it; its only cost is per-frame re-raster, already gated by
+// the video-draw budget. Nonzero => raise --sub-glyph-atlas-size if any frames
+// are over budget.
 //
 // One open-addressed probe locates the id (if present) and the first reusable
 // (empty or stale) slot. Stale slots act as reusable tombstones that stay
@@ -3203,11 +3225,15 @@ bail:
     }
     // Off the fast path (fires are exceptional); lets tests attribute exactly
     // what a guard engagement presented (stale snapshot pts vs no overlays).
+    // A presented-nothing bail (no valid previous snapshot: cold start,
+    // post-seek/reset, pts discontinuity, or >0.5 s content gap) is the visible
+    // vanish -- count it as guard-empty, not stale-present. Sticky per frame.
     if (frame->num_overlays) {
         MP_VERBOSE(vo, "[present-guard] deadline exceeded at pts %f: presenting "
                    "previous overlays (pts %f)\n",
                    src ? src->pts : MP_NOPTS_VALUE, g->good_pts);
     } else {
+        p->guard_presented_empty = true;
         MP_VERBOSE(vo, "[present-guard] deadline exceeded at pts %f: presenting "
                    "no overlays\n", src ? src->pts : MP_NOPTS_VALUE);
     }
@@ -4168,6 +4194,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // approx_duration (there is no container fps at the vo level), then to a
     // ~24 fps budget.
     p->guard_fired = false;
+    p->guard_presented_empty = false;
     int64_t gdl = 0;
     int gms = p->next_opts->sub_present_guard_ms;
     if (gms > 0) {
@@ -4335,10 +4362,17 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "shader-warmups",            p->cnt_shader_warmups,      &p->stat_shader_warmups);
     // WP-E3: guard engagements, once per frame no matter how many overlay
     // sets bailed (ra-stale counts dec_sub-level staleness separately; the
-    // two layers are independent and never double-count).
-    if (p->guard_fired)
-        p->cnt_stale_present++;
+    // two layers are independent and never double-count). A bail that served
+    // the previous overlays is stale-present; one that presented nothing (no
+    // valid snapshot -- cold start / post-seek / discontinuity) is guard-empty.
+    if (p->guard_fired) {
+        if (p->guard_presented_empty)
+            p->cnt_guard_empty++;
+        else
+            p->cnt_stale_present++;
+    }
     emit_counter(vo, "stale-present",             p->cnt_stale_present,       &p->stat_stale_present);
+    emit_counter(vo, "guard-empty",               p->cnt_guard_empty,         &p->stat_guard_empty);
     emit_counter(vo, "prefill-glyphs",            p->cnt_prefill_glyphs,      &p->stat_prefill_glyphs);
     emit_counter(vo, "glyphs-uncached",           p->cnt_glyph_uncached,      &p->stat_glyph_uncached);
     if (want_slow) {
