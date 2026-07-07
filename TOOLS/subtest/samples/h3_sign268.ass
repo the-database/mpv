@@ -13,9 +13,15 @@
 ; (rounded to 0) and dropped it, so the GPU path was missing the whole shadow
 ; layer. Fix: gate render_shadow_deferred on FILTER_NONZERO_SHADOW.
 ;   {=31} shadow raster-vs-CPU: 229/255 -> 0.5/255 (black bg);  live t=268: 115 -> 0.7.
-; Residual (SEPARATE, pre-existing): {=30}'s \blur20 parchment is the large-sigma
-; gaussian-approx gap (~3.4/255 gray, ~0.7 on the live video) beyond the M5-
-; certified sigma range; unaffected by the shadow fix.
+; Residual (WP-H3 investigation, documented-acceptable): NOT a single-element
+; blur gap. Each layer in isolation ({=30} parchment \blur20, {=31} shadow,
+; {=32} fill) AND every pair of them diffs CPU-vs-GPU EXACTLY 0. Only all three
+; stacked produce a residual, and it is a 1-2 PIXEL multi-layer composite-
+; accumulation rounding effect at coverage crossovers (everything else <1/255):
+; 3.38/255 (2 px) on this flat-gray synthetic bg, 0.69-2.58/255 (1 px) on the
+; live video. Temporally stable (no shimmer). No trivial/perf-neutral fix (it is
+; the multi-layer float-blend accumulation, not a kernel/coefficient), and it is
+; sub-perceptual -- well inside the visually-lossless bar on real content.
 Title: h3 sign268 fractional-shadow deferred-drop repro
 ScriptType: v4.00+
 WrapStyle: 0
