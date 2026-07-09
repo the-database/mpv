@@ -894,6 +894,73 @@ static void osd_combine_part(struct priv *p, pl_tex atlas, pl_tex acc,
         pl_dispatch_abort(p->osd_dp, &sh);
 }
 
+// WP-H5b: batched "gather" combine. One osd_combine_part dispatch per glyph is
+// the dominant compose-build dispatch-RECORD cost on dense walls (hundreds of
+// runs x their glyphs -- the round-2 42-61ms "other" on a 5090). Sum a whole
+// run's glyphs into run_acc in FEWER dispatches: each output pixel reads the
+// run's glyph list (a uniform array, up to GATHER_MAXG per dispatch) and adds
+// the coverage of every glyph covering it, in glyph order.
+//   - Race-free: output-indexed (each acc pixel is read-added-written by exactly
+//     one invocation), so no atomics -- unlike the abandoned r32u atomic combine
+//     (which also could not compile as a float storage image).
+//   - Bit-identical to the sequential per-glyph adds: the local accumulator sums
+//     the SAME coverages in the SAME (parts[]) order and stores once, so the f32
+//     rounding matches exactly; all coverage is >= 0 so there is no catastrophic
+//     cancellation (unlike the sign-bleed span form) -- the arithmetic is
+//     integer index math + exact texelFetch + same-order positive adds, so
+//     lavapipe validation carries to real hardware.
+// Glyphs beyond GATHER_MAXG chunk into more dispatches; a run whose bbox*count
+// would be too much GPU fill (few, huge glyphs) uses the per-glyph path instead
+// -- same pixels either way (see gc_build_cov).
+#define GATHER_MAXG 64
+static const char *const osd_combine_gather_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x >= bw || g.y >= bh) return;\n"
+    "float a = imageLoad(acc, g).r;\n"
+    "for (int k = 0; k < nglyph; k++) {\n"
+    "    vec4 A = gl[2*k], B = gl[2*k+1];\n"        // A: dx,dy,w,h   B: sax,say,atlas,_
+    "    int dx=int(A.x), dy=int(A.y);\n"
+    "    if (g.x >= dx && g.y >= dy && g.x < dx+int(A.z) && g.y < dy+int(A.w)) {\n"
+    "        ivec2 s = ivec2(int(B.x)+g.x-dx, int(B.y)+g.y-dy);\n"
+    "        a += B.z > 0.5 ? texelFetch(tatlas, s, 0).r : texelFetch(atlas, s, 0).r;\n"
+    "    }\n"
+    "}\n"
+    "imageStore(acc, g, vec4(a, 0.0, 0.0, 0.0));\n";
+
+// gl holds nglyph (<= GATHER_MAXG) entries of 2 vec4 each: [dx,dy,w,h][sax,say,
+// atlas,_]; the caller must pass a full GATHER_MAXG-sized array (unused tail is
+// never read by the shader). atlas != 0 selects the per-item transient store.
+static void osd_combine_gather(struct priv *p, pl_tex acc, const float *gl,
+                               int nglyph, int bw, int bh)
+{
+    pl_shader sh = pl_dispatch_begin(p->osd_dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=0,
+                    .access=PL_DESC_ACCESS_READWRITE }, .binding = { .object=acc } },
+        { .desc = { .name="atlas", .type=PL_DESC_SAMPLED_TEX, .binding=1 },
+          .binding = { .object=p->glyph_atlas } },
+        { .desc = { .name="tatlas", .type=PL_DESC_SAMPLED_TEX, .binding=2 },
+          .binding = { .object=p->trans_atlas ? p->trans_atlas : p->glyph_atlas } },
+    };
+    struct pl_var glvar = pl_var_vec4("gl");
+    glvar.dim_a = 2 * GATHER_MAXG;
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("bw"), .data=&bw }, { .var = pl_var_int("bh"), .data=&bh },
+        { .var = pl_var_int("nglyph"), .data=&nglyph },
+        { .var = glvar, .data = gl },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 3,
+        .variables = vars, .num_variables = 4, .body = osd_combine_gather_body,
+    };
+    if (pl_shader_custom(sh, &cs))
+        pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (bw+15)/16, (bh+15)/16, 1 }));
+    else
+        pl_dispatch_abort(p->osd_dp, &sh);
+}
+
 // One r/w-storage + one sampled/storage helper for resolve and fix_outline.
 static void osd_unop(struct priv *p, pl_tex a, pl_tex b, int rw, int rh,
                      const char *aname, bool a_sampled, const char *bname,
@@ -1393,6 +1460,12 @@ struct gc_region {
     int shift_x, shift_y;        // shadow-run sub-pixel offset, 1/64 px (0..63)
 };
 
+// WP-H5b: above this bbox-area x glyph-count product a run uses the per-glyph
+// combine path (the gather fills the whole run bbox once per glyph-chunk, so a
+// few glyphs spread over a huge bbox would waste GPU fill). Below it -- the
+// common dense case (short text/sign runs) -- the batched gather collapses the
+// per-glyph dispatch-record cost. Both paths produce identical pixels.
+#define GATHER_GPU_CAP ((int64_t) 32 << 20)
 // Combine a region's glyph list (saturating add) into run_acc at run-local
 // coords and resolve to cov. (Blur happens later -- after fix_outline -- to
 // match libass's combine -> expand -> fix_outline -> blur order.)
@@ -1401,6 +1474,17 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
                          pl_tex cov, int bw, int bh, struct gpos *cpos, double gs)
 {
     osd_clear(p, p->run_acc, bw, bh);
+    int nplace = 0;
+    for (int k = 0; k < n; k++)
+        if (cpos[parts[k]].t >= 0) nplace++;
+    // WP-H5b: batch the per-glyph combines into gather dispatches when the GPU
+    // fill (bbox x count) stays bounded and the glyph atlas exists.
+    bool gather = p->glyph_atlas && (int64_t) bw * bh * nplace <= GATHER_GPU_CAP;
+    // Zeroed so a partial final chunk's unused tail (which pl_dispatch still
+    // uploads with the uniform, though the shader reads only [0,nglyph)) is
+    // never uninitialised memory.
+    float gl[8 * GATHER_MAXG] = {0};
+    int gn = 0;
     for (int k = 0; k < n; k++) {
         const struct sub_bitmap *b = &item->parts[parts[k]];
         // Glyph coverage (b->w x b->h) is at the capped render resolution; place
@@ -1410,17 +1494,31 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
             continue;   // unplaceable (theoretical; see gc_trans_place)
         int dx = lrint(b->x * gs) - r->x0 + r->margin;
         int dy = lrint(b->y * gs) - r->y0 + r->margin;
-        // WP-H1d: uncached/overflow glyphs live in the per-item transient
-        // store instead of the persistent atlas.
-        pl_tex src = cpos[parts[k]].t > 0 ? p->trans_atlas : p->glyph_atlas;
-        osd_combine_part(p, src, p->run_acc, cpos[parts[k]].ax,
-                         cpos[parts[k]].ay, dx, dy, b->w, b->h);
+        if (gather) {
+            float *e = &gl[8 * gn];
+            e[0]=dx; e[1]=dy; e[2]=b->w; e[3]=b->h;
+            e[4]=cpos[parts[k]].ax; e[5]=cpos[parts[k]].ay;
+            e[6]=cpos[parts[k]].t > 0 ? 1.0f : 0.0f; e[7]=0;
+            if (++gn == GATHER_MAXG) {
+                osd_combine_gather(p, p->run_acc, gl, gn, bw, bh);
+                gn = 0;
+            }
+        } else {
+            // WP-H1d: uncached/overflow glyphs live in the per-item transient
+            // store instead of the persistent atlas.
+            pl_tex src = cpos[parts[k]].t > 0 ? p->trans_atlas : p->glyph_atlas;
+            osd_combine_part(p, src, p->run_acc, cpos[parts[k]].ax,
+                             cpos[parts[k]].ay, dx, dy, b->w, b->h);
+        }
     }
+    if (gn > 0) osd_combine_gather(p, p->run_acc, gl, gn, bw, bh);
     osd_unop(p, p->run_acc, cov, bw, bh, "acc", false, "dst", osd_resolve_body);
 }
 
 static void gc_blur(struct priv *p, pl_tex cov, int bw, int bh, float sigma)
 {
+    if (sigma <= 0)
+        return;   // WP-H5b: no-blur run (radius 0 = identity) -- skip 2 dispatches
     stats_time_start(p->stats, "sub-blur");   // WP-A3: GPU blur pass (composite path)
     osd_blur_part(p, cov, p->run_tmp, 0, 0, bw, bh, sigma, osd_blur_body_h);
     osd_blur_part(p, p->run_tmp, cov, 0, 0, bw, bh, sigma, osd_blur_body_v);
@@ -2051,6 +2149,11 @@ static void gc_warmup(struct priv *p)
     if (have_r32 && p->run_acc) {
         osd_clear(p, p->run_acc, D, D);                                  (*n)++;
         if (p->glyph_atlas) { osd_combine_part(p, p->glyph_atlas, p->run_acc, 0, 0, 0, 0, D, D); (*n)++; }
+        // WP-H5b: precompile the batched gather-combine variant (one dummy glyph).
+        if (p->glyph_atlas) {
+            float gl[8 * GATHER_MAXG] = {0};
+            osd_combine_gather(p, p->run_acc, gl, 1, D, D);             (*n)++;
+        }
     }
     if (have_r8 && have_r32 && p->run_acc && p->run_cov_f)
         { osd_unop(p, p->run_acc, p->run_cov_f, D, D, "acc", false, "dst", osd_resolve_body); (*n)++; }
