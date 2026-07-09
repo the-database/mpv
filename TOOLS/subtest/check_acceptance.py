@@ -19,8 +19,8 @@ ACCEPTANCE BAR (a scene PASSES only if all three hold):
 
   3. ALL of these integrity counters == 0:
        gcache-flush atlas-overflow staging-grow overlay-buf-grow tex-realloc
-       vo-alloc-after-first-frame ra-miss ra-inline ra-stale stale-present
-       guard-empty
+       raster-pool-grow vo-alloc-after-first-frame ra-miss ra-inline ra-stale
+       stale-present guard-empty
      (gcache-overcommit is NOT gated -- post-H1d it is the lossless per-frame
      transient-glyph path, an informational tuning signal, not content loss.)
      mpv emits these with emit_counter() (vo_gpu_next.c) / MP_STATS value lines
@@ -93,6 +93,11 @@ COUNTERS = [
     "staging-grow",
     "overlay-buf-grow",
     "tex-realloc",
+    # WP-H5a: any raster/compose pool (run_acc/run_tmp/run_cov_*, edge_tex,
+    # work_tex, trans_atlas, per-sub result_tex) recreated mid-playback. All are
+    # preallocated to a display-derived worst case at warm-up, so a grow here is
+    # a VO-thread alloc stall (the round-2 533ms "other" class) -- gated ==0.
+    "raster-pool-grow",
     "vo-alloc-after-first-frame",
     "ra-miss",
     "ra-inline",
