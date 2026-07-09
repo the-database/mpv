@@ -99,6 +99,31 @@ struct osd_entry {
 #define GLYPH_STAGE_MAX_BYTES (16u << 20)
 #define OVERLAY_BUF_MAX_BYTES  (8u << 20)
 
+// WP-H5a: display-derived worst-case sizing for the raster/compose pools that
+// gc_prealloc_pools preallocates so they never grow mid-playback (the round-2
+// 533ms "other" stall class). All are functions of the output area, so they
+// scale with resolution; the counted grow fallback (raster-pool-grow) catches
+// any content that still exceeds them (then bump these). Calibrated against the
+// dense 8K corpus (dense_ep09 / dense_signs / mixed_8k) with generous headroom.
+//   RUN_MARGIN    -- per-run scratch halo (both sides) for the blur/\be expand;
+//                    512 covers a full-screen sign run with a wide blur.
+//   COVER_K       -- coverage the raster writes in one frame as a multiple of
+//                    the screen area (fill+border+shadow layers over the same
+//                    pixels): bounds the raster-tile / segment count.
+//   SEGS_PER_TILE -- avg outline segments touching one 16x16 tile (edge_tex).
+//   RESULT_H_MULT -- per-sub result-atlas height as a multiple of the screen
+//                    height (runs shelf-packed at 4096 width). Measured dense
+//                    real content (kobayashi ~0.3x, animated ep09 text ~0.75x)
+//                    packs to well under 1x; a sudden 200-sign+churn density
+//                    wall packs to ~3.25x. 4x covers that with headroom (capped
+//                    at the GPU limit, ~3.8x of an 8K screen). Even denser
+//                    stress subs can still exceed it -- then the counted grow
+//                    fallback fires (raise this).
+#define RASTER_RUN_MARGIN    512
+#define RASTER_COVER_K       4
+#define RASTER_SEGS_PER_TILE 8
+#define RASTER_RESULT_H_MULT 4
+
 struct osd_state {
     struct osd_entry entries[MAX_OSD_PARTS];
     struct pl_overlay overlays[MAX_OSD_PARTS];
@@ -335,9 +360,16 @@ struct priv {
     int64_t cnt_gcache_flush, cnt_atlas_overflow, cnt_staging_grow;
     int64_t cnt_overlay_buf_grow, cnt_tex_realloc, cnt_vo_alloc_after_first;
     int64_t cnt_raster_dispatches, cnt_raster_tiles;
+    // WP-H5a: any raster/compose pool (run_acc/run_tmp/run_cov_*, edge_tex,
+    // work_tex, trans_atlas, per-sub result_tex) recreated mid-playback. These
+    // are all preallocated to a display-derived worst case at gc_warmup, so a
+    // grow here after the first frame is a VO-thread alloc stall (the round-2
+    // 533ms "other" class) -- gated ==0 and fed into vo-alloc-after-first-frame.
+    int64_t cnt_raster_pool_grow;
     int64_t stat_gcache_flush, stat_atlas_overflow, stat_staging_grow;
     int64_t stat_overlay_buf_grow, stat_tex_realloc, stat_vo_alloc_after_first;
     int64_t stat_raster_dispatches, stat_raster_tiles;
+    int64_t stat_raster_pool_grow;
     // WP-E: epoch-eviction + warm-up counters. gcache-epoch-advance = segment
     // recycles (bounded, replaces the flush); gcache-evict-n = entries evicted
     // (cumulative); gcache-overcommit = glyphs skipped because a single item's
@@ -1175,6 +1207,28 @@ static void overlay_tex_floor(struct priv *p, int *fw, int *fh)
 }
 
 #if HAVE_ASS_COMPOSITE_DEFERRED
+// WP-H5a: gc_ensure for the raster/compose pools that historically grew on
+// demand mid-playback (run_acc/run_tmp/run_cov_*, edge_tex, work_tex,
+// trans_atlas, per-sub result_tex). They are all preallocated to a display-
+// derived worst case at gc_warmup (gc_prealloc_pools), so the hot-path call
+// no-ops. If content still outgrows the prealloc, this counted fallback grows
+// it AND bumps raster-pool-grow (a mid-playback pl_tex_recreate = VO-thread
+// stall of the round-2 533ms class). A real (re)allocation is detected by a
+// dimension change, so the first (warm-up) allocation via plain gc_ensure does
+// not double-count here.
+static bool gc_ensure_pool(struct priv *p, pl_tex *t, pl_fmt fmt, int w, int h,
+                           bool storable, bool sampleable, bool blit_src,
+                           bool blit_dst, bool host_writable)
+{
+    int pw = *t ? (*t)->params.w : -1;
+    int ph = *t ? (*t)->params.h : -1;
+    bool ok = gc_ensure(p->gpu, t, fmt, w, h, storable, sampleable,
+                        blit_src, blit_dst, host_writable);
+    if (ok && *t && ((*t)->params.w != pw || (*t)->params.h != ph))
+        vo_alloc_bump(p, &p->cnt_raster_pool_grow);
+    return ok;
+}
+
 // Reserve a glyph's slot in the persistent atlas. Cache hit (live entry, same
 // size): *upload stays false. Miss: a ring slot is allocated + the id inserted,
 // *upload set true (the caller uploads/rasterizes the pixels). Returns false
@@ -1266,8 +1320,8 @@ static bool gc_cacheable(struct priv *p, int w, int h)
 // WP-H1d: allocate a slot in the per-item transient store (uncached and
 // overflow glyphs; see priv.trans_atlas). Shelf packing; the cursor is reset
 // at the start of every compose item. Grows the texture on demand (counted
-// via tex-realloc -- it is pre-created at warm-up so this should never fire
-// in normal playback; growth happens before the item's raster/upload flush,
+// via raster-pool-grow -- it is pre-created at warm-up so this should never
+// fire in normal playback; growth happens before the item's raster/upload flush,
 // so no already-flushed coverage is lost). Only fails when a single item
 // needs more transient area than the GPU's max texture allows (> 8x the 8K
 // screen area of uncached coverage) -- unreachable for real content.
@@ -1305,10 +1359,9 @@ static bool gc_trans_place(struct priv *p, int w, int h, struct gpos *out)
 #else
         const bool storable = false;
 #endif
-        if (!gc_ensure(gpu, &p->trans_atlas, r8, want_w, want_h,
-                       storable, true, false, false, true))
+        if (!gc_ensure_pool(p, &p->trans_atlas, r8, want_w, want_h,
+                            storable, true, false, false, true))
             return false;
-        vo_alloc_bump(p, &p->cnt_tex_realloc);
     }
     out->ax = p->tr_x;
     out->ay = p->tr_y;
@@ -1855,6 +1908,74 @@ static void ensure_overlay_pool(struct priv *p)
     }
 }
 
+// WP-H5a: preallocate the raster/compose pools that would otherwise grow on
+// demand mid-playback (the round-2 533ms "other" stall was one such grow -- an
+// uncounted pl_tex_recreate in the compose/raster path). Sizes derive from the
+// display (osd_res), so they scale with the output resolution, and are capped
+// at the GPU 2D-texture limit; the counted grow fallback (gc_ensure_pool ->
+// raster-pool-grow) still catches any content that exceeds them. Called from
+// gc_warmup and re-floored on every reconfig (display-size change), always OFF
+// the hot path -- so the plain gc_ensure calls here never bump the counter.
+static void gc_prealloc_pools(struct priv *p)
+{
+    pl_gpu gpu = p->gpu;
+    if (!gpu)
+        return;
+    int maxd = gpu->limits.max_tex_2d_dim;
+    pl_fmt r8  = p->osd_fmt[SUBBITMAP_LIBASS];
+    pl_fmt r32 = p->osd_acc_fmt;
+    bool have_r8  = r8  && (r8->caps  & PL_FMT_CAP_STORABLE);
+    bool have_r32 = r32 && (r32->caps & PL_FMT_CAP_STORABLE);
+    int ow = MPMAX(p->osd_res.w, 512), oh = MPMAX(p->osd_res.h, 512);
+
+    // Per-run scratch (run_acc/run_tmp r32f; run_cov_f/run_cov_b r8): a single
+    // deferred run's bbox is bounded by the screen, plus a blur/\be halo margin.
+    int rw = MPMIN(ow + RASTER_RUN_MARGIN, maxd);
+    int rh = MPMIN(oh + RASTER_RUN_MARGIN, maxd);
+    if (have_r32) {
+        gc_ensure(gpu, &p->run_acc, r32, rw, rh, true, false, false, false, false);
+        gc_ensure(gpu, &p->run_tmp, r32, rw, rh, true, true,  false, false, false);
+    }
+    if (have_r8) {
+        gc_ensure(gpu, &p->run_cov_f, r8, rw, rh, true, true, false, false, false);
+        gc_ensure(gpu, &p->run_cov_b, r8, rw, rh, true, true, false, false, false);
+    }
+
+    // Per-sub result atlas (compose_glyph_runs shelf-packs an item's runs at
+    // AW=4096 width): width up to the widest run; height RESULT_H_MULT x the
+    // screen height (real dense content packs to well under 1x). Only the
+    // subtitle entries (render_index OSDTYPE_SUB==0 / OSDTYPE_SUB2==1, the only
+    // OSD objects that emit deferred glyph/outline runs) ever reach the compose
+    // path, and the overlay state is double-buffered, so preallocate both
+    // subtitle result_tex slots in each of states[0]/states[1].
+    if (have_r8) {
+        int rtw = MPMIN(MPMAX(4096, ow + RASTER_RUN_MARGIN), maxd);
+        int rth = MPMIN(RASTER_RESULT_H_MULT * oh, maxd);
+        for (int s = 0; s < 2; s++)
+            for (int e = 0; e <= 1; e++)   // OSDTYPE_SUB, OSDTYPE_SUB2
+                gc_ensure(gpu, &p->osd_guard.states[s].entries[e].result_tex,
+                          r8, rtw, rth, true, true, false, false, false);
+    }
+
+#if HAVE_ASS_OUTLINE_DEFERRED
+    // Outline raster pools: edge_tex holds 2 rgba32f texels/segment, work_tex 4/
+    // tile (one 16x16 tile per workgroup). Worst-case tiles ~ screen area x
+    // COVER_K / 256; segments ~ tiles x SEGS_PER_TILE. Widths are fixed
+    // (WORK_TEX_W/EDGE_TEX_W); size the heights and cap at the GPU limit.
+    pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
+    if (ef) {
+        int64_t tiles = (int64_t) ow * oh * RASTER_COVER_K / 256;
+        int wh = (int) MPMIN((4 * tiles + WORK_TEX_W - 1) / WORK_TEX_W, (int64_t) maxd);
+        int64_t segs = tiles * RASTER_SEGS_PER_TILE;
+        int eh = (int) MPMIN((2 * segs + EDGE_TEX_W - 1) / EDGE_TEX_W, (int64_t) maxd);
+        gc_ensure(gpu, &p->work_tex, ef, WORK_TEX_W, MPMAX(wh, 1),
+                  false, true, false, false, true);
+        gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, MPMAX(eh, 1),
+                  false, true, false, false, true);
+    }
+#endif
+}
+
 // WP-E (E1.2/E1.3/E4a): one-time, config-time cold-start warm-up, run OFF the hot
 // path before playback. (a) create the glyph atlas at full size, (b) preallocate
 // the upload rings at their worst-frame max so staging-grow/overlay-buf-grow stay
@@ -1904,24 +2025,18 @@ static void gc_warmup(struct priv *p)
         pl_buf_recreate(gpu, &p->glyph_stage[i],
                         pl_buf_params(.size = GLYPH_STAGE_MAX_BYTES, .host_writable = true));
 
-    // (c)+(d) warm-up scratch, sized to a representative run so the first real
-    // frame rarely regrows them (they grow monotonically; not a full flush).
+    // (c)+(d) WP-H5a: preallocate the raster/compose pools (run_acc/run_tmp/
+    // run_cov_*, edge_tex/work_tex, per-sub result_tex) to the display-derived
+    // worst case so the first -- and every subsequent -- real frame does no
+    // first-time allocation and never grows them mid-playback (raster-pool-grow
+    // stays 0). run_tmp must be r32f like run_acc (see the r_tmp rationale in
+    // compose_glyph_runs), which gc_prealloc_pools honours.
+    gc_prealloc_pools(p);
     pl_fmt r8  = p->osd_fmt[SUBBITMAP_LIBASS];
     pl_fmt r32 = p->osd_acc_fmt;
-    const int W = 256, H = 256, D = 16;  // scratch dims; dummy dispatch dims (1 group)
+    const int D = 16;  // dummy dispatch dims (1 group)
     bool have_r8  = r8  && (r8->caps  & PL_FMT_CAP_STORABLE);
     bool have_r32 = r32 && (r32->caps & PL_FMT_CAP_STORABLE);
-    if (have_r32)
-        gc_ensure(gpu, &p->run_acc, r32, W, H, true, false, false, false, false);
-    // run_tmp is the blur's H->V intermediate; it must be created at the same
-    // high precision the hot path uses (r32f), else the first real frame regrows
-    // it. See the r_tmp rationale in compose_glyph_runs.
-    if (have_r32)
-        gc_ensure(gpu, &p->run_tmp,   r32, W, H, true, true, false, false, false);
-    if (have_r8) {
-        gc_ensure(gpu, &p->run_cov_f, r8, W, H, true, true, false, false, false);
-        gc_ensure(gpu, &p->run_cov_b, r8, W, H, true, true, false, false, false);
-    }
     int64_t *n = &p->cnt_shader_warmups;
     // Compilation is keyed by the generated GLSL (body + descriptor layout +
     // group size), independent of texture size, so a 16x16 dummy dispatch of each
@@ -1999,8 +2114,8 @@ static bool gc_flush_edges(struct priv *p, int ne)
         p->ebuf = talloc_realloc(p, p->ebuf, float, p->ebuf_cap);
     }
     pl_fmt ef = pl_find_named_fmt(gpu, "rgba32f");
-    if (!ef || !gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true,
-                          false, false, true))
+    if (!ef || !gc_ensure_pool(p, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true,
+                               false, false, true))
         return false;
     pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
         .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
@@ -2043,8 +2158,8 @@ static void gc_flush_raster(struct priv *p, struct rjob *rjobs, int nrjobs,
             ti++;
         }
     }
-    if (gc_ensure(gpu, &p->work_tex, pl_find_named_fmt(gpu, "rgba32f"),
-                  WORK_TEX_W, wh, false, true, false, false, true)) {
+    if (gc_ensure_pool(p, &p->work_tex, pl_find_named_fmt(gpu, "rgba32f"),
+                       WORK_TEX_W, wh, false, true, false, false, true)) {
         pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->work_tex,
             .rc = { .x1 = WORK_TEX_W, .y1 = wh },
             .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = p->wbuf));
@@ -2133,7 +2248,6 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // the glyphs are rendered at the capped resolution, so compose the runs in
     // that capped space and upscale the result_tex region to display in the
     // final overlay. gs == 1 (uncapped) leaves coords unchanged.
-    pl_gpu gpu = p->gpu;
     pl_fmt r8 = p->osd_fmt[SUBBITMAP_LIBASS];
     // The gaussian's H->V intermediate (run_tmp) must keep more than 8 bits:
     // libass unpacks its 8-bit coverage to 14 bits (0x4000) and holds that
@@ -2378,11 +2492,11 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     }
     int atlas_w = MPMAX(max_w, 1), atlas_h = MPMAX(shelf_y + shelf_h, 1);
 
-    if (!gc_ensure(gpu, &entry->result_tex, r8, atlas_w, atlas_h, true, true, false, false, false) ||
-        !gc_ensure(gpu, &p->run_acc, p->osd_acc_fmt, run_acc_w, run_acc_h, true, false, false, false, false) ||
-        !gc_ensure(gpu, &p->run_tmp, r_tmp, run_acc_w, run_acc_h, true, true, false, false, false) ||
-        !gc_ensure(gpu, &p->run_cov_f, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
-        !gc_ensure(gpu, &p->run_cov_b, r8, run_acc_w, run_acc_h, true, true, false, false, false)) {
+    if (!gc_ensure_pool(p, &entry->result_tex, r8, atlas_w, atlas_h, true, true, false, false, false) ||
+        !gc_ensure_pool(p, &p->run_acc, p->osd_acc_fmt, run_acc_w, run_acc_h, true, false, false, false, false) ||
+        !gc_ensure_pool(p, &p->run_tmp, r_tmp, run_acc_w, run_acc_h, true, true, false, false, false) ||
+        !gc_ensure_pool(p, &p->run_cov_f, r8, run_acc_w, run_acc_h, true, true, false, false, false) ||
+        !gc_ensure_pool(p, &p->run_cov_b, r8, run_acc_w, run_acc_h, true, true, false, false, false)) {
         talloc_free(tmp);
         return true;
     }
@@ -4353,6 +4467,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "staging-grow",              p->cnt_staging_grow,        &p->stat_staging_grow);
     emit_counter(vo, "overlay-buf-grow",          p->cnt_overlay_buf_grow,    &p->stat_overlay_buf_grow);
     emit_counter(vo, "tex-realloc",               p->cnt_tex_realloc,         &p->stat_tex_realloc);
+    emit_counter(vo, "raster-pool-grow",          p->cnt_raster_pool_grow,    &p->stat_raster_pool_grow);
     emit_counter(vo, "vo-alloc-after-first-frame", p->cnt_vo_alloc_after_first, &p->stat_vo_alloc_after_first);
     emit_counter(vo, "raster-dispatches",         p->cnt_raster_dispatches,   &p->stat_raster_dispatches);
     emit_counter(vo, "raster-tiles",              p->cnt_raster_tiles,        &p->stat_raster_tiles);
@@ -4504,6 +4619,11 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     // changed) display size. Reconfig only -- before playback -- never
     // mid-playback; no-op when already at the right floor.
     ensure_overlay_pool(p);
+    // WP-H5a: likewise re-floor the raster/compose pools to the (possibly
+    // larger) display size. gc_warmup runs once; a later display-size increase
+    // reaches this on reconfig. Uses plain gc_ensure (monotonic MPMAX), off the
+    // hot path, so it never bumps raster-pool-grow.
+    gc_prealloc_pools(p);
 #endif
     return 0;
 }
@@ -5207,6 +5327,7 @@ static int preinit(struct vo *vo)
     // finds a sample on a clean run).
     p->stat_gcache_flush = p->stat_atlas_overflow = p->stat_staging_grow = -1;
     p->stat_overlay_buf_grow = p->stat_tex_realloc = p->stat_vo_alloc_after_first = -1;
+    p->stat_raster_pool_grow = -1;
     p->stat_raster_dispatches = p->stat_raster_tiles = -1;
     p->stat_gcache_epoch_advance = p->stat_gcache_evict_n = p->stat_gcache_overcommit = -1;
     p->stat_shader_warmups = -1;
