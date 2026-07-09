@@ -1845,20 +1845,27 @@ static bool gc_ensure_atlas(struct priv *p)
     return true;
 }
 
-// WP-H1c: per-buffer floor for the legacy-overlay async upload ring, derived
-// from the display size (packed atlas bytes scale with resolution: the ring
-// stages one frame's packed r8/bgra atlas, whose dims scale with the output).
-// A quarter of the floor-texture area covers a full-floor-width r8 band over
-// a quarter of the display height -- comfortably above the heaviest realistic
-// OSD/legacy atlas at that resolution (~2x margin over an --osd-level=3 +
-// stats-page frame) without ballooning the NUM_OVERLAY_BUFS-deep ring; the
-// historical 8 MiB stays as the minimum (sub-4K displays are unchanged) and
-// the counted grow path remains for pathological frames.
+// WP-H1c/H5c: per-buffer floor for the legacy-overlay async upload ring,
+// derived from the display size (packed atlas bytes scale with resolution: the
+// ring stages one frame's packed r8/bgra atlas, whose dims scale with the
+// output). WP-H5c: cover the FULL floor-texture area as r8 -- the round-2 8K
+// statspage found the previous quarter-area floor too small for a full-screen
+// OSD packed atlas (an --osd-level=3 + stats-page frame at 8K measured 8088x1480
+// = 11.8 MiB vs the old 12 MiB floor: a 0.4 MiB margin, so a real-HW stats page
+// with a few more decoder/GPU lines grows every buffer in the NUM_OVERLAY_BUFS
+// ring in turn -- the overlay-buf-grow x16 burst). The r8 packed atlas cannot
+// exceed the floor texture it uploads into, so fw*fh is the exact upper bound;
+// the historical 8 MiB stays as the minimum (sub-4K displays are unchanged).
+// With --osd-render-res-cap the packed atlas shrinks (render height <= cap), so
+// this floor then has large headroom; the counted grow path remains for the
+// pathological uncapped case. (Cost: the 16-deep ring is ~fw*fh*16; on the 8K
+// target that is a few hundred MiB, dwarfed by the atlases and acceptable to
+// keep overlay-buf-grow at 0.)
 static size_t overlay_buf_floor(struct priv *p)
 {
     int fw, fh;
     overlay_tex_floor(p, &fw, &fh);
-    size_t want = MPMAX((size_t) OVERLAY_BUF_MAX_BYTES, (size_t) fw * fh / 4);
+    size_t want = MPMAX((size_t) OVERLAY_BUF_MAX_BYTES, (size_t) fw * fh);
     return (want + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
 }
 
