@@ -5369,6 +5369,7 @@ static void uninit(struct vo *vo)
     pl_tex_destroy(p->gpu, &p->run_cov_f);
     pl_tex_destroy(p->gpu, &p->run_cov_b);
     pl_tex_destroy(p->gpu, &p->glyph_atlas);
+    pl_tex_destroy(p->gpu, &p->trans_atlas);   // WP-H1d store; was leaked at teardown
     pl_tex_destroy(p->gpu, &p->edge_tex);
     pl_tex_destroy(p->gpu, &p->work_tex);
     for (int i = 0; i < 3; i++)
