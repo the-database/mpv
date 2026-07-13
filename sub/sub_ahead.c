@@ -233,6 +233,20 @@ struct sub_ahead {
     uint64_t last_served_content;
     bool have_last_served;
 
+    // WP-H6 (item 6 fix): REAL content identity for ring entries. sd_ass's
+    // sub_bitmaps.change_id is a 0/1 "changed since my previous render" DELTA
+    // (mp_sub_packer_pack_ass sets it from libass's detect_change flag), NOT
+    // an identity -- every changed frame carries 1, so using it directly as
+    // content_id unified DISTINCT frames as "unchanged" (moving text would
+    // freeze under the VO's per-item compose reuse; caught by the moving-wall
+    // A/B). Because the worker renders sequentially on its own renderer, the
+    // flag IS authoritative relative to the worker's previous render: 0 means
+    // byte-identical output. Fold it into a monotonic generation here.
+    // Touched by the worker thread only (outside the lock).
+    uint64_t content_gen;
+    uint64_t last_render_content;
+    bool have_last_render;
+
     // worker render-cost EMA (seconds per frame), for the banking gate.
     double render_ema;
 
@@ -599,7 +613,17 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         if (a->debug_slow_ns)     // debug: artificially slow worker (see create)
             mp_sleep_ns(a->debug_slow_ns);
         double render_time = (mp_time_ns() - t0) / 1e9;
-        uint64_t content_id = bmp ? bmp->change_id : 0;
+        // WP-H6 (item 6 fix): translate the render's 0/1 changed DELTA into a
+        // content identity: an unchanged render shares the previous render's
+        // generation; any change (libass reports position AND content changes
+        // as nonzero) mints a new one. bmp == NULL stays 0 ("no subtitles").
+        uint64_t content_id = 0;
+        if (bmp) {
+            content_id = bmp->change_id == 0 && a->have_last_render
+                       ? a->last_render_content : ++a->content_gen;
+        }
+        a->last_render_content = content_id;
+        a->have_last_render = true;
         pin_outline_blobs(bmp);   // ring entries outlive the packer's blobs
 
         mp_mutex_lock(&a->lock);
