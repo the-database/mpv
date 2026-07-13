@@ -233,6 +233,20 @@ struct sub_ahead {
     uint64_t last_served_content;
     bool have_last_served;
 
+    // WP-H6 (item 6 fix): REAL content identity for ring entries. sd_ass's
+    // sub_bitmaps.change_id is a 0/1 "changed since my previous render" DELTA
+    // (mp_sub_packer_pack_ass sets it from libass's detect_change flag), NOT
+    // an identity -- every changed frame carries 1, so using it directly as
+    // content_id unified DISTINCT frames as "unchanged" (moving text would
+    // freeze under the VO's per-item compose reuse; caught by the moving-wall
+    // A/B). Because the worker renders sequentially on its own renderer, the
+    // flag IS authoritative relative to the worker's previous render: 0 means
+    // byte-identical output. Fold it into a monotonic generation here.
+    // Touched by the worker thread only (outside the lock).
+    uint64_t content_gen;
+    uint64_t last_render_content;
+    bool have_last_render;
+
     // worker render-cost EMA (seconds per frame), for the banking gate.
     double render_ema;
 
@@ -252,7 +266,55 @@ struct sub_ahead {
     long dbg_served, dbg_empty, dbg_miss;
     long dbg_stale, dbg_wait, dbg_prewarm, dbg_inline;
     int dbg_bank_last;
+
+    // WP-H6 (item 2): fetches whose NON-wait phase (lock acquisition + ring
+    // find + serve) exceeded RA_FETCH_STALL_NS on the VO thread. Round 3 had
+    // an uncounted 256.7 ms video-draw whose whole cost sat between the VO
+    // fetch entering sub_ahead_get_bitmaps and its ra-* stats emission with
+    // miss/wait NOT incrementing -- i.e. blocked on `lock` (or an equally
+    // invisible pre-serve step), not the bounded miss-wait. Gated ==0 in
+    // acceptance; a fire logs a phase breakdown for one-look attribution.
+    long dbg_fetch_stall;
+
+    // WP-H6 (item 2): payloads whose last reference dropped under `lock` are
+    // parked here and freed AFTER unlock. Freeing a dense OUTLINES frame
+    // (thousands of pinned blob children) is a long talloc walk; doing it
+    // under `lock` blocks the VO fetch path for the whole free. The array is
+    // NULL-parented (standalone): it is stolen under the lock and freed
+    // outside it, so it must never live in `a`'s talloc child list (which is
+    // only safe to touch under `lock`).
+    struct ahead_payload **retire;
+    int num_retire;
 };
+
+// WP-H6 (item 2): non-wait fetch phases above this are a counted VO stall.
+#define RA_FETCH_STALL_NS (20 * INT64_C(1000000))
+
+// Drop a ring/loop reference under `lock`: the actual talloc_free of the
+// payload tree is deferred to retire_flush() outside the lock.
+static void payload_retire(struct sub_ahead *a, struct ahead_payload *pl)
+{
+    if (pl && atomic_fetch_sub_explicit(&pl->refs, 1, memory_order_acq_rel) == 1)
+        MP_TARRAY_APPEND(NULL, a->retire, a->num_retire, pl);
+}
+
+// Steal the parked payloads (call with `lock` held)...
+static struct ahead_payload **retire_steal(struct sub_ahead *a, int *n)
+{
+    struct ahead_payload **list = a->retire;
+    *n = a->num_retire;
+    a->retire = NULL;
+    a->num_retire = 0;
+    return list;
+}
+
+// ...and free them (call with `lock` NOT held).
+static void retire_flush(struct ahead_payload **list, int n)
+{
+    for (int i = 0; i < n; i++)
+        talloc_free(list[i]);
+    talloc_free(list);
+}
 
 static double ahead_pts_to_subtitle(struct sub_ahead *a, double pts)
 {
@@ -271,7 +333,7 @@ static void ahead_clear(struct sub_ahead *a)
 {
     for (int n = 0; n < a->ring_len; n++) {
         if (a->ring[n].valid) {
-            payload_unref(a->ring[n].pl);
+            payload_retire(a, a->ring[n].pl);   // freed outside `lock`
             a->ring[n] = (struct sub_ahead_entry){0};
         }
     }
@@ -364,16 +426,19 @@ static void ahead_store(struct sub_ahead *a, double V, struct mp_osd_res dim,
         }
     }
     if (a->ring[slot].valid)
-        payload_unref(a->ring[slot].pl);
+        payload_retire(a, a->ring[slot].pl);   // freed outside `lock`
     a->ring[slot] = (struct sub_ahead_entry){
         .valid = true, .video_pts = V, .dim = dim, .format = format,
         .gen = gen, .content_id = content_id, .pl = payload_new(bmp),
     };
 }
 
-// Emit the ra-bank gauge (number of rendered frames beyond the guaranteed
-// depth window) when it changed. Called under lock.
-static void ahead_emit_bank(struct sub_ahead *a)
+// Compute the ra-bank gauge (number of rendered frames beyond the guaranteed
+// depth window). Called under lock; returns true when it changed since the
+// last call (the caller emits the MP_STATS line AFTER unlocking -- WP-H6
+// item 2: no log/stats I/O under `lock`, a blocking write there stalls the
+// VO fetch path).
+static bool ahead_bank_gauge(struct sub_ahead *a, int *out_count)
 {
     double base = a->vo_pts != MP_NOPTS_VALUE ? a->vo_pts : a->hint_pts;
     int count = 0;
@@ -385,20 +450,52 @@ static void ahead_emit_bank(struct sub_ahead *a)
                 count++;
         }
     }
-    if (count != a->dbg_bank_last) {
-        a->dbg_bank_last = count;
-        MP_STATS(a, "value %d ra-bank", count);
-    }
+    *out_count = count;
+    if (count == a->dbg_bank_last)
+        return false;
+    a->dbg_bank_last = count;
+    return true;
 }
 
-static void ahead_verbose_line(struct sub_ahead *a)
+// Snapshot of the health counters, taken under lock, emitted outside it.
+struct ahead_dbg_snap {
+    long served, empty, miss, stale, wait, prewarm, inline_, fetch_stall;
+    int bank;
+    bool bank_changed;
+    bool verbose_due;
+};
+
+static struct ahead_dbg_snap ahead_dbg_snapshot(struct sub_ahead *a)
 {
-    // Prefix (served= empty= miss=) is parsed by TOOLS/subtest/parse_stats.py;
-    // extend only at the end.
-    MP_VERBOSE(a, "[render-ahead] served=%ld empty=%ld miss=%ld stale=%ld "
-               "wait=%ld prewarm=%ld inline=%ld\n",
-               a->dbg_served, a->dbg_empty, a->dbg_miss, a->dbg_stale,
-               a->dbg_wait, a->dbg_prewarm, a->dbg_inline);
+    struct ahead_dbg_snap s = {
+        .served = a->dbg_served, .empty = a->dbg_empty, .miss = a->dbg_miss,
+        .stale = a->dbg_stale, .wait = a->dbg_wait, .prewarm = a->dbg_prewarm,
+        .inline_ = a->dbg_inline, .fetch_stall = a->dbg_fetch_stall,
+    };
+    s.bank_changed = ahead_bank_gauge(a, &s.bank);
+    s.verbose_due = s.served && s.served % 250 == 0;
+    return s;
+}
+
+static void ahead_dbg_emit(struct sub_ahead *a, const struct ahead_dbg_snap *s)
+{
+    MP_STATS(a, "value %ld ra-served", s->served);
+    MP_STATS(a, "value %ld ra-empty", s->empty);
+    MP_STATS(a, "value %ld ra-miss", s->miss);
+    MP_STATS(a, "value %ld ra-stale", s->stale);
+    MP_STATS(a, "value %ld ra-wait", s->wait);
+    MP_STATS(a, "value %ld ra-inline", s->inline_);
+    MP_STATS(a, "value %ld ra-fetch-stall", s->fetch_stall);
+    if (s->bank_changed)
+        MP_STATS(a, "value %d ra-bank", s->bank);
+    if (s->verbose_due) {
+        // Prefix (served= empty= miss=) is parsed by TOOLS/subtest/
+        // parse_stats.py; extend only at the end.
+        MP_VERBOSE(a, "[render-ahead] served=%ld empty=%ld miss=%ld stale=%ld "
+                   "wait=%ld prewarm=%ld inline=%ld fstall=%ld\n",
+                   s->served, s->empty, s->miss, s->stale,
+                   s->wait, s->prewarm, s->inline_, s->fetch_stall);
+    }
 }
 
 static MP_THREAD_VOID sub_ahead_thread(void *ptr)
@@ -516,7 +613,17 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         if (a->debug_slow_ns)     // debug: artificially slow worker (see create)
             mp_sleep_ns(a->debug_slow_ns);
         double render_time = (mp_time_ns() - t0) / 1e9;
-        uint64_t content_id = bmp ? bmp->change_id : 0;
+        // WP-H6 (item 6 fix): translate the render's 0/1 changed DELTA into a
+        // content identity: an unchanged render shares the previous render's
+        // generation; any change (libass reports position AND content changes
+        // as nonzero) mints a new one. bmp == NULL stays 0 ("no subtitles").
+        uint64_t content_id = 0;
+        if (bmp) {
+            content_id = bmp->change_id == 0 && a->have_last_render
+                       ? a->last_render_content : ++a->content_gen;
+        }
+        a->last_render_content = content_id;
+        a->have_last_render = true;
         pin_outline_blobs(bmp);   // ring entries outlive the packer's blobs
 
         mp_mutex_lock(&a->lock);
@@ -526,19 +633,35 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         // discard, the entry is still missing and re-renders next iteration
         // (after the queue drain decodes the packet).
         bool late_pkt = sub_pts >= a->newpkt_min_pts - 1e-9;
+        struct sub_bitmaps *stale_bmp = NULL;
+        long prewarm_snap = -1;
+        bool bank_changed = false;
+        int bank = 0;
         if (gen == a->gen && format == a->cur_format &&
             osd_res_equals(dim, a->cur_dim) && !late_pkt)
         {
             ahead_store(a, target, dim, format, gen, content_id, bmp);
-            if (prewarm) {
-                a->dbg_prewarm++;
-                MP_STATS(a, "value %ld ra-prewarm", a->dbg_prewarm);
-            }
-            ahead_emit_bank(a);
+            if (prewarm)
+                prewarm_snap = ++a->dbg_prewarm;
+            bank_changed = ahead_bank_gauge(a, &bank);
             mp_cond_broadcast(&a->ring_added);  // release a fetch waiting out a miss
         } else {
-            talloc_free(bmp);    // stale (flush/resize/late packet during render)
+            stale_bmp = bmp;     // stale (flush/resize/late packet during render)
         }
+        // WP-H6 (item 2): stats/log writes and payload frees happen with the
+        // lock RELEASED. Round 3's uncounted 256.7 ms VO fetch stall was time
+        // spent blocked on `lock` while the holder did invisible work; the
+        // remaining under-lock work above is now O(ring) bookkeeping only.
+        int nretire = 0;
+        struct ahead_payload **retired = retire_steal(a, &nretire);
+        mp_mutex_unlock(&a->lock);
+        talloc_free(stale_bmp);
+        retire_flush(retired, nretire);
+        if (prewarm_snap >= 0)
+            MP_STATS(a, "value %ld ra-prewarm", prewarm_snap);
+        if (bank_changed)
+            MP_STATS(a, "value %d ra-bank", bank);
+        mp_mutex_lock(&a->lock);
     }
     mp_mutex_unlock(&a->lock);
     MP_THREAD_RETURN();
@@ -609,9 +732,15 @@ void sub_ahead_destroy(struct sub_ahead *a)
         mp_mutex_unlock(&a->lock);
         mp_thread_join(a->thread);
     }
-    ahead_verbose_line(a);
+    // Worker joined: single-threaded from here (no lock needed).
+    struct ahead_dbg_snap snap = ahead_dbg_snapshot(a);
+    snap.verbose_due = true;
+    ahead_dbg_emit(a, &snap);
     queue_flush(a);
     ahead_clear(a);
+    int nretire = 0;
+    struct ahead_payload **retired = retire_steal(a, &nretire);
+    retire_flush(retired, nretire);
     if (a->worker_sd) {
         a->worker_sd->driver->uninit(a->worker_sd);
         talloc_free(a->worker_sd);
@@ -641,13 +770,16 @@ void sub_ahead_enqueue(struct sub_ahead *a, struct demux_packet *pkt)
             if (e->valid &&
                 ahead_pts_to_subtitle(a, e->video_pts) >= pkt->pts - 1e-9)
             {
-                payload_unref(e->pl);
+                payload_retire(a, e->pl);   // freed outside `lock` below
                 *e = (struct sub_ahead_entry){0};
             }
         }
     }
     mp_cond_signal(&a->wakeup);
+    int nretire = 0;
+    struct ahead_payload **retired = retire_steal(a, &nretire);
     mp_mutex_unlock(&a->lock);
+    retire_flush(retired, nretire);
 }
 
 void sub_ahead_flush(struct sub_ahead *a)
@@ -664,7 +796,10 @@ void sub_ahead_flush(struct sub_ahead *a)
     a->newpkt_min_pts = INFINITY;
     mp_cond_signal(&a->wakeup);
     mp_cond_broadcast(&a->ring_added);  // don't leave a fetch waiting on stale gen
+    int nretire = 0;
+    struct ahead_payload **retired = retire_steal(a, &nretire);
     mp_mutex_unlock(&a->lock);
+    retire_flush(retired, nretire);
 }
 
 void sub_ahead_set_timing(struct sub_ahead *a, double sub_speed, float delay,
@@ -684,7 +819,10 @@ void sub_ahead_set_timing(struct sub_ahead *a, double sub_speed, float delay,
         a->gen++;
     }
     mp_cond_signal(&a->wakeup);
+    int nretire = 0;
+    struct ahead_payload **retired = retire_steal(a, &nretire);
     mp_mutex_unlock(&a->lock);
+    retire_flush(retired, nretire);
 }
 
 void sub_ahead_set_video_params(struct sub_ahead *a,
@@ -703,7 +841,10 @@ void sub_ahead_set_video_params(struct sub_ahead *a,
         a->gen++;
         mp_cond_signal(&a->wakeup);
     }
+    int nretire = 0;
+    struct ahead_payload **retired = retire_steal(a, &nretire);
     mp_mutex_unlock(&a->lock);
+    retire_flush(retired, nretire);
 }
 
 void sub_ahead_hint_pts(struct sub_ahead *a, double raw_video_pts)
@@ -721,9 +862,9 @@ void sub_ahead_note_inline(struct sub_ahead *a)
     if (!a)
         return;
     mp_mutex_lock(&a->lock);
-    a->dbg_inline++;
-    MP_STATS(a, "value %ld ra-inline", a->dbg_inline);
+    long v = ++a->dbg_inline;
     mp_mutex_unlock(&a->lock);
+    MP_STATS(a, "value %ld ra-inline", v);   // WP-H6: no stats I/O under lock
 }
 
 void sub_ahead_inline_begin(struct sub_ahead *a)
@@ -752,7 +893,15 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
     *handled = false;
     if (!a)
         return NULL;
+    // WP-H6 (item 2): phase-attribute the fetch. lock_ns is the time to
+    // acquire `lock` (round 3's uncounted 256.7 ms class: the fetch blocked
+    // before doing ANY counted work); wait_ns is the intentional bounded
+    // miss-wait (already counted as ra-wait). Anything else above
+    // RA_FETCH_STALL_NS bumps ra-fetch-stall (gated ==0) with a breakdown.
+    int64_t t_enter = mp_time_ns();
     mp_mutex_lock(&a->lock);
+    int64_t lock_ns = mp_time_ns() - t_enter;
+    int64_t wait_ns = 0;
     if (a->play_dir < 0) {
         // Reverse playback: the worker only walks forward. Degraded mode --
         // the caller falls back to the inline render (counted via ra-inline).
@@ -783,7 +932,8 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
                                             : a->miss_wait_ms / 1000.0;
         if (wait_s > 0) {
             mp_cond_signal(&a->wakeup);  // the worker targets i=0 first
-            int64_t until = mp_time_ns() + (int64_t)(wait_s * 1e9);
+            int64_t wait_t0 = mp_time_ns();
+            int64_t until = wait_t0 + (int64_t)(wait_s * 1e9);
             while (!a->terminate) {
                 idx = ahead_find(a, raw_video_pts, a->cur_dim, a->cur_format);
                 if (idx >= 0)
@@ -791,6 +941,7 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
                 if (mp_cond_timedwait_until(&a->ring_added, &a->lock, until))
                     break;       // deadline passed
             }
+            wait_ns = mp_time_ns() - wait_t0;
             if (idx >= 0)
                 a->dbg_wait++;
         }
@@ -813,14 +964,6 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
         if (src >= 0)
             a->dbg_stale++;
     }
-    MP_STATS(a, "value %ld ra-served", a->dbg_served);
-    MP_STATS(a, "value %ld ra-empty", a->dbg_empty);
-    MP_STATS(a, "value %ld ra-miss", a->dbg_miss);
-    MP_STATS(a, "value %ld ra-stale", a->dbg_stale);
-    MP_STATS(a, "value %ld ra-wait", a->dbg_wait);
-    MP_STATS(a, "value %ld ra-inline", a->dbg_inline);
-    if (a->dbg_served && a->dbg_served % 250 == 0)
-        ahead_verbose_line(a);
     struct sub_bitmaps *res = NULL;
     if (src >= 0 && a->ring[src].pl) {
         // Serve by reference: pin the entry's payload instead of deep-copying
@@ -848,9 +991,27 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
             res->change_id = 0;
         }
     }
-    ahead_emit_bank(a);
+    // WP-H6 (item 2): everything the fetch did MINUS the intentional bounded
+    // wait; a stall here was invisible to every round-3 counter.
+    int64_t stall_ns = (mp_time_ns() - t_enter) - wait_ns;
+    bool stalled = stall_ns > RA_FETCH_STALL_NS;
+    if (stalled)
+        a->dbg_fetch_stall++;
+    struct ahead_dbg_snap snap = ahead_dbg_snapshot(a);
+    int nretire = 0;
+    struct ahead_payload **retired = retire_steal(a, &nretire);
     mp_mutex_unlock(&a->lock);
     mp_cond_signal(&a->wakeup);  // nudge the worker to refill ahead of us
+    // Log/stats writes and payload frees happen OFF the lock (item 2): a
+    // blocking stats write or a big talloc free here can no longer stall a
+    // concurrent fetch or the worker.
+    if (stalled) {
+        MP_WARN(a, "[render-ahead] fetch stalled %.1f ms outside the bounded "
+                "wait (lock %.1f ms, wait %.1f ms)\n", stall_ns / 1e6,
+                lock_ns / 1e6, wait_ns / 1e6);
+    }
+    ahead_dbg_emit(a, &snap);
+    retire_flush(retired, nretire);
     return res;
 }
 
