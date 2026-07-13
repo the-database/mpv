@@ -20,7 +20,7 @@ ACCEPTANCE BAR (a scene PASSES only if all three hold):
   3. ALL of these integrity counters == 0:
        gcache-flush atlas-overflow staging-grow overlay-buf-grow tex-realloc
        raster-pool-grow vo-alloc-after-first-frame ra-miss ra-inline ra-stale
-       stale-present guard-empty
+       ra-fetch-stall stale-present guard-empty
      (gcache-overcommit is NOT gated -- post-H1d it is the lossless per-frame
      transient-glyph path, an informational tuning signal, not content loss.)
      mpv emits these with emit_counter() (vo_gpu_next.c) / MP_STATS value lines
@@ -86,7 +86,18 @@ DEFAULT_BUDGET_MS = 41.7
 #                    is gated ==0. (Post-seek/cold-start stalls can legitimately
 #                    produce it -- stale there would be wrong content -- but a
 #                    clean acceptance run seeks only where the guard does not
-#                    fire, so it must stay 0.)
+#                    fire, so it must stay 0.) WP-H6 (item 4): a bail whose
+#                    VALID previous snapshot simply contained no subtitles (the
+#                    first frame of a sub appearing overran the deadline) is no
+#                    longer counted here -- presenting "still no subs" is the
+#                    correct previous state, one frame late; it counts as
+#                    guard-first-late (info) instead.
+#   ra-fetch-stall -- WP-H6 (item 2): a VO subtitle fetch spent >20 ms OUTSIDE
+#                    the intentional bounded miss-wait (e.g. blocked on the
+#                    render-ahead lock while its holder did slow work). This
+#                    names the round-3 uncounted 256.7 ms video-draw class; a
+#                    fire also logs a lock/wait breakdown ([render-ahead]
+#                    "fetch stalled" in the mpv log) for one-look attribution.
 COUNTERS = [
     "gcache-flush",
     "atlas-overflow",
@@ -97,11 +108,16 @@ COUNTERS = [
     # work_tex, trans_atlas, per-sub result_tex) recreated mid-playback. All are
     # preallocated to a display-derived worst case at warm-up, so a grow here is
     # a VO-thread alloc stall (the round-2 533ms "other" class) -- gated ==0.
+    # WP-H6 (item 1): pools now pre-grow on a helper thread at a ~70% demand
+    # watermark and swap in at frame boundaries (counted raster-pool-pregrow,
+    # info -- that is the fix working); only INLINE grows count here, and the
+    # mpv log names pool+old+new sizes on every grow/pre-grow.
     "raster-pool-grow",
     "vo-alloc-after-first-frame",
     "ra-miss",
     "ra-inline",
     "ra-stale",
+    "ra-fetch-stall",
     "stale-present",
     "guard-empty",
 ]
@@ -114,11 +130,39 @@ COUNTERS = [
 # re-raster) is already gated by the video-draw budget, so gating it ==0 would
 # falsely fail a valid 8K run (dense signs legitimately trip it). When nonzero
 # it prints a tuning hint.
+# WP-H6 additions:
+#   raster-pool-pregrow -- pool grows created off-thread and swapped in at a
+#                          frame boundary (item 1 working as designed).
+#   result-spill        -- frames whose result_tex demand exceeded capacity;
+#                          the overflow composed via the transient store while
+#                          the background pre-grow lands (no inline grow).
+#   blob-hash-hit       -- outline glyphs served by blob CONTENT hash after a
+#                          glyph_id miss (item 3: animated text with an
+#                          unchanged outline skips re-raster/re-upload).
+#   compose-reuse       -- deferred sub items re-emitted from the previous
+#                          frame's compose because their change_id/geometry
+#                          were identical (item 6: sibling OSD churn no longer
+#                          forces a full recompose).
+#   guard-first-late    -- a bail served a VALID snapshot that contained no
+#                          subtitle overlays (first-appearance frame late by
+#                          one); correct previous state, not a vanish.
+#   staging-wrap        -- glyph staging ring used beyond its depth within one
+#                          frame (pl_buf_write can block on a busy buffer);
+#                          structurally 0 in --sub-gpu-raster mode.
+#   glyphs-uncached     -- giant glyphs above the cache admission cap, drawn
+#                          per-frame via the transient store (WP-H1d policy).
 INFO_COUNTERS = [
     "gcache-overcommit",
     "gcache-epoch-advance",
     "gcache-evict-n",
     "prefill-glyphs",
+    "raster-pool-pregrow",
+    "result-spill",
+    "blob-hash-hit",
+    "compose-reuse",
+    "guard-first-late",
+    "staging-wrap",
+    "glyphs-uncached",
 ]
 
 # The mis-linked-build tell: stock (non-fork) libass makes mpv warn-and-ignore
