@@ -166,8 +166,11 @@ struct osd_state *osd_create(struct mpv_global *global)
         .log = mp_log_new(osd, global->log, "osd"),
         .force_video_pts = MP_NOPTS_VALUE,
         .stats = stats_ctx_create(osd, global, "osd"),
+        .stats_ext = stats_ctx_create(osd, global, "osd-ext"),
     };
     mp_mutex_init(&osd->lock);
+    mp_mutex_init(&osd->ext_lock);
+    mp_cond_init(&osd->ext_wakeup);
     osd->opts = osd->opts_cache->opts;
 
     for (int n = 0; n < MAX_OSD_PARTS; n++) {
@@ -193,8 +196,22 @@ void osd_free(struct osd_state *osd)
         return;
     osd_destroy_backend(osd);
     talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->external2);
+    mp_cond_destroy(&osd->ext_wakeup);
+    mp_mutex_destroy(&osd->ext_lock);
     mp_mutex_destroy(&osd->lock);
     talloc_free(osd);
+}
+
+// WP-H7 (defect 2): called when the async external-OSD worker publishes a
+// fresh snapshot, so the player core wakes up and presents it promptly even
+// while paused (during playback the next video frame picks it up anyway).
+void osd_set_ext_wakeup_cb(struct osd_state *osd, void (*cb)(void *ctx),
+                           void *ctx)
+{
+    mp_mutex_lock(&osd->lock);
+    osd->ext_wakeup_cb = cb;
+    osd->ext_wakeup_ctx = ctx;
+    mp_mutex_unlock(&osd->lock);
 }
 
 void osd_set_text(struct osd_state *osd, const char *text)
@@ -400,6 +417,11 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
             res = sub_bitmaps_copy(NULL, obj->external2); // need to be owner
             obj->external2->change_id = 0;
         }
+    } else if (obj->type == OSDTYPE_EXTERNAL) {
+        // WP-H7 (defect 2): script overlays (stats page, OSC) are rendered
+        // by the async worker; serve its last completed snapshot without
+        // ever putting libass work on this (usually the VO) thread.
+        res = osd_external_render_async(osd, obj, render_res, format);
     } else {
         res = osd_object_get_bitmaps(osd, obj, format);
     }
