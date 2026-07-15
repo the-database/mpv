@@ -3896,7 +3896,9 @@ Window
     very high output resolutions (8K), can otherwise contend with heavy
     subtitle frames. The OSD is text/UI, so the slight softening is usually
     acceptable. Subtitles are never affected by this option (see
-    ``--sub-render-res-limit`` for those).
+    ``--sub-render-res-limit`` for those). The cap is internal to
+    rendering: ``osd-dimensions``, script layout and mouse interaction
+    geometry always use the real output size.
 
     Default: 0 (no cap).
 
