@@ -3313,10 +3313,29 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     for (int i = 0; i < nregs; i++) {
         regs[i].margin = blur_expand_pad(MPMAX(regs[i].blur_f, regs[i].blur_b)) +
                          MPMAX(regs[i].be_f, regs[i].be_b);
-        if (regs[i].nbord)
-            ems[nems++] = (struct gc_emit){ regs[i].bord[0], i, 0 };
-        if (regs[i].nfill)
-            ems[nems++] = (struct gc_emit){ regs[i].fill[0], i, 1 };
+        // WP-H7 (defect 1): libass now KEEPS fully transparent deferred images
+        // (their coverage feeds fix_outline; see the fork's ass_render_frame).
+        // A 0xFF-alpha layer composites to nothing, so give it no result-atlas
+        // space and no overlay part (t = -1 -- the emission loop skips it).
+        // Its coverage is still BUILT when a visible sibling needs it for the
+        // fix_outline subtraction (see the region compose below).
+        bool bord_vis = regs[i].nbord && (regs[i].bord_color & 0xFF) != 0xFF;
+        bool fill_vis = regs[i].nfill &&
+                        ((regs[i].fill_color & 0xFF) != 0xFF ||
+                         ((regs[i].run_flags & RUN_FLAG_KF_WIPE) &&
+                          (regs[i].fill_color2 & 0xFF) != 0xFF));
+        if (regs[i].nbord) {
+            if (bord_vis)
+                ems[nems++] = (struct gc_emit){ regs[i].bord[0], i, 0 };
+            else
+                regs[i].bord_t = -1;
+        }
+        if (regs[i].nfill) {
+            if (fill_vis)
+                ems[nems++] = (struct gc_emit){ regs[i].fill[0], i, 1 };
+            else
+                regs[i].fill_t = -1;
+        }
     }
     // insertion sort by key (part indices are distinct; nems is small)
     for (int i = 1; i < nems; i++) {
@@ -3456,7 +3475,17 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         // sigma/be; blur_bm gating), so blurring it here is a no-op then.
         // \be is applied by mpv only in outline mode -- in GLYPHS mode libass
         // box-blurs the coverage on the CPU before deferring the gaussian.
-        if (r->nfill) {
+        // WP-H7 (defect 1): an invisible (0xFF-alpha, t == -1) fill still has
+        // its coverage built when a border will subtract it (fix_outline);
+        // with no such border the whole layer -- or the whole region -- is
+        // skipped outright (exact-output: it would composite to nothing).
+        bool need_fill = r->nfill &&
+                         (r->fill_t >= 0 ||
+                          (r->nbord && r->bord_t >= 0 && (r->run_flags & 1)));
+        bool need_bord = r->nbord && r->bord_t >= 0;
+        if (!need_fill && !need_bord)
+            continue;
+        if (need_fill) {
             gc_build_cov(p, item, r, r->fill, r->nfill, p->run_cov_f, bw, bh, cpos, gs);
             gc_blur(p, p->run_cov_f, bw, bh, r->blur_f);  // σ may be 0 (bordered fill)
 #if HAVE_ASS_OUTLINE_DEFERRED
@@ -3475,7 +3504,7 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                 osd_copy(p, p->run_cov_b, p->run_cov_f, 0, 0, bw, bh);
             }
 #endif
-            if (r->nbord) {
+            if (need_bord) {
                 gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos, gs);
                 gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
 #if HAVE_ASS_OUTLINE_DEFERRED
@@ -3496,7 +3525,7 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 #endif
             if (r->fill_t >= 0)
                 osd_copy(p, p->run_cov_f, dst_f, r->fill_ax, r->fill_ay, bw, bh);
-        } else if (r->nbord) {
+        } else if (need_bord) {
             gc_build_cov(p, item, r, r->bord, r->nbord, p->run_cov_b, bw, bh, cpos, gs);
             gc_blur(p, p->run_cov_b, bw, bh, r->blur_b);
 #if HAVE_ASS_OUTLINE_DEFERRED
