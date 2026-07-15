@@ -874,7 +874,8 @@ static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
 }
 
 struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
-                                           struct osd_object *obj, int format)
+                                           struct osd_object *obj,
+                                           struct mp_osd_res res, int format)
 {
     if (obj->type == OSDTYPE_OSD) {
         if (obj->osd_changed) {
@@ -890,13 +891,16 @@ struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
 
     MP_TARRAY_GROW(obj, obj->ass_imgs, obj->num_externals + 1);
 
-    append_ass(&obj->ass, &obj->vo_res, &obj->ass_imgs[0], &obj->changed);
+    // Rasterize at the (possibly capped) render res; obj->vo_res stays the
+    // true geometry. Layout is PlayRes-relative, so the smaller frame just
+    // yields a proportionally smaller bitmap for the GPU to upscale.
+    append_ass(&obj->ass, &res, &obj->ass_imgs[0], &obj->changed);
     for (int n = 0; n < obj->num_externals; n++) {
         if (obj->externals[n]->ov.hidden) {
-            update_playres(&obj->externals[n]->ass, &obj->vo_res);
+            update_playres(&obj->externals[n]->ass, &res);
             obj->ass_imgs[n + 1] = NULL;
         } else {
-            append_ass(&obj->externals[n]->ass, &obj->vo_res,
+            append_ass(&obj->externals[n]->ass, &res,
                        &obj->ass_imgs[n + 1], &obj->changed);
         }
     }
