@@ -404,7 +404,21 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
         render_res.mb = lrint(osdres.mb * s);
     }
 
-    check_obj_resize(osd, render_res, obj);
+    // vo_res must always hold the TRUE output geometry: it backs the
+    // osd-dimensions property (script layout and mouse areas -- e.g. the
+    // OSC's hover zones) and the WIN_RESIZE broadcast. Storing the capped
+    // res here displaced every geometry consumer while the rects-upscale
+    // below kept the rendering itself looking correct.
+    check_obj_resize(osd, osdres, obj);
+
+    // The capped res is render-internal only. Track it separately so the
+    // object re-renders when it changes (cap engaged/disengaged, window
+    // resized under the cap); no WIN_RESIZE for cap-derived changes -- the
+    // window geometry did not change.
+    if (!osd_res_equals(render_res, obj->render_res)) {
+        obj->render_res = render_res;
+        obj->osd_changed = true;
+    }
 
     if (obj->type == OSDTYPE_SUB) {
         if (obj->sub && sub_is_primary_visible(obj->sub))
@@ -423,7 +437,7 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
         // ever putting libass work on this (usually the VO) thread.
         res = osd_external_render_async(osd, obj, render_res, format);
     } else {
-        res = osd_object_get_bitmaps(osd, obj, format);
+        res = osd_object_get_bitmaps(osd, obj, render_res, format);
     }
 
     // Scale the capped-resolution OSD parts back up to the real output size; the
