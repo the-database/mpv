@@ -66,7 +66,11 @@ struct osd_object {
 
     // VO cache state
     int vo_change_id;
-    struct mp_osd_res vo_res;
+    struct mp_osd_res vo_res;   // true output geometry, never capped
+    // Rasterization resolution: == vo_res unless --osd-render-res-cap
+    // shrinks a non-subtitle object's render (osd.c render_object). Never
+    // exposed as geometry -- osd-dimensions/scripts/mouse read vo_res.
+    struct mp_osd_res render_res;
     bool vo_had_output;
 
     // Internally used by osd_libass.c
@@ -129,8 +133,11 @@ struct osd_state {
 };
 
 // defined in osd_libass.c
+// res is the rasterization resolution (obj->render_res; may be smaller than
+// the true geometry in obj->vo_res under --osd-render-res-cap).
 struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
-                                           struct osd_object *obj, int format);
+                                           struct osd_object *obj,
+                                           struct mp_osd_res res, int format);
 // WP-H7 (defect 2): non-blocking OSDTYPE_EXTERNAL serve -- returns a copy of
 // the worker's last completed snapshot (NULL if none at this geometry yet)
 // and kicks the worker when the request generation or geometry moved on.
