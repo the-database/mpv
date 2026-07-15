@@ -224,7 +224,7 @@ def run_one(mpv: str, media: str, cfg_flags: list[str], run_dir: str,
         ("--script-opts=" +
          f"tstep-start={args.start},tstep-frames={args.frames}," +
          f"tstep-out={out_arg},tstep-settle={args.settle}," +
-         f"tstep-settle0={args.settle0}"),
+         f"tstep-settle0={args.settle0},tstep-warmup={args.warmup}"),
         f"--dump-stats={stats_arg}",
         f"--log-file={log_arg}",
         "-v",
@@ -402,6 +402,11 @@ def main(argv=None) -> int:
                          "reference run (state-dependent defects)")
     ap.add_argument("--settle", type=float, default=0.25)
     ap.add_argument("--settle0", type=float, default=3.0)
+    ap.add_argument("--warmup", type=float, default=0.0,
+                    help="play this many seconds past --start once (unpaused) "
+                         "before re-seeking and stepping: warms the monotonic "
+                         "GPU pools to the scene's demand like real playback "
+                         "reaching the scene does")
     ap.add_argument("--tol8", type=float, default=0.0,
                     help="per-frame maxdiff tolerance on the 8-bit scale "
                          "(0 = exact; 3 = the m5 blur bar)")

@@ -30,12 +30,20 @@ local opts = {
     settle = 0.25,
     settle0 = 3.0,
     quitpause = 0.5,
+    -- warmup: play (unpaused) this many seconds past `start` once, then
+    -- re-seek and step. Warms the monotonic GPU pools (result_tex & co.) to
+    -- the scene's demand the way normal playback reaching the scene does --
+    -- without it, the capture's first frames measure the cold-pool ramp of a
+    -- fresh seek, which is not the state the defect class lives in.
+    warmup = 0,
 }
 require("mp.options").read_options(opts, "tstep")
 
 local idx = 0
 local stepping = false      -- a frame-step is in flight
 local started = false
+local warming = false
+local reseek = false
 local last_pos = nil
 
 local function shot_path(i)
@@ -76,6 +84,13 @@ watchdog:kill()
 
 mp.observe_property("time-pos", "number", function(_, v)
     if v == nil then return end
+    if warming and v >= opts.start + opts.warmup then
+        warming = false
+        reseek = true
+        mp.set_property_bool("pause", true)
+        mp.msg.info("tstep: warmup pass done; re-seeking")
+        mp.commandv("seek", tostring(opts.start), "absolute+exact")
+    end
     if stepping and last_pos ~= nil and v ~= last_pos then
         stepping = false
         watchdog:kill(); watchdog:resume()
@@ -92,6 +107,12 @@ end)
 
 mp.register_event("playback-restart", function()
     if started then return end
+    if opts.warmup > 0 and not reseek and not warming then
+        warming = true
+        mp.set_property_bool("pause", false)
+        return
+    end
+    if warming then return end   -- restarts during the warmup play
     started = true
     watchdog:resume()
     -- settle0: let the seek/prewarm settle before the first capture
