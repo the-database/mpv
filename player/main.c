@@ -320,6 +320,9 @@ struct MPContext *mp_create(void)
     init_libav(mpctx->global);
     mp_clients_init(mpctx);
     mpctx->osd = osd_create(mpctx->global);
+    // WP-H7 (defect 2): present freshly rendered script overlays promptly
+    // even while paused (the async OSD worker completes off-thread).
+    osd_set_ext_wakeup_cb(mpctx->osd, mp_wakeup_core_cb, mpctx);
 
 #if HAVE_COCOA
     cocoa_set_input_context(mpctx->input);
