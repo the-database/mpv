@@ -6,7 +6,7 @@ an acceptance matrix of mpv configs.
 
 Python 3.12, **stdlib only** — no third-party packages.
 
-Four tools plus self-tests:
+Five tools plus self-tests:
 
 | file                | role                                                         |
 |---------------------|--------------------------------------------------------------|
@@ -14,11 +14,14 @@ Four tools plus self-tests:
 | `run_matrix.py`     | run (or emit for Windows) an acceptance config matrix        |
 | `check_reference.py`| self-test: reproduce the postmortem reference table          |
 | `abdiff.py`         | screenshot A/B **pixel** diff: prove two configs render identically |
+| `temporal_ab.py`    | frame-step A/B **temporal** gate: every frame of a window, with a vanish detector |
 
 `parse_stats.py`/`run_matrix.py`/`check_reference.py` measure *performance*.
 `abdiff.py` verifies *pixel output*: it screenshots the actual gpu-next window
 under two configs and diffs the PNGs, so "the GPU path is bit-identical to the
-CPU path" becomes a mechanical, gateable check.
+CPU path" becomes a mechanical, gateable check. `temporal_ab.py` extends that
+to *every frame* of a scene window (abdiff samples instants and provably
+missed a mid-lifetime sign vanish -- WP-H7 defect 1).
 
 ---
 
@@ -292,6 +295,58 @@ Baseline results captured on this box — maxdiffs are in **16-bit** sample unit
 
 Note: `--sub-ass-render-threads=0` means *auto*, not serial — use `=1` for the
 serial baseline in test 2.
+
+---
+
+## temporal_ab.py — frame-step A/B temporal gate (WP-H7)
+
+`abdiff.py` proves per-PTS equality but samples instants: a defect that
+renders correctly at the sampled frames and corrupts BETWEEN them passes it.
+That happened in the field (round 4): a typeset sign rendered fine for
+seconds, then lost its outline, then vanished entirely — state-dependent, and
+no sampled PTS landed on it. `temporal_ab.py` closes that class: it
+frame-steps two configs across a window, screenshots EVERY frame (via the
+bundled `temporal_step.lua`, no IPC), and diffs frame-by-frame.
+
+```sh
+# local (lavapipe). NOTE --extra-b: the auto present-guard deadline
+# (sub-present-guard-ms=-1 = frame duration) fires on nearly every heavy
+# frame on lavapipe and would pollute a CONTENT A/B with stale serves.
+python3 temporal_ab.py --mpv ../../build/mpv \
+    --media "$KOBA_EP7" --start 246.0 --frames 130 \
+    --config-a mpv-cpu-baseline.conf --config-b mpv-acceptance.conf \
+    "--extra-b=--sub-present-guard-ms=0" \
+    --geometry 5328x3000 --out out_t --tag unfazed --tol8 3 --runs 3
+
+# rig (Windows mpv.exe from WSL; /mnt/X paths auto-translated; outputs to
+# C: scratch, never Y:/SMB). Real GPU: keep the guard at its default.
+python3 temporal_ab.py --mpv /mnt/c/Users/jsoos/8k-rig/mpv/mpv.exe \
+    --media "/mnt/y/Video/kobayashi/...ep07...mkv" --start 246.0 --frames 130 \
+    --config-a .../mpv-cpu-baseline.conf --config-b .../mpv-acceptance.conf \
+    --geometry 7680x4320 --out out_rig --tag unfazed_rig --runs 3
+```
+
+Verdict per run: PASS iff no frame exceeds `--tol8` (0 = bit-exact; 3 = the
+m5 blur bar) and both runs captured to completion. Any frame whose GROSS
+differing area (pixels differing by more than tol8) exceeds `--vanish-pct`
+of the frame is additionally flagged **VANISH**. The first divergent frame is
+reported with the counter deltas that fired in the interval that produced it
+(the lua logs a timestamped `tstep-shot` line per frame; `--dump-stats`
+shares that clock), so forensics start attributed. `--runs N` repeats the
+under-test config against one reference capture (state-dependent defects).
+Matching PNGs are deleted as they are compared; divergent pairs and an
+amplified diff of the first divergence are kept.
+
+**Pinned regression scenario — "Unfazed" lifetime (ep7 246.0s +130 frames)**:
+the WP-H7 defect-1 wall (77 static `\blur8` drawing layers + 2 shadow-text
+layers + a drawing pair that changes EVERY frame; result_tex demand ~34k rows
+at 8K = sustained spill). Gate it at 5328x3000 locally (sustained spill that
+still fits 2 frames of transient-store footprint under lavapipe's 16384 texel
+cap) and at 7680x4320 on the rig. Local 8K is NOT gateable: one frame's spill
+footprint alone exceeds the lavapipe texture bound, content is dropped by
+capacity (gcache-overcommit counts it — gated in acceptance).
+
+Rig runs pop a real mpv window on the Windows desktop; keep them batched.
 
 ---
 
