@@ -25,6 +25,7 @@
 #include "misc/bstr.h"
 #include "common/common.h"
 #include "common/msg.h"
+#include "common/stats.h"
 #include "osd.h"
 #include "osd_state.h"
 
@@ -84,12 +85,25 @@ static void destroy_external(struct osd_external *ext)
 
 void osd_destroy_backend(struct osd_state *osd)
 {
+    // WP-H7 (defect 2): stop the external render worker before freeing the
+    // libass state it owns.
+    mp_mutex_lock(&osd->lock);
+    osd->ext_exit = true;
+    mp_cond_signal(&osd->ext_wakeup);
+    bool join = osd->ext_thread_valid;
+    mp_mutex_unlock(&osd->lock);
+    if (join)
+        mp_thread_join(osd->ext_thread);
+    osd->ext_thread_valid = false;
+
     for (int n = 0; n < MAX_OSD_PARTS; n++) {
         struct osd_object *obj = osd->objs[n];
         destroy_ass_renderer(&obj->ass);
         for (int i = 0; i < obj->num_externals; i++)
             destroy_external(obj->externals[i]);
         obj->num_externals = 0;
+        talloc_free(obj->ext_done);
+        obj->ext_done = NULL;
     }
 }
 
@@ -557,11 +571,156 @@ static int cmp_zorder(const void *pa, const void *pb)
     return a->ov.z == b->ov.z ? 0 : (a->ov.z > b->ov.z ? 1 : -1);
 }
 
+// WP-H7 (defect 2): all libass work for OSDTYPE_EXTERNAL (track parsing,
+// shaping/layout, rasterization, packing) runs on this worker; consumers are
+// served the last completed snapshot. Before this, osd_render did it all ON
+// THE VO THREAD: opening the 8K stats page was a 50+ ms layout inside the
+// frame (a guaranteed dropped frame), and every periodic page update put the
+// re-shape + repack on frames that at 8K have no headroom left.
+// Runs with ext_lock held, osd->lock NOT held (taken briefly inside).
+static void ext_render_pass(struct osd_state *osd, struct osd_object *obj,
+                            struct mp_osd_res res, int format, int64_t gen)
+{
+    stats_time_start(osd->stats_ext, "osd-ext-worker");
+
+    // Phase 1: re-parse changed tracks. Needs osd->lock (reads osd->opts for
+    // styles); parsing is small (string -> events), the EXPENSIVE phase below
+    // runs without osd->lock so neither the VO serve nor script threads block
+    // behind a render.
+    mp_mutex_lock(&osd->lock);
+    for (int n = 0; n < obj->num_externals; n++) {
+        struct osd_external *ext = obj->externals[n];
+        if (ext->dirty) {
+            update_external(osd, obj, ext);
+            ext->dirty = false;
+        }
+    }
+    bool changed = obj->changed;
+    obj->changed = false;
+    mp_mutex_unlock(&osd->lock);
+
+    // Phase 2: render + pack (libass state + packer are ext_lock domain).
+    MP_TARRAY_GROW(obj, obj->ass_imgs, obj->num_externals + 1);
+    append_ass(&obj->ass, &res, &obj->ass_imgs[0], &changed);
+    for (int n = 0; n < obj->num_externals; n++) {
+        if (obj->externals[n]->ov.hidden) {
+            update_playres(&obj->externals[n]->ass, &res);
+            obj->ass_imgs[n + 1] = NULL;
+        } else {
+            append_ass(&obj->externals[n]->ass, &res,
+                       &obj->ass_imgs[n + 1], &changed);
+        }
+    }
+
+    if (!obj->sub_packer)
+        obj->sub_packer = mp_sub_packer_alloc(obj);
+    struct sub_bitmaps out_imgs = {0};
+    mp_sub_packer_pack_ass(obj->sub_packer, obj->ass_imgs,
+                           obj->num_externals + 1, changed, false, format,
+                           &out_imgs);
+    // NULL when empty; the packed image is refcounted and the packer
+    // copies-on-write before its next pack, so the snapshot is stable.
+    struct sub_bitmaps *snap = sub_bitmaps_copy(&obj->copy_cache, &out_imgs);
+
+    stats_time_end(osd->stats_ext, "osd-ext-worker");
+
+    // Phase 3: publish.
+    mp_mutex_lock(&osd->lock);
+    talloc_free(obj->ext_done);
+    obj->ext_done = snap;
+    obj->ext_done_gen = gen;
+    obj->ext_done_res = res;
+    obj->ext_done_format = format;
+    // Account the content change exactly once (serves return change_id 0 and
+    // render_object stamps the accumulated vo_change_id).
+    obj->vo_change_id += out_imgs.change_id;
+    osd->want_redraw_notification = true;
+    if (osd->ext_wakeup_cb)
+        osd->ext_wakeup_cb(osd->ext_wakeup_ctx);
+    mp_mutex_unlock(&osd->lock);
+}
+
+static MP_THREAD_VOID ext_worker_fn(void *arg)
+{
+    struct osd_state *osd = arg;
+    mp_thread_set_name("osd/ext");
+    mp_mutex_lock(&osd->lock);
+    while (!osd->ext_exit) {
+        struct osd_object *obj = osd->objs[OSDTYPE_EXTERNAL];
+        bool res_ok = osd_res_equals(obj->ext_done_res, obj->ext_want_res) &&
+                      obj->ext_done_format == obj->ext_want_format;
+        bool want = obj->ext_want_res.w > 0 && obj->ext_want_res.h > 0 &&
+                    obj->ext_want_format &&
+                    (obj->ext_req_gen != obj->ext_done_gen || !res_ok);
+        if (!want) {
+            mp_cond_wait(&osd->ext_wakeup, &osd->lock);
+            continue;
+        }
+        int64_t gen = obj->ext_req_gen;
+        struct mp_osd_res res = obj->ext_want_res;
+        int format = obj->ext_want_format;
+        mp_mutex_unlock(&osd->lock);
+        // LOCK ORDER: ext_lock outside osd->lock, always.
+        mp_mutex_lock(&osd->ext_lock);
+        ext_render_pass(osd, obj, res, format, gen);
+        mp_mutex_unlock(&osd->ext_lock);
+        mp_mutex_lock(&osd->lock);
+    }
+    mp_mutex_unlock(&osd->lock);
+    MP_THREAD_RETURN();
+}
+
+// Under osd->lock.
+static void ext_worker_start(struct osd_state *osd)
+{
+    if (osd->ext_thread_valid || osd->ext_exit)
+        return;
+    osd->ext_thread_valid =
+        mp_thread_create(&osd->ext_thread, ext_worker_fn, osd) == 0;
+    if (!osd->ext_thread_valid)
+        MP_ERR(osd, "Failed to create the OSD overlay render thread; "
+               "script overlays will not render.\n");
+}
+
+// Under osd->lock. Serve the last completed snapshot; kick the worker when
+// content or geometry moved on. Never renders, never blocks: an update is at
+// most one completed render stale, which for OSD/script overlays is fine
+// (and beats a dropped video frame).
+struct sub_bitmaps *osd_external_render_async(struct osd_state *osd,
+                                              struct osd_object *obj,
+                                              struct mp_osd_res res,
+                                              int format)
+{
+    if (!obj->num_externals && !obj->ext_done && !obj->ext_done_gen)
+        return NULL;    // never had content: don't wake anything
+    obj->ext_want_res = res;
+    obj->ext_want_format = format;
+    bool res_ok = osd_res_equals(obj->ext_done_res, res) &&
+                  obj->ext_done_format == format;
+    if (obj->ext_req_gen != obj->ext_done_gen || !res_ok) {
+        ext_worker_start(osd);
+        mp_cond_signal(&osd->ext_wakeup);
+    }
+    if (!res_ok || !obj->ext_done || !obj->ext_done->num_parts)
+        return NULL;
+    struct sub_bitmaps *out = sub_bitmaps_copy(&obj->serve_cache,
+                                               obj->ext_done);
+    if (out)
+        out->change_id = 0;   // accounted once at publish time
+    return out;
+}
+
 void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
 {
+    // LOCK ORDER: ext_lock before osd->lock. The externals array and entry
+    // contents are mutated under BOTH locks, so the worker (ext_lock only)
+    // and osd->lock-only readers are both safe.
+    mp_mutex_lock(&osd->ext_lock);
     mp_mutex_lock(&osd->lock);
     struct osd_object *obj = osd->objs[OSDTYPE_EXTERNAL];
     bool zorder_changed = false;
+    bool content_changed = false;
+    struct osd_external *entry = NULL;
     int index = -1;
 
     for (int n = 0; n < obj->num_externals; n++) {
@@ -583,20 +742,23 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
         zorder_changed = true;
     }
 
-    struct osd_external *entry = obj->externals[index];
+    entry = obj->externals[index];
 
     if (!ov->format) {
         if (!entry->ov.hidden) {
             obj->changed = true;
+            content_changed = true;
             osd->want_redraw_notification = true;
         }
         destroy_external(entry);
         MP_TARRAY_REMOVE_AT(obj->externals, obj->num_externals, index);
+        entry = NULL;
         goto done;
     }
 
     if (!entry->ov.hidden || !ov->hidden) {
         obj->changed = true;
+        content_changed = true;
         osd->want_redraw_notification = true;
     }
 
@@ -611,14 +773,34 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
     entry->ov.z = ov->z;
     entry->ov.hidden = ov->hidden;
 
-    update_external(osd, obj, entry);
+    // WP-H7 (defect 2): the parse (and everything after it) moved to the
+    // worker -- this call site is a script/player thread and must not carry
+    // libass work under osd->lock, or the VO's osd_render blocks behind it.
+    entry->dirty = true;
 
     if (zorder_changed) {
         qsort(obj->externals, obj->num_externals, sizeof(obj->externals[0]),
               cmp_zorder);
     }
 
-    if (ov->out_rc) {
+done:
+    if (content_changed || (entry && entry->ov.format)) {
+        obj->ext_req_gen += 1;
+        ext_worker_start(osd);
+        mp_cond_signal(&osd->ext_wakeup);
+    }
+    mp_mutex_unlock(&osd->lock);
+
+    if (ov->format && ov->out_rc && entry) {
+        // Synchronous bounds computation (mp.create_osd_overlay with
+        // compute_bounds): parse + measure right here, on the caller's
+        // thread, under ext_lock -- script-side latency, never the VO's.
+        if (entry->dirty) {
+            mp_mutex_lock(&osd->lock);   // opts/styles (ext -> osd order)
+            update_external(osd, obj, entry);
+            mp_mutex_unlock(&osd->lock);
+            entry->dirty = false;
+        }
         struct mp_osd_res vo_res = entry->ass.vo_res;
         // Defined fallback if VO has not drawn this yet
         if (vo_res.w < 1 || vo_res.h < 1) {
@@ -639,25 +821,32 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
 
         mp_ass_get_bb(img_list, entry->ass.track, &vo_res, ov->out_rc);
     }
-
-done:
-    mp_mutex_unlock(&osd->lock);
+    mp_mutex_unlock(&osd->ext_lock);
 }
 
 void osd_set_external_remove_owner(struct osd_state *osd, void *owner)
 {
+    mp_mutex_lock(&osd->ext_lock);
     mp_mutex_lock(&osd->lock);
     struct osd_object *obj = osd->objs[OSDTYPE_EXTERNAL];
+    bool removed = false;
     for (int n = obj->num_externals - 1; n >= 0; n--) {
         struct osd_external *e = obj->externals[n];
         if (e->ov.owner == owner) {
             destroy_external(e);
             MP_TARRAY_REMOVE_AT(obj->externals, obj->num_externals, n);
             obj->changed = true;
+            removed = true;
             osd->want_redraw_notification = true;
         }
     }
+    if (removed) {
+        obj->ext_req_gen += 1;
+        ext_worker_start(osd);
+        mp_cond_signal(&osd->ext_wakeup);
+    }
     mp_mutex_unlock(&osd->lock);
+    mp_mutex_unlock(&osd->ext_lock);
 }
 
 static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
