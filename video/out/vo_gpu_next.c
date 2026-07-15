@@ -228,12 +228,20 @@ struct osd_guard {
     uint8_t good_ol_rindex[MAX_OSD_OVERLAYS];
     int64_t good_ol_change[MAX_OSD_OVERLAYS];
     struct pl_overlay bail_overlays[MAX_OSD_OVERLAYS];
-    // WP-H6 (item 1): the committed build's spill overlay references rows
-    // [0, good_trans_protect) of good_trans_tex (the transient store at
-    // commit time); those rows must not be reused or the texture swapped
-    // until this snapshot is superseded. NULL = no spill committed.
+    // WP-H6 (item 1) / WP-H7 (defect 1): the committed build's spill overlay
+    // references rows [good_trans_lo, good_trans_hi) of good_trans_tex (the
+    // transient store at commit time); those rows must not be reused or the
+    // texture swapped until this snapshot is superseded. NULL = no spill
+    // committed. WP-H7: this is an INTERVAL, not a floor -- the original
+    // absolute-floor scheme protected the dead per-item glyph rows BELOW the
+    // spill start and left the spill rows themselves unprotected (a guard
+    // bail re-presented garbage), and the floor RATCHETED up every spilling
+    // frame without ever reclaiming superseded rows, so a sustained-spill
+    // scene (the ep7 "Unfazed" wall) exhausted the store in a few frames and
+    // then dropped region-layers/glyphs as invisible (the field-observed
+    // progressive sign vanish, top z-order first).
     pl_tex good_trans_tex;
-    int good_trans_protect;
+    int good_trans_lo, good_trans_hi;
     // Forward-progress guarantee: a guard fire sets this, and the NEXT build
     // for this consumer ignores the deadline and runs to completion. Without
     // it, content that is systematically over-deadline would bail every
@@ -379,15 +387,25 @@ struct priv {
     // reference it (guard-safe like the run_* scratch).
     pl_tex trans_atlas;
     int tr_x, tr_y, tr_rowh;                 // per-item shelf cursor
-    // WP-H6 (item 1): transient-store row protection for result_tex spills.
-    // Rows below tr_protect are referenced by the committed good snapshot's
-    // spill overlay (a guard bail may present it any later frame); rows below
-    // tr_build_floor additionally hold THIS build's spills (a later item in
-    // the same build must not shelf-reset over them). The per-item cursor
-    // reset starts at tr_build_floor instead of 0.
-    int tr_protect;
-    int tr_build_floor;
+    // WP-H7 (defect 1): transient-store row protection for result_tex spills,
+    // as ROW INTERVALS the shelf allocator skips over (gc_trans_place).
+    //   tr_good_[lo,hi)  -- rows referenced by the committed good snapshot's
+    //                       spill overlay (a guard bail may re-present it on
+    //                       any later frame); released when a spill-free
+    //                       build commits (supersedes the snapshot).
+    //   tr_build_[lo,hi) -- rows holding THIS build's spills so far (a later
+    //                       item in the same build must not overwrite them;
+    //                       the emitted overlay reads them at render).
+    // Everything else in the store (per-item transient glyphs) is consumed
+    // within its own item and is free ground for the next item's shelf reset
+    // to 0. Superseded snapshot rows are reclaimed automatically because
+    // nothing protects them anymore -- the old absolute-floor scheme
+    // ratcheted forever under sustained spill (see osd_guard).
+    int tr_good_lo, tr_good_hi;
+    int tr_build_lo, tr_build_hi;
     bool build_spilled;                      // any spill in the current build
+    uint32_t tr_fail_pass;                   // gc_pass that last logged an
+                                             // exhaustion failure (rate limit)
 
     // WP-H6 (item 1): background pool pre-grow. When a pool crosses ~70% of
     // capacity during a frame, the next-size texture is created on a helper
@@ -1888,6 +1906,33 @@ static bool gc_cacheable(struct priv *p, int w, int h)
 // so no already-flushed coverage is lost). Only fails when a single item
 // needs more transient area than the GPU's max texture allows (> 8x the 8K
 // screen area of uncached coverage) -- unreachable for real content.
+// WP-H7 (defect 1): advance the shelf cursor past any protected row interval
+// the next placement of height nh would overlap. Protected are the committed
+// good snapshot's spill rows and the current build's spill rows -- both are
+// still read after this placement. Skipping (instead of an absolute floor)
+// means rows of SUPERSEDED snapshots are reclaimed the moment they stop being
+// protected, so sustained spill no longer ratchets the store to exhaustion.
+static void tr_skip_protected(struct priv *p, int nh)
+{
+    for (;;) {
+        if (p->tr_good_hi > p->tr_good_lo &&
+            p->tr_y < p->tr_good_hi && p->tr_y + nh > p->tr_good_lo) {
+            p->tr_y = p->tr_good_hi;
+            p->tr_x = 0;
+            p->tr_rowh = 0;
+            continue;
+        }
+        if (p->tr_build_hi > p->tr_build_lo &&
+            p->tr_y < p->tr_build_hi && p->tr_y + nh > p->tr_build_lo) {
+            p->tr_y = p->tr_build_hi;
+            p->tr_x = 0;
+            p->tr_rowh = 0;
+            continue;
+        }
+        break;
+    }
+}
+
 static bool gc_trans_place(struct priv *p, int w, int h, struct gpos *out)
 {
     pl_gpu gpu = p->gpu;
@@ -1902,6 +1947,29 @@ static bool gc_trans_place(struct priv *p, int w, int h, struct gpos *out)
         p->tr_y += p->tr_rowh;
         p->tr_x = 0;
         p->tr_rowh = 0;
+    }
+    // WP-H7 (defect 1): never place over live spill rows (see the helper).
+    // A placement taller than the current shelf row can newly overlap an
+    // interval above even without a shelf advance, so check every placement.
+    tr_skip_protected(p, nh);
+    // WP-H7 (defect 1): while any spill interval is live, an inline grow is
+    // FORBIDDEN: pl_tex_recreate destroys the old texture, but the committed
+    // snapshot's spill overlay (bail-servable) and/or overlays already
+    // emitted THIS frame still reference it -- a grow here is a use-after-
+    // free at present time, not just a stall. Fail the placement instead
+    // (counted gcache-overcommit -- visible and gated); the background
+    // pre-grow swaps a bigger store in at a spill-free frame boundary.
+    if ((p->tr_good_hi > p->tr_good_lo || p->tr_build_hi > p->tr_build_lo) &&
+        (nw > tw || p->tr_y + nh > th)) {
+        if (p->tr_fail_pass != p->gc_pass) {
+            p->tr_fail_pass = p->gc_pass;
+            MP_VERBOSE(p, "[pool-spill] trans store exhausted: need %dx%d at "
+                       "row %d of %dx%d (good [%d,%d) build [%d,%d) "
+                       "protected); placements fail this item\n",
+                       nw, nh, p->tr_y, tw, th, p->tr_good_lo, p->tr_good_hi,
+                       p->tr_build_lo, p->tr_build_hi);
+        }
+        return false;
     }
     if (nw > tw || p->tr_y + nh > th) {
         // Grow: width at least the atlas width (and this glyph; 4096 minimum
@@ -3031,12 +3099,14 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     p->gc_pass_claims = 0;
     p->gc_pass_wraps = 0;
     // WP-H1d: the transient store is per-item; its content from the previous
-    // item was consumed by that item's composes. WP-H6 (item 1): the shelf
-    // starts at tr_build_floor, not 0 -- rows below it hold the committed
-    // good snapshot's spill overlay (tr_protect) and/or THIS build's earlier
-    // spills, which stay referenced beyond this item.
+    // item was consumed by that item's composes, so the shelf resets to 0.
+    // WP-H7 (defect 1): rows still referenced beyond this item -- the
+    // committed good snapshot's spill overlay and THIS build's earlier
+    // spills -- are protected as intervals that gc_trans_place skips over,
+    // not by a floor (the floor ratcheted under sustained spill and never
+    // reclaimed superseded rows).
     p->tr_x = 0;
-    p->tr_y = p->tr_build_floor;
+    p->tr_y = 0;
     p->tr_rowh = 0;
 
     void *tmp = talloc_new(NULL);
@@ -3304,11 +3374,23 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             spill_from = ei;    // this and all later region-layers spill
         }
         // Transient-store spill (gc_trans_place pads by 1px itself). Fails
-        // only past the GPU max-texture bound: make the layer invisible
-        // rather than compose garbage, and let the gates catch it.
+        // only when the store is genuinely exhausted (single-frame demand
+        // past the GPU max-texture bound, or all remaining rows protected by
+        // live spill intervals): make the layer invisible rather than
+        // compose garbage, and let the gates catch it.
         struct gpos sp;
         if (gc_trans_place(p, rw - 1, rh - 1, &sp)) {
             *ax = sp.ax; *ay = sp.ay; *at = 1;
+            // WP-H7 (defect 1): these rows are read by the emitted overlay
+            // at render (and by a bail re-present until superseded) -- track
+            // them as this build's protected spill interval.
+            if (p->tr_build_hi <= p->tr_build_lo) {
+                p->tr_build_lo = sp.ay;
+                p->tr_build_hi = sp.ay + rh;
+            } else {
+                p->tr_build_lo = MPMIN(p->tr_build_lo, sp.ay);
+                p->tr_build_hi = MPMAX(p->tr_build_hi, sp.ay + rh);
+            }
         } else {
             *at = -1;
             p->cnt_gcache_overcommit++;
@@ -3318,7 +3400,6 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     bool spilled = spill_from < nems;
     if (spilled) {
         p->build_spilled = true;
-        p->tr_build_floor = MPMAX(p->tr_build_floor, p->tr_y + p->tr_rowh);
         p->cnt_result_spill++;
         MP_VERBOSE(p, "[pool-spill] result_tex demand %dx%d exceeds %dx%d; "
                    "%d/%d region-layers composed via the transient store "
@@ -3757,10 +3838,11 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
     frame->overlays = state->overlays;
     frame->num_overlays = 0;
 
-    // WP-H6 (item 1): transient-store floor for this build -- rows below
-    // tr_protect hold the committed good snapshot's spill overlay and must
-    // survive until it is superseded. Spill state tracks the MAIN guard only.
-    p->tr_build_floor = p->tr_protect;
+    // WP-H7 (defect 1): a fresh build (any consumer -- the present path or a
+    // screenshot rebuild) starts with no spill rows of its own; the committed
+    // good snapshot's rows stay protected via tr_good_* until superseded.
+    // Spill COMMIT state tracks the MAIN guard only.
+    p->tr_build_lo = p->tr_build_hi = 0;
     if (present && g == &p->osd_guard)
         p->build_spilled = false;
 
@@ -4234,12 +4316,17 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
         g->good_coords = coords;
         memcpy(g->good_ol_rindex, g->build_ol_rindex, sizeof(g->good_ol_rindex));
         memcpy(g->good_ol_change, g->build_ol_change, sizeof(g->good_ol_change));
-        // WP-H6 (item 1): a committed spill overlay pins its transient-store
-        // rows (and blocks a trans_atlas pre-grow swap) until superseded.
+        // WP-H6 (item 1) / WP-H7 (defect 1): a committed spill overlay pins
+        // its transient-store ROWS (and blocks a trans_atlas pre-grow swap)
+        // until superseded. The interval is exactly this build's spill rows;
+        // the previous snapshot's rows stop being protected right here --
+        // reclaimed by the next build instead of ratcheting the store full.
         if (g == &p->osd_guard) {
             g->good_trans_tex = p->build_spilled ? p->trans_atlas : NULL;
-            g->good_trans_protect = p->build_spilled ? p->tr_build_floor : 0;
-            p->tr_protect = g->good_trans_protect;
+            g->good_trans_lo = p->build_spilled ? p->tr_build_lo : 0;
+            g->good_trans_hi = p->build_spilled ? p->tr_build_hi : 0;
+            p->tr_good_lo = g->good_trans_lo;
+            p->tr_good_hi = g->good_trans_hi;
         }
     }
     return true;
@@ -5567,8 +5654,9 @@ static void guard_invalidate(struct priv *p)
 {
     p->osd_guard.good = -1;
     p->osd_guard.good_trans_tex = NULL;
-    p->osd_guard.good_trans_protect = 0;
-    p->tr_protect = 0;
+    p->osd_guard.good_trans_lo = p->osd_guard.good_trans_hi = 0;
+    p->tr_good_lo = p->tr_good_hi = 0;
+    p->tr_build_lo = p->tr_build_hi = 0;
     for (int s = 0; s < 2; s++) {
         for (int e = 0; e < MAX_OSD_PARTS; e++)
             p->osd_guard.states[s].entries[e].built_valid = false;
