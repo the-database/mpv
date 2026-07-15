@@ -20,9 +20,11 @@ ACCEPTANCE BAR (a scene PASSES only if all three hold):
   3. ALL of these integrity counters == 0:
        gcache-flush atlas-overflow staging-grow overlay-buf-grow tex-realloc
        raster-pool-grow vo-alloc-after-first-frame ra-miss ra-inline ra-stale
-       ra-fetch-stall stale-present guard-empty
-     (gcache-overcommit is NOT gated -- post-H1d it is the lossless per-frame
-     transient-glyph path, an informational tuning signal, not content loss.)
+       ra-fetch-stall stale-present guard-empty gcache-overcommit
+     (gcache-overcommit was re-gated by WP-H7: since WP-H6 it counts
+     gc_trans_place FAILURES, i.e. glyphs/region-layers dropped as invisible
+     -- content loss. The lossless big-glyph transient path is counted as
+     glyphs-uncached, which remains informational.)
      mpv emits these with emit_counter() (vo_gpu_next.c) / MP_STATS value lines
      (sub_ahead.c). vo_gpu_next's emit_counter is *emit-on-change* starting from
      0, so a counter that never left 0 for the whole run produces NO line at
@@ -120,16 +122,19 @@ COUNTERS = [
     "ra-fetch-stall",
     "stale-present",
     "guard-empty",
+    # WP-H7 (defect 1): RE-GATED. Since WP-H6, gcache-overcommit is bumped by
+    # gc_trans_place FAILURE -- a failed placement makes a glyph or a spilled
+    # region-layer INVISIBLE (the successful lossless transient path counts as
+    # glyphs-uncached, which stays informational). The field defect this gate
+    # exists for: the ep7 "Unfazed" wall progressively vanished while
+    # overcommit climbed ~112/frame and NO gated counter fired. Any nonzero
+    # value means the transient store was exhausted (or a single frame's
+    # demand exceeded the GPU texture bound) and content was dropped.
+    "gcache-overcommit",
 ]
 
 # Informational counters: reported in the table but not gated (nonzero is
 # expected in normal operation; watch for per-frame explosions).
-# gcache-overcommit: post-H1d this means "took the lossless per-frame transient
-# path for a big/overflow glyph" -- NOT content loss (that is structurally
-# impossible now, proven pixel-identical to CPU). Its only cost (per-frame
-# re-raster) is already gated by the video-draw budget, so gating it ==0 would
-# falsely fail a valid 8K run (dense signs legitimately trip it). When nonzero
-# it prints a tuning hint.
 # WP-H6 additions:
 #   raster-pool-pregrow -- pool grows created off-thread and swapped in at a
 #                          frame boundary (item 1 working as designed).
@@ -152,7 +157,6 @@ COUNTERS = [
 #   glyphs-uncached     -- giant glyphs above the cache admission cap, drawn
 #                          per-frame via the transient store (WP-H1d policy).
 INFO_COUNTERS = [
-    "gcache-overcommit",
     "gcache-epoch-advance",
     "gcache-evict-n",
     "prefill-glyphs",
@@ -575,13 +579,12 @@ def print_scene(r: dict) -> None:
         note = "  (never fired)" if v == 0 else ""
         if name == "guard-empty" and v != 0:
             note = "  << SUBS VANISHED: guard presented no overlays"
+        if name == "gcache-overcommit" and v != 0:
+            note = "  << CONTENT DROPPED: transient store exhausted"
         print(f"{name:<28} {v:>7}   {status}{note}")
     for name in INFO_COUNTERS:
         v = r["counters"].get(name, 0.0)
         note = "info (not gated)"
-        if name == "gcache-overcommit" and v != 0:
-            note = ("info -- transient fallback active (lossless; raise "
-                    "--sub-glyph-atlas-size if any frames are over budget)")
         print(f"{name:<28} {v:>7}   {note}")
 
     if r.get("log") and r["log"].get("stock_libass_warn"):
