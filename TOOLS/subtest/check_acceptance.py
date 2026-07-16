@@ -21,10 +21,13 @@ ACCEPTANCE BAR (a scene PASSES only if all three hold):
        gcache-flush atlas-overflow staging-grow overlay-buf-grow tex-realloc
        raster-pool-grow vo-alloc-after-first-frame ra-miss ra-inline ra-stale
        ra-fetch-stall stale-present guard-empty gcache-overcommit
-     (gcache-overcommit was re-gated by WP-H7: since WP-H6 it counts
-     gc_trans_place FAILURES, i.e. glyphs/region-layers dropped as invisible
-     -- content loss. The lossless big-glyph transient path is counted as
-     glyphs-uncached, which remains informational.)
+     (gcache-overcommit was re-gated by WP-H7: it counts gc_trans_place
+     FAILURES, i.e. glyphs/region-layers dropped as invisible -- content
+     loss. WP-H10 made the counting match that meaning exactly: the lossless
+     atlas-refusal fallback -- a cacheable glyph the atlas ring could not
+     admit this pass, drawn via the transient store -- no longer pre-counts
+     as overcommit; every successful transient placement is counted as
+     glyphs-uncached, which remains informational pressure.)
      mpv emits these with emit_counter() (vo_gpu_next.c) / MP_STATS value lines
      (sub_ahead.c). vo_gpu_next's emit_counter is *emit-on-change* starting from
      0, so a counter that never left 0 for the whole run produces NO line at
