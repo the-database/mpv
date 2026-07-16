@@ -22,6 +22,9 @@
 --   settle  (number) seconds to wait between the step landing and the shot
 --   settle0 (number) seconds to wait after the initial seek (RA warm-up)
 --   quitpause (number) extra seconds to idle before quit (flush stats)
+--   step_timeout (number) watchdog seconds before an unlanded frame-step
+--                    finishes the run early (WP-H10: a lavapipe frame of a
+--                    max-geometry dense wall legitimately takes >30 s)
 
 local opts = {
     start = 0,
@@ -30,6 +33,7 @@ local opts = {
     settle = 0.25,
     settle0 = 3.0,
     quitpause = 0.5,
+    step_timeout = 30.0,
     -- warmup: play (unpaused) this many seconds past `start` once, then
     -- re-seek and step. Warms the monotonic GPU pools (result_tex & co.) to
     -- the scene's demand the way normal playback reaching the scene does --
@@ -74,9 +78,11 @@ end
 
 -- Failsafe: if a frame-step never lands (EOF inside the window), finish with
 -- what we have rather than hanging the driver forever.
-local watchdog = mp.add_periodic_timer(30.0, function()
+local watchdog = mp.add_periodic_timer(opts.step_timeout, function()
     if started and stepping then
-        mp.msg.warn("tstep: step did not land in 30s; finishing early")
+        mp.msg.warn(string.format(
+            "tstep: step did not land in %ds; finishing early",
+            opts.step_timeout))
         finish()
     end
 end)

@@ -74,10 +74,14 @@ struct osd_entry {
     struct pl_overlay_part *run_parts;
     int num_run_parts;
     // WP-H6 (item 1): result_tex overflow runs composed into the transient
-    // store instead of growing result_tex inline (emitted as one extra
-    // overlay right after the main one; see the spill notes in
-    // compose_glyph_runs).
+    // store instead of growing result_tex inline (emitted as extra overlays
+    // right after the main one; see the spill notes in compose_glyph_runs).
+    // WP-H10: spill_links[i] is the chain link part i was composed into;
+    // consecutive equal-link runs become one overlay each (link use is
+    // monotonic within an item, so there are at most TR_CHAIN_MAX runs and
+    // the sequence preserves z-order exactly).
     struct pl_overlay_part *spill_parts;
+    uint8_t *spill_links;
     int num_spill_parts;
     // WP-H6 (item 6): per-item compose reuse. A completed deferred compose
     // is content-addressed by the item's change_id (+ render geometry); when
@@ -145,8 +149,35 @@ struct osd_entry {
 #define RASTER_SEGS_PER_TILE 8
 #define RASTER_RESULT_H_MULT 4
 
-// WP-H6 (item 1): the two sub entries may each emit one extra spill overlay.
-#define MAX_OSD_OVERLAYS (MAX_OSD_PARTS + 2)
+// WP-H10: the transient store is a CHAIN of up to this many textures ("links")
+// instead of one texture that must swap wholesale to grow. Round-5 real-8K rig
+// evidence (ep09 dense-typeset wall, 114.0-118.4 s): a single frame demanded
+// ~3.2-3.5x the 16384x32768 store (84 uncached screen-scale glyphs ~433 Mpx +
+// 229/250 region-layers spilling, result_tex demand 5599x310348), and the
+// single texture had NO growth path at all -- its height was already at the
+// GPU max (32768), width growth was never watermarked (the shelf packs into a
+// fixed width), the inline grow is forbidden once anything was placed, and a
+// completed pre-grow could never swap in under sustained spill anyway
+// (good_trans_tex pin, the H7-predicted deadlock). Placements failed by the
+// hundreds per frame = invisible content for the wall's whole lifetime.
+// Chaining sidesteps every one of those: when the active link exhausts, the
+// NEXT link (background-allocated) activates; nothing ever swaps, so pinned
+// rows never block growth, and total capacity scales past the single-texture
+// dimension limit. VRAM is bounded: each link is at most the warm-up link's
+// size, so the chain caps at TR_CHAIN_MAX x that (2 GiB at the 8K worst case,
+// only ever reached by content that actually demands it; idle tail links
+// retire after TR_LINK_RETIRE_FRAMES unused frames).
+#define TR_CHAIN_MAX 4
+// Frames a tail link must sit unused (and unpinned) before it is destroyed.
+// ~75 s at 24 fps: longer than any scene gap inside one dense sequence, so a
+// wall that comes back does not churn allocations.
+#define TR_LINK_RETIRE_FRAMES 1800
+
+// WP-H6 (item 1): the two sub entries may each emit extra spill overlays --
+// WP-H10: up to one per chain link (spill placements advance monotonically
+// through the chain within an item, so the split stays a clean z-order
+// partition; see emit_composed_overlays).
+#define MAX_OSD_OVERLAYS (MAX_OSD_PARTS + 2 * TR_CHAIN_MAX)
 
 // WP-H7: one protected transient-store row band [lo, hi); see the tr_good /
 // tr_build comments in struct priv.
@@ -233,21 +264,22 @@ struct osd_guard {
     uint8_t good_ol_rindex[MAX_OSD_OVERLAYS];
     int64_t good_ol_change[MAX_OSD_OVERLAYS];
     struct pl_overlay bail_overlays[MAX_OSD_OVERLAYS];
-    // WP-H6 (item 1) / WP-H7 (defect 1): the committed build's spill overlay
-    // references the good_trans[] row bands of good_trans_tex (the
-    // transient store at commit time); those rows must not be reused or the
-    // texture swapped until this snapshot is superseded. NULL = no spill
-    // committed. WP-H7: these are INTERVALS, not a floor -- the original
-    // absolute-floor scheme protected the dead per-item glyph rows BELOW the
-    // spill start and left the spill rows themselves unprotected (a guard
-    // bail re-presented garbage), and the floor RATCHETED up every spilling
-    // frame without ever reclaiming superseded rows, so a sustained-spill
-    // scene (the ep7 "Unfazed" wall) exhausted the store in a few frames and
-    // then dropped region-layers/glyphs as invisible (the field-observed
-    // progressive sign vanish, top z-order first).
-    pl_tex good_trans_tex;
-    struct tr_band good_trans[TR_BANDS_MAX];
-    int n_good_trans;
+    // WP-H6 (item 1) / WP-H7 (defect 1): the committed build's spill
+    // overlay(s) reference these row bands of the transient-store chain
+    // links (at commit time); those rows must not be reused -- nor their
+    // links destroyed -- until this snapshot is superseded. WP-H7: these are
+    // INTERVALS, not a floor -- the original absolute-floor scheme protected
+    // the dead per-item glyph rows BELOW the spill start and left the spill
+    // rows themselves unprotected (a guard bail re-presented garbage), and
+    // the floor RATCHETED up every spilling frame without ever reclaiming
+    // superseded rows, so a sustained-spill scene (the ep7 "Unfazed" wall)
+    // exhausted the store in a few frames and then dropped region-layers/
+    // glyphs as invisible (the field-observed progressive sign vanish, top
+    // z-order first). WP-H10: one band list per chain link; a link is
+    // "pinned" iff its list is nonempty. Pinning no longer blocks store
+    // growth (growth = appending a link, never swapping a pinned texture).
+    struct tr_band good_trans[TR_CHAIN_MAX][TR_BANDS_MAX];
+    int n_good_trans[TR_CHAIN_MAX];
     // Forward-progress guarantee: a guard fire sets this, and the NEXT build
     // for this consumer ignores the deadline and runs to completion. Without
     // it, content that is systematically over-deadline would bail every
@@ -399,8 +431,23 @@ struct priv {
     // cursor reset per compose item; contents live only from an item's
     // resolve+flush to its region composes, so committed overlays never
     // reference it (guard-safe like the run_* scratch).
-    pl_tex trans_atlas;
+    // WP-H10: the store is a CHAIN of textures (see TR_CHAIN_MAX). The shelf
+    // cursor walks link tr_link; when a placement cannot fit the active link
+    // it advances to the next allocated one (cursor back to row 0). Links
+    // beyond [0] are allocated in the BACKGROUND (pregrow worker; appended at
+    // a frame boundary) -- driven by the demand estimators (tr_want_links) --
+    // and the tail link retires when unpinned and idle. A gpos/clipmask/
+    // region t-value of k >= 1 means "chain link k-1"; 0 = the persistent
+    // atlas (or result_tex for region-layers); -1 = unplaceable.
+    pl_tex trans_chain[TR_CHAIN_MAX];
+    int n_trans_chain;
+    int tr_link;                             // link the shelf cursor is on
     int tr_x, tr_y, tr_rowh;                 // per-item shelf cursor
+    int tr_want_links;                       // demand-estimated chain size
+    uint64_t tr_link_used_frame[TR_CHAIN_MAX]; // draw_frame count of last
+                                             // placement into each link (tail
+                                             // retire; see pregrow_swap_in)
+    uint64_t tr_frame;                       // draw_frame counter for the above
     // WP-H7 (defect 1): transient-store row protection for result_tex spills,
     // as ROW INTERVALS the shelf allocator skips over (gc_trans_place).
     //   tr_good[]  -- row bands referenced by the committed good snapshot's
@@ -424,9 +471,10 @@ struct priv {
     // are appended in nondecreasing row order (the shelf cursor only moves
     // down within a pass) and merged when they touch; on overflow the LAST
     // band absorbs the newcomer (conservative: over-protects, never
-    // under-protects).
-    struct tr_band tr_good[TR_BANDS_MAX], tr_build[TR_BANDS_MAX];
-    int n_tr_good, n_tr_build;
+    // under-protects). WP-H10: one pair of lists per chain link.
+    struct tr_band tr_good[TR_CHAIN_MAX][TR_BANDS_MAX];
+    struct tr_band tr_build[TR_CHAIN_MAX][TR_BANDS_MAX];
+    int n_tr_good[TR_CHAIN_MAX], n_tr_build[TR_CHAIN_MAX];
     bool build_spilled;                      // any spill in the current build
     bool tr_pass_used;                       // WP-H7: anything placed in the
                                              // store this pass (its rastered
@@ -434,6 +482,22 @@ struct priv {
                                              // grow, same as banded rows)
     uint32_t tr_fail_pass;                   // gc_pass that last logged an
                                              // exhaustion failure (rate limit)
+    // WP-H10: bounded wait-for-link budget, one deadline per pass. When the
+    // chain exhausts with a background link alloc in flight (seek straight
+    // into a dense wall: the estimators fire on the SAME frame that already
+    // needs the capacity), failing means invisible content for the wall's
+    // whole lifetime; waiting means one long frame inside the seek's own
+    // grace window. The wait is bounded (TR_LINK_WAIT_MS total per pass) and
+    // never allocates on the VO thread itself.
+    uint32_t tr_wait_pass;
+    int64_t tr_wait_until;
+    // WP-H10: post-seek demand probe. VOCTRL_RESET arms it; the next few
+    // draw_frames peek the render-ahead ring's lowest-pts entry (the seek
+    // target, pre-warmed by the worker during the video-restart window) and
+    // run the transient-demand estimator on it, so the chain links a dense
+    // seek target needs are requested BEFORE its first composed frame.
+    int tr_reset_probe;
+    double tr_probe_pts;                     // last pts the probe estimated
 
     // WP-H6 (item 1): background pool pre-grow. When a pool crosses ~70% of
     // capacity during a frame, the next-size texture is created on a helper
@@ -537,9 +601,11 @@ struct priv {
     int64_t stat_raster_pool_grow;
     // WP-E: epoch-eviction + warm-up counters. gcache-epoch-advance = segment
     // recycles (bounded, replaces the flush); gcache-evict-n = entries evicted
-    // (cumulative); gcache-overcommit = glyphs skipped because a single item's
-    // working set exceeded the whole atlas (never a stall); shader-warmups =
-    // compute variants dispatched once at config time (no playback-time compile).
+    // (cumulative); gcache-overcommit = FAILED gc_trans_place placements --
+    // glyphs/region-layers dropped invisible, i.e. content loss, gated ==0
+    // (WP-H7 re-gate; WP-H10 removed the lossless atlas-refusal pre-count
+    // that also bumped it); shader-warmups = compute variants dispatched
+    // once at config time (no playback-time compile).
     int64_t cnt_gcache_epoch_advance, cnt_gcache_evict_n, cnt_gcache_overcommit;
     int64_t cnt_shader_warmups;
     int64_t stat_gcache_epoch_advance, stat_gcache_evict_n, stat_gcache_overcommit;
@@ -573,6 +639,12 @@ struct priv {
     // store for the rest of a frame (never grown inline). Info counters.
     int64_t cnt_raster_pool_pregrow, stat_raster_pool_pregrow;
     int64_t cnt_result_spill, stat_result_spill;
+    // WP-H10: transient-store chain links appended (background alloc landed)
+    // and retired (tail idle+unpinned). trans-links additionally samples the
+    // CURRENT chain length as a gauge. All info, for rig forensics.
+    int64_t cnt_trans_link_append, stat_trans_link_append;
+    int64_t cnt_trans_link_retire, stat_trans_link_retire;
+    int64_t stat_trans_links;
     // WP-H6 (item 3): outline cache hits keyed by blob CONTENT hash after the
     // glyph_id key missed (animated text with fresh ids but unchanged
     // outlines skips re-raster/re-upload). Info.
@@ -1117,10 +1189,21 @@ static const char *const osd_combine_gather_body =
 
 // gl holds nglyph (<= GATHER_MAXG) entries of 2 vec4 each: [dx,dy,w,h][sax,say,
 // atlas,_]; the caller must pass a full GATHER_MAXG-sized array (unused tail is
-// never read by the shader). atlas != 0 selects the per-item transient store.
+// never read by the shader). atlas != 0 selects tatlas -- WP-H10: ONE chain
+// link per dispatch (the caller flushes its batch whenever the link its
+// transient glyphs live in changes; NULL when the batch has none). A batch
+// with no transient glyph still needs a DISTINCT texture bound (libplacebo
+// rejects one object under two descriptors -- gpu.c pl_pass_run validation),
+// so the fallback is chain link 0 (warm-up-created, exactly the pre-chain
+// trans_atlas guarantee); the glyph_atlas last resort only exists for the
+// no-store degenerate case, where the dispatch is rejected and the glyphs of
+// that batch are dropped -- identical to the pre-H10 behavior there. The
+// GLSL body never changes, so no new pipeline variant to warm up.
 static void osd_combine_gather(struct priv *p, pl_tex acc, const float *gl,
-                               int nglyph, int bw, int bh)
+                               int nglyph, int bw, int bh, pl_tex tatlas)
 {
+    if (!tatlas)
+        tatlas = p->n_trans_chain ? p->trans_chain[0] : p->glyph_atlas;
     pl_shader sh = pl_dispatch_begin(p->osd_dp);
     struct pl_shader_desc descs[] = {
         { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=0,
@@ -1128,7 +1211,7 @@ static void osd_combine_gather(struct priv *p, pl_tex acc, const float *gl,
         { .desc = { .name="atlas", .type=PL_DESC_SAMPLED_TEX, .binding=1 },
           .binding = { .object=p->glyph_atlas } },
         { .desc = { .name="tatlas", .type=PL_DESC_SAMPLED_TEX, .binding=2 },
-          .binding = { .object=p->trans_atlas ? p->trans_atlas : p->glyph_atlas } },
+          .binding = { .object=tatlas } },
     };
     struct pl_var glvar = pl_var_vec4("gl");
     glvar.dim_a = 2 * GATHER_MAXG;
@@ -1280,8 +1363,9 @@ static int blur_expand_pad(float sigma)
     return ((radius + 4) << level) - 4;
 }
 
-struct gpos { int ax, ay; int t; };   // a glyph's position; t=1: in the per-item
-                                      // transient store instead of the atlas
+struct gpos { int ax, ay; int t; };   // a glyph's position; t >= 1: in link
+                                      // t-1 of the per-item transient store
+                                      // chain instead of the atlas (WP-H10)
 
 // WP-E: an entry is live iff its generation fingerprint still matches. A
 // segment recycle bumps that segment's generation, so all entries whose rows
@@ -1525,6 +1609,10 @@ static MP_THREAD_VOID pregrow_thread_fn(void *arg)
             }
             p->pg_pending &= ~(1u << job.pool);   // failed: allow a retry
         }
+        // WP-H10: wake a tr_wait_append_link waiter (completion OR failure --
+        // it re-checks pg_done/pg_pending). The worker shares this cond and
+        // simply re-checks num_pg_req on a spurious wake.
+        mp_cond_broadcast(&p->pregrow_wakeup);
     }
     mp_mutex_unlock(&p->pregrow_lock);
     MP_THREAD_RETURN();
@@ -1627,6 +1715,99 @@ static void pregrow_watermark(struct priv *p, int pool, pl_tex cur,
     pregrow_request(p, pool, &par);
 }
 
+// WP-H10: request one more transient-store chain link (same params as the
+// warm-up link) from the background worker. No-op while a request is already
+// in flight (pg_pending) or the chain is full. The completed texture is
+// APPENDED at the next frame boundary (pregrow_swap_in) -- never swapped over
+// a live one, so committed spill pins can not block store growth.
+static void tr_request_link(struct priv *p)
+{
+    if (!p->pregrow_inited || !p->n_trans_chain ||
+        p->n_trans_chain >= TR_CHAIN_MAX)
+        return;
+    struct pl_tex_params par = p->trans_chain[0]->params;
+    par.initial_data = NULL;
+    par.user_data = NULL;
+    pregrow_request(p, POOL_TRANS, &par);
+}
+
+// WP-H10: feed a transient-store demand estimate (px of coverage area for one
+// frame/item) into the chain-size target and start background allocation
+// toward it. Callers: the idle pre-fill (upcoming ring entries, so a dense
+// wall approaching linearly gets its links ~1 s early), the post-reset probe
+// (the seek target, during the video-restart grace window), and the compose
+// path itself (this frame's exact demand -- the backstop that also covers
+// render-ahead-off). The area -> rows conversion uses the link width and a
+// 1.5x shelf-waste factor (the measured ep09 wall packs ~5.6k-wide layers 2
+// per 16384 row = 1.46x waste). Only ever raises the target; it decays by one
+// link at a time through tail retire.
+static void tr_note_demand(struct priv *p, int64_t px)
+{
+    if (!p->n_trans_chain || px <= 0)
+        return;
+    pl_tex l0 = p->trans_chain[0];
+    int64_t rows = px * 3 / 2 / MPMAX(l0->params.w, 1);
+    int links = (int)(1 + (rows - 1) / MPMAX(l0->params.h, 1));
+    links = MPCLAMP(links, 1, TR_CHAIN_MAX);
+    if (links > p->tr_want_links)
+        p->tr_want_links = links;
+    if (p->n_trans_chain < p->tr_want_links)
+        tr_request_link(p);
+}
+
+// WP-H10: bounded wait for an in-flight background chain-link allocation,
+// appending it as soon as the worker finishes (instead of at the next frame
+// boundary). This is the seek-straight-into-a-dense-wall path: the demand
+// probe/estimators fire on the same frame that already needs the capacity,
+// so without waiting that frame's placements fail = invisible content for
+// the wall's whole lifetime; with it, one long frame inside the seek's own
+// restart window. Never allocates on the VO thread (the ban stands); it only
+// waits -- bounded by `until` -- for the pregrow worker. Non-threaded
+// backends allocated synchronously in pregrow_request, so the scan finds the
+// texture immediately. Returns true when a link was appended.
+static bool tr_wait_append_link(struct priv *p, int64_t until)
+{
+    if (!p->pregrow_inited)
+        return false;
+    bool appended = false;
+    mp_mutex_lock(&p->pregrow_lock);
+    while (p->n_trans_chain >= 1 && p->n_trans_chain < TR_CHAIN_MAX) {
+        int found = -1;
+        for (int i = 0; i < p->num_pg_done; i++) {
+            if (p->pg_done[i].pool == POOL_TRANS) { found = i; break; }
+        }
+        if (found >= 0) {
+            struct pregrow_done d = p->pg_done[found];
+            MP_TARRAY_REMOVE_AT(p->pg_done, p->num_pg_done, found);
+            p->pg_pending &= ~(1u << POOL_TRANS);
+            int k = p->n_trans_chain++;
+            p->trans_chain[k] = d.tex;
+            p->n_tr_good[k] = p->n_tr_build[k] = 0;
+            p->tr_link_used_frame[k] = p->tr_frame;
+            p->cnt_trans_link_append++;
+            appended = true;
+            MP_VERBOSE(p, "[pool-pregrow] trans_atlas link %d appended "
+                       "(%dx%d; chain %d/%d, mid-pass wait)\n", k,
+                       d.tex->params.w, d.tex->params.h, p->n_trans_chain,
+                       TR_CHAIN_MAX);
+            break;
+        }
+        if (!(p->pg_pending & (1u << POOL_TRANS)))
+            break;                       // nothing in flight to wait for
+        if (mp_time_ns() >= until ||
+            mp_cond_timedwait_until(&p->pregrow_wakeup, &p->pregrow_lock,
+                                    until))
+            break;                       // budget exhausted
+    }
+    mp_mutex_unlock(&p->pregrow_lock);
+    return appended;
+}
+
+// Total mid-pass wait budget for background links, per pass (see above).
+// Sized to cover the measured worst real-8K link allocation (round-3: one
+// 16384x32768 vkAllocateMemory = 427 ms).
+#define TR_LINK_WAIT_MS 600
+
 static pl_tex *pregrow_slot(struct priv *p, int pool)
 {
     switch (pool) {
@@ -1636,7 +1817,6 @@ static pl_tex *pregrow_slot(struct priv *p, int pool)
     case POOL_RUN_COV_B: return &p->run_cov_b;
     case POOL_EDGE:      return &p->edge_tex;
     case POOL_WORK:      return &p->work_tex;
-    case POOL_TRANS:     return &p->trans_atlas;
     default: {
         int idx = pool - POOL_RESULT;
         return &p->osd_guard.states[idx / 2].entries[idx % 2].result_tex;
@@ -1645,14 +1825,15 @@ static pl_tex *pregrow_slot(struct priv *p, int pool)
 }
 
 // A swap destroys the old texture, so it must not be referenced by anything
-// that can still be presented: the good snapshot's result_tex (serve-stale),
-// and the transient store while a committed spill overlay references it.
+// that can still be presented: the good snapshot's result_tex (serve-stale).
 // Everything else has strictly per-frame content. Deferred swaps stay in
-// pg_done and retry next frame (good flips almost every frame).
+// pg_done and retry next frame (good flips almost every frame). WP-H10:
+// POOL_TRANS never comes through here -- a completed transient link is
+// APPENDED to the chain (nothing destroyed), so the historical
+// good-spill-pin deadlock (a pinned store could never swap its pre-grow in
+// under sustained spill) is structurally gone.
 static bool pregrow_swap_allowed(struct priv *p, int pool)
 {
-    if (pool == POOL_TRANS)
-        return !p->osd_guard.good_trans_tex;
     if (pool >= POOL_RESULT) {
         int state = (pool - POOL_RESULT) / 2;
         return p->osd_guard.good != state;
@@ -1667,9 +1848,34 @@ static void pregrow_swap_in(struct vo *vo)
     struct priv *p = vo->priv;
     if (!p->pregrow_inited)
         return;
+    p->tr_frame++;                          // WP-H10: frame counter (retire age)
     mp_mutex_lock(&p->pregrow_lock);
     for (int i = p->num_pg_done - 1; i >= 0; i--) {
         struct pregrow_done d = p->pg_done[i];
+        if (d.pool == POOL_TRANS) {
+            // WP-H10: append the finished link to the transient-store chain
+            // (nothing is destroyed or swapped, so no pin can defer this).
+            MP_TARRAY_REMOVE_AT(p->pg_done, p->num_pg_done, i);
+            p->pg_pending &= ~(1u << d.pool);
+            if (p->n_trans_chain < 1 || p->n_trans_chain >= TR_CHAIN_MAX) {
+                mp_mutex_unlock(&p->pregrow_lock);
+                pl_tex_destroy(p->gpu, &d.tex);   // raced a full/reset chain
+                mp_mutex_lock(&p->pregrow_lock);
+                continue;
+            }
+            int k = p->n_trans_chain++;
+            p->trans_chain[k] = d.tex;
+            p->n_tr_good[k] = p->n_tr_build[k] = 0;
+            p->tr_link_used_frame[k] = p->tr_frame;
+            p->cnt_trans_link_append++;
+            mp_mutex_unlock(&p->pregrow_lock);
+            MP_VERBOSE(vo, "[pool-pregrow] trans_atlas link %d appended "
+                       "(%dx%d; chain %d/%d, appended at frame boundary)\n",
+                       k, d.tex->params.w, d.tex->params.h,
+                       p->n_trans_chain, TR_CHAIN_MAX);
+            mp_mutex_lock(&p->pregrow_lock);
+            continue;
+        }
         if (!pregrow_swap_allowed(p, d.pool))
             continue;                       // retry next frame
         MP_TARRAY_REMOVE_AT(p->pg_done, p->num_pg_done, i);
@@ -1700,7 +1906,34 @@ static void pregrow_swap_in(struct vo *vo)
                    d.tex->params.w, d.tex->params.h);
         mp_mutex_lock(&p->pregrow_lock);
     }
+    // Snapshot under the lock for the retire check below (the worker
+    // clears/sets pg_pending under this lock).
+    bool trans_pending = p->pg_pending & (1u << POOL_TRANS);
     mp_mutex_unlock(&p->pregrow_lock);
+
+    // WP-H10: keep pumping toward the demand-estimated chain size (one link
+    // is in flight at a time; each append re-arms the next request here).
+    if (p->n_trans_chain && p->n_trans_chain < p->tr_want_links)
+        tr_request_link(p);
+
+    // WP-H10: tail retire -- give a link back once its pinned rows died
+    // naturally (no committed/build spill bands) and it sat unused for
+    // TR_LINK_RETIRE_FRAMES. Only the tail retires (indices stay stable for
+    // every t/band reference) and only one per frame.
+    int tail = p->n_trans_chain - 1;
+    if (tail >= 1 && !p->n_tr_good[tail] && !p->n_tr_build[tail] &&
+        !trans_pending &&
+        p->tr_frame - p->tr_link_used_frame[tail] > TR_LINK_RETIRE_FRAMES) {
+        pl_tex old = p->trans_chain[tail];
+        p->trans_chain[tail] = NULL;
+        p->n_trans_chain--;
+        p->tr_want_links = MPMIN(p->tr_want_links, p->n_trans_chain);
+        p->cnt_trans_link_retire++;
+        MP_VERBOSE(vo, "[pool-pregrow] trans_atlas link %d retired (idle "
+                   "%d frames; chain %d/%d)\n", tail,
+                   (int) TR_LINK_RETIRE_FRAMES, p->n_trans_chain, TR_CHAIN_MAX);
+        pl_tex_destroy(p->gpu, &old);
+    }
 }
 
 #else // !HAVE_ASS_COMPOSITE_DEFERRED (stock libass): no pools, no worker
@@ -1739,16 +1972,15 @@ static bool gc_ensure_pool(struct priv *p, pl_tex *t, pl_fmt fmt, int w, int h,
 // size): *upload stays false. Miss: a ring slot is allocated + the id inserted,
 // *upload set true (the caller uploads/rasterizes the pixels). Returns false
 // only when no slot could be claimed this pass (bigger than the atlas, or
-// overcommit -- the current item's working set exceeded the whole atlas);
-// WP-H1d: the caller then falls back to the per-item transient store
-// (gc_trans_place) so the glyph is still drawn -- NEVER skipped (the old skip
-// was silent content loss). The overcommit counter thus now means "took the
-// lossless per-frame transient path for a big/overflow glyph" (proven pixel-
-// identical to CPU under atlas pressure), NOT content loss. Post-H1d it is an
-// ungated tuning signal in acceptance (INFO, not gated ==0): dense 8K signs
-// legitimately trip it; its only cost is per-frame re-raster, already gated by
-// the video-draw budget. Nonzero => raise --sub-glyph-atlas-size if any frames
-// are over budget.
+// the current item's working set exceeded the whole atlas); WP-H1d: the
+// caller then falls back to the per-item transient store (gc_trans_place) so
+// the glyph is still drawn -- NEVER skipped (the old skip was silent content
+// loss). WP-H10: an atlas refusal is NOT counted as gcache-overcommit
+// anymore -- that counter is gated ==0 in acceptance with the documented
+// WP-H7 meaning "a gc_trans_place FAILURE = content dropped invisible", and
+// the refusal path loses nothing (the successful transient fallback counts
+// as glyphs-uncached, the pressure signal: nonzero => consider raising
+// --sub-glyph-atlas-size if frames are over budget).
 //
 // One open-addressed probe locates the key (if present) and the first
 // reusable (empty or stale) slot. Stale slots act as reusable tombstones that
@@ -1816,7 +2048,11 @@ static int gcache_place_new(struct priv *p, uint64_t id, int ktype, int w, int h
             p->gc_refused = true;
             return -1;
         }
-        p->cnt_gcache_overcommit++;  // bigger than atlas, or table genuinely full
+        // WP-H10: NOT counted as gcache-overcommit -- the caller falls back
+        // to the transient store, which draws the glyph losslessly; only a
+        // FAILED gc_trans_place is content loss (the H7 re-gate semantics
+        // the ==0 acceptance gate documents). This pre-count made a heavy
+        // atlas-ring pass fail the gate with zero pixels lost.
         return -1;
     }
     int gx, gy, seg;
@@ -1825,7 +2061,9 @@ static int gcache_place_new(struct priv *p, uint64_t id, int ktype, int w, int h
             p->gc_refused = true;
             return -1;
         }
-        p->cnt_gcache_overcommit++;  // ring exhausted this pass: skip (never stall)
+        // WP-H10: ring exhausted this pass -- same as above: the transient
+        // fallback keeps the glyph visible, so this is pressure (counted as
+        // glyphs-uncached at the successful fallback), never content loss.
         return -1;
     }
     p->gcache[reuse] = (struct gcache_slot){ id, gx, gy, w, h,
@@ -1959,26 +2197,30 @@ static bool gc_cacheable(struct priv *p, int w, int h)
 // still read after this placement. Skipping (instead of an absolute floor)
 // means rows of SUPERSEDED snapshots are reclaimed the moment they stop being
 // protected, so sustained spill no longer ratchets the store to exhaustion.
+// WP-H10: operates on the ACTIVE chain link's band lists.
 static void tr_skip_protected(struct priv *p, int nh)
 {
     // Advance past every protected band the placement would overlap. Both
     // lists are sorted (appended in nondecreasing row order), and each jump
     // only moves the cursor DOWN, so one rescan loop terminates after at
     // most n_tr_good + n_tr_build jumps.
+    const struct tr_band *good = p->tr_good[p->tr_link];
+    const struct tr_band *build = p->tr_build[p->tr_link];
+    int ngood = p->n_tr_good[p->tr_link], nbuild = p->n_tr_build[p->tr_link];
     bool moved = true;
     while (moved) {
         moved = false;
-        for (int i = 0; i < p->n_tr_good; i++) {
-            if (p->tr_y < p->tr_good[i].hi && p->tr_y + nh > p->tr_good[i].lo) {
-                p->tr_y = p->tr_good[i].hi;
+        for (int i = 0; i < ngood; i++) {
+            if (p->tr_y < good[i].hi && p->tr_y + nh > good[i].lo) {
+                p->tr_y = good[i].hi;
                 p->tr_x = 0;
                 p->tr_rowh = 0;
                 moved = true;
             }
         }
-        for (int i = 0; i < p->n_tr_build; i++) {
-            if (p->tr_y < p->tr_build[i].hi && p->tr_y + nh > p->tr_build[i].lo) {
-                p->tr_y = p->tr_build[i].hi;
+        for (int i = 0; i < nbuild; i++) {
+            if (p->tr_y < build[i].hi && p->tr_y + nh > build[i].lo) {
+                p->tr_y = build[i].hi;
                 p->tr_x = 0;
                 p->tr_rowh = 0;
                 moved = true;
@@ -2032,17 +2274,71 @@ static bool gc_trans_place(struct priv *p, int w, int h, struct gpos *out)
     int nw = w + 1, nh = h + 1;          // 1px pad against bilinear bleed
     if (!r8 || nw > maxd || nh > maxd)
         return false;
-    int tw = p->trans_atlas ? p->trans_atlas->params.w : 0;
-    int th = p->trans_atlas ? p->trans_atlas->params.h : 0;
-    if (p->tr_x + nw > tw) {             // shelf advance
-        p->tr_y += p->tr_rowh;
-        p->tr_x = 0;
-        p->tr_rowh = 0;
+    // WP-H10: walk the chain from the cursor. Within a pass the link index
+    // only ever advances, so an item's placements are monotonic in (link,
+    // row) order -- the property the spill-overlay z-order split relies on.
+retry:
+    while (p->tr_link < p->n_trans_chain) {
+        pl_tex t = p->trans_chain[p->tr_link];
+        int tw = t->params.w, th = t->params.h;
+        if (p->tr_x + nw > tw) {         // shelf advance
+            p->tr_y += p->tr_rowh;
+            p->tr_x = 0;
+            p->tr_rowh = 0;
+        }
+        // WP-H7 (defect 1): never place over live spill rows (see the
+        // helper). A placement taller than the current shelf row can newly
+        // overlap an interval above even without a shelf advance, so check
+        // every placement.
+        tr_skip_protected(p, nh);
+        if (nw <= tw && p->tr_y + nh <= th) {
+            out->ax = p->tr_x;
+            out->ay = p->tr_y;
+            out->t = 1 + p->tr_link;
+            p->tr_x += nw;
+            p->tr_rowh = MPMAX(p->tr_rowh, nh);
+            p->tr_pass_used = true;
+            p->tr_link_used_frame[p->tr_link] = p->tr_frame;
+            // WP-H6 (item 1)/WP-H10 watermark: crossing ~70% of the LAST
+            // allocated link starts the next one off-thread BEFORE demand
+            // can exhaust the chain (ep09's 568 ms round-3 frame was the
+            // historical inline grow, on the VO thread).
+            if (p->tr_link == p->n_trans_chain - 1 &&
+                p->n_trans_chain < TR_CHAIN_MAX &&
+                (int64_t) (p->tr_y + p->tr_rowh) * 10 > (int64_t) th * 7) {
+                p->tr_want_links = MPMAX(p->tr_want_links,
+                                         p->n_trans_chain + 1);
+                tr_request_link(p);
+            }
+            return true;
+        }
+        if (p->tr_link + 1 < p->n_trans_chain) {
+            // Active link exhausted: activate the next allocated one.
+            p->tr_link++;
+            p->tr_x = p->tr_y = p->tr_rowh = 0;
+            continue;
+        }
+        break;                           // whole chain exhausted
     }
-    // WP-H7 (defect 1): never place over live spill rows (see the helper).
-    // A placement taller than the current shelf row can newly overlap an
-    // interval above even without a shelf advance, so check every placement.
-    tr_skip_protected(p, nh);
+    // The chain is exhausted (or was never created -- no warm-up). Ask for
+    // one more link NOW, then wait -- bounded, once per pass -- for the
+    // background alloc: a seek straight into a dense wall has its demand
+    // land on the very frame the estimators first see it, and failing here
+    // is invisible content for the wall's whole lifetime (the round-5 ep09
+    // storm), while waiting is one long frame inside the seek's own restart
+    // window. If the budget runs out the placement fails (counted) and the
+    // link lands at the next frame boundary instead.
+    if (p->n_trans_chain >= 1 && p->n_trans_chain < TR_CHAIN_MAX) {
+        p->tr_want_links = MPMAX(p->tr_want_links, p->n_trans_chain + 1);
+        tr_request_link(p);
+        if (p->tr_wait_pass != p->gc_pass) {
+            p->tr_wait_pass = p->gc_pass;
+            p->tr_wait_until = mp_time_ns() +
+                               TR_LINK_WAIT_MS * INT64_C(1000000);
+        }
+        if (tr_wait_append_link(p, p->tr_wait_until))
+            goto retry;
+    }
     // WP-H7 (defect 1): while any spill band is live -- or anything was
     // placed this pass (its rastered content is consumed later this item) --
     // an inline grow is FORBIDDEN: pl_tex_recreate destroys the old texture,
@@ -2050,24 +2346,38 @@ static bool gc_trans_place(struct priv *p, int w, int h, struct gpos *out)
     // already emitted THIS frame, and this pass's own rasters still
     // reference it -- a grow here is a use-after-free at present time, not
     // just a stall. Fail the placement instead (counted gcache-overcommit --
-    // visible and gated); the background pre-grow swaps a bigger store in at
-    // a spill-free frame boundary.
-    if ((p->n_tr_good || p->n_tr_build || p->tr_pass_used) &&
-        (nw > tw || p->tr_y + nh > th)) {
+    // visible and gated); the requested chain link lands at a frame
+    // boundary. WP-H10: the inline path only remains for a single-link
+    // chain (debug-small stores, or a missing warm-up); a longer chain
+    // means real content already flowed through the background path.
+    bool banded = p->tr_pass_used;
+    for (int k = 0; k < p->n_trans_chain; k++)
+        banded |= p->n_tr_good[k] || p->n_tr_build[k];
+    if (banded || p->n_trans_chain > 1) {
         if (p->tr_fail_pass != p->gc_pass) {
             p->tr_fail_pass = p->gc_pass;
+            pl_tex tl = p->n_trans_chain ?
+                        p->trans_chain[p->n_trans_chain - 1] : NULL;
             MP_VERBOSE(p, "[pool-spill] trans store exhausted: need %dx%d at "
-                       "row %d of %dx%d (%d good + %d build bands protected); "
-                       "placements fail this item\n",
-                       nw, nh, p->tr_y, tw, th, p->n_tr_good, p->n_tr_build);
+                       "row %d of link %d/%d (%dx%d; %d good + %d build bands "
+                       "on it, want %d links); placements fail this item\n",
+                       nw, nh, p->tr_y, p->tr_link + 1, p->n_trans_chain,
+                       tl ? tl->params.w : 0, tl ? tl->params.h : 0,
+                       p->n_trans_chain ? p->n_tr_good[p->tr_link] : 0,
+                       p->n_trans_chain ? p->n_tr_build[p->tr_link] : 0,
+                       p->tr_want_links);
         }
         return false;
     }
-    if (nw > tw || p->tr_y + nh > th) {
-        // Grow: width at least the atlas width (and this glyph; 4096 minimum
-        // so a debug-shrunk atlas doesn't force a needle-thin store), height
-        // to fit the current shelf; both doubled up to the GPU limit so
-        // growth is O(log) over a scene.
+    // Inline (counted) grow of the single unpinned, unused link -- the
+    // historical last resort, kept for debug-shrunk atlases and a missing
+    // warm-up. Width at least the atlas width (and this glyph; 4096 minimum
+    // so a debug-shrunk atlas doesn't force a needle-thin store), height to
+    // fit the current shelf; both doubled up to the GPU limit so growth is
+    // O(log) over a scene.
+    {
+        int tw = p->n_trans_chain ? p->trans_chain[0]->params.w : 0;
+        int th = p->n_trans_chain ? p->trans_chain[0]->params.h : 0;
         int target_w = MPMIN(MPMAX(MPMAX(p->gatlas_w, nw), 4096), maxd);
         int want_w = tw, want_h = th;
         while (want_w < target_w)
@@ -2082,9 +2392,11 @@ static bool gc_trans_place(struct priv *p, int w, int h, struct gpos *out)
 #else
         const bool storable = false;
 #endif
-        if (!gc_ensure_pool(p, &p->trans_atlas, r8, want_w, want_h,
+        if (!gc_ensure_pool(p, &p->trans_chain[0], r8, want_w, want_h,
                             storable, true, false, false, true, "trans_atlas"))
             return false;
+        p->n_trans_chain = MPMAX(p->n_trans_chain, 1);
+        p->tr_link = 0;
     }
     out->ax = p->tr_x;
     out->ay = p->tr_y;
@@ -2092,11 +2404,7 @@ static bool gc_trans_place(struct priv *p, int w, int h, struct gpos *out)
     p->tr_x += nw;
     p->tr_rowh = MPMAX(p->tr_rowh, nh);
     p->tr_pass_used = true;
-    // WP-H6 (item 1): watermark on the shelf's high-water row so the next
-    // size is created off-thread BEFORE an item can hit the inline grow
-    // above (ep09's 568 ms frame was exactly that grow, on the VO thread).
-    // Width stays fixed (need_w 0): the shelf packs into the full width.
-    pregrow_watermark(p, POOL_TRANS, p->trans_atlas, 0, p->tr_y + p->tr_rowh);
+    p->tr_link_used_frame[0] = p->tr_frame;
     return true;
 }
 
@@ -2151,33 +2459,53 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
     // never uninitialised memory.
     float gl[8 * GATHER_MAXG] = {0};
     int gn = 0;
+    // WP-H10: a gather dispatch binds ONE transient chain link; glyphs from a
+    // different link flush the batch first. Link use is monotonic through a
+    // pass, so a run mixes at most a couple of links = a couple extra
+    // dispatches, and the GLSL body (hence the warmed pipeline) is unchanged.
+    int glink = -1;                        // chain link bound by this batch
     for (int k = 0; k < n; k++) {
         const struct sub_bitmap *b = &item->parts[parts[k]];
         // Glyph coverage (b->w x b->h) is at the capped render resolution; place
         // it in the run accumulator in that same capped space (gs scales the
         // display-space part position down to it).
         if (cpos[parts[k]].t < 0)
-            continue;   // unplaceable (theoretical; see gc_trans_place)
+            continue;   // unplaceable (chain exhausted; see gc_trans_place)
         int dx = lrint(b->x * gs) - r->x0 + r->margin;
         int dy = lrint(b->y * gs) - r->y0 + r->margin;
         if (gather) {
+            int link = cpos[parts[k]].t - 1;   // -1 = persistent atlas
+            if (link >= 0 && glink >= 0 && link != glink && gn > 0) {
+                // Stale entries past gn are never read (the shader loop is
+                // bounded by nglyph), same as the zero-padded tail.
+                osd_combine_gather(p, p->run_acc, gl, gn, bw, bh,
+                                   p->trans_chain[glink]);
+                gn = 0;
+            }
+            if (link >= 0)
+                glink = link;
             float *e = &gl[8 * gn];
             e[0]=dx; e[1]=dy; e[2]=b->w; e[3]=b->h;
             e[4]=cpos[parts[k]].ax; e[5]=cpos[parts[k]].ay;
             e[6]=cpos[parts[k]].t > 0 ? 1.0f : 0.0f; e[7]=0;
             if (++gn == GATHER_MAXG) {
-                osd_combine_gather(p, p->run_acc, gl, gn, bw, bh);
+                osd_combine_gather(p, p->run_acc, gl, gn, bw, bh,
+                                   glink >= 0 ? p->trans_chain[glink] : NULL);
                 gn = 0;
+                glink = -1;
             }
         } else {
             // WP-H1d: uncached/overflow glyphs live in the per-item transient
             // store instead of the persistent atlas.
-            pl_tex src = cpos[parts[k]].t > 0 ? p->trans_atlas : p->glyph_atlas;
+            pl_tex src = cpos[parts[k]].t > 0 ?
+                         p->trans_chain[cpos[parts[k]].t - 1] : p->glyph_atlas;
             osd_combine_part(p, src, p->run_acc, cpos[parts[k]].ax,
                              cpos[parts[k]].ay, dx, dy, b->w, b->h);
         }
     }
-    if (gn > 0) osd_combine_gather(p, p->run_acc, gl, gn, bw, bh);
+    if (gn > 0)
+        osd_combine_gather(p, p->run_acc, gl, gn, bw, bh,
+                           glink >= 0 ? p->trans_chain[glink] : NULL);
     osd_unop(p, p->run_acc, cov, bw, bh, "acc", false, "dst", osd_resolve_body);
 }
 
@@ -2461,7 +2789,8 @@ static void gc_clip_mult(struct priv *p, pl_tex cov, int bw, int bh,
         { .desc = { .name = "cov", .type = PL_DESC_STORAGE_IMG, .binding = 0,
                     .access = PL_DESC_ACCESS_READWRITE }, .binding = { .object = cov } },
         { .desc = { .name = "mask", .type = PL_DESC_SAMPLED_TEX, .binding = 1 },
-          .binding = { .object = cm->t ? p->trans_atlas : p->glyph_atlas } },
+          .binding = { .object = cm->t ? p->trans_chain[cm->t - 1]
+                                       : p->glyph_atlas } },
     };
     struct pl_shader_var vars[] = {
         { .var = pl_var_int("bw"), .data = &bw }, { .var = pl_var_int("bh"), .data = &bh },
@@ -2777,7 +3106,10 @@ static void gc_warmup(struct priv *p)
     // atlas height -- the round-3 ep09 wall demanded 16384x32768 in a single
     // frame (a 427 ms in-frame vkAllocateMemory when grown inline), and the
     // store now also absorbs result_tex spills. 512 MiB r8 on the 8K target,
-    // acceptable next to the atlases.
+    // acceptable next to the atlases. WP-H10: this becomes link [0] of the
+    // transient-store CHAIN; further links (same size) are appended in the
+    // background when demand estimates or placements call for them, up to
+    // TR_CHAIN_MAX (the round-5 ep09 wall needs ~3.2-3.5x this link).
     if (p->glyph_atlas) {
         pl_fmt tr8 = p->osd_fmt[SUBBITMAP_LIBASS];
 #if HAVE_ASS_OUTLINE_DEFERRED
@@ -2788,9 +3120,9 @@ static void gc_warmup(struct priv *p)
         bool big = p->osd_res.w >= 3840 || p->osd_res.h >= 2160;
         int tr_h = big ? MPMIN(2 * p->gatlas_h, gpu->limits.max_tex_2d_dim)
                        : p->gatlas_h;
-        if (tr8)
-            gc_ensure(gpu, &p->trans_atlas, tr8, p->gatlas_w, tr_h,
-                      tr_storable, true, false, false, true);
+        if (tr8 && gc_ensure(gpu, &p->trans_chain[0], tr8, p->gatlas_w, tr_h,
+                             tr_storable, true, false, false, true))
+            p->n_trans_chain = MPMAX(p->n_trans_chain, 1);
     }
     // WP-H6 (item 1): start the background pool pre-grow worker.
     pregrow_init(p);
@@ -2827,7 +3159,7 @@ static void gc_warmup(struct priv *p)
         // WP-H5b: precompile the batched gather-combine variant (one dummy glyph).
         if (p->glyph_atlas) {
             float gl[8 * GATHER_MAXG] = {0};
-            osd_combine_gather(p, p->run_acc, gl, 1, D, D);             (*n)++;
+            osd_combine_gather(p, p->run_acc, gl, 1, D, D, NULL);       (*n)++;
         }
     }
     if (have_r8 && have_r32 && p->run_acc && p->run_cov_f)
@@ -3021,12 +3353,15 @@ static void gc_flush_raster(struct priv *p, struct rjob *rjobs, int nrjobs,
     stats_time_end(p->stats, "sub-raster");
 }
 
-// Flush both destinations' job queues for one item: the whole segment pool is
+// Flush every destination's job queue for one item: the whole segment pool is
 // uploaded ONCE when it fits the current edge_tex (the near-universal case);
 // past capacity the flush degrades to rebased per-chunk uploads (see above).
+// WP-H10: transient jobs are queued per chain link (trjobs[k] targets link k;
+// NULL from the pre-fill, which never touches the transient store) -- one
+// gc_flush_raster per link that has jobs.
 static void gc_flush_raster_all(struct priv *p, int ne,
                                 struct rjob *rjobs, int nrjobs,
-                                struct rjob *trjobs, int ntrjobs)
+                                struct rjob *const *trjobs, const int *ntrjobs)
 {
     if (!ne)
         return;
@@ -3034,7 +3369,9 @@ static void gc_flush_raster_all(struct priv *p, int ne,
                       (int)(((int64_t) ne * 2 + EDGE_TEX_W - 1) / EDGE_TEX_W));
     bool edges_ready = ne <= gc_edge_cap_segs(p) && gc_flush_edges_range(p, 0, ne);
     gc_flush_raster(p, rjobs, nrjobs, p->glyph_atlas, edges_ready);
-    gc_flush_raster(p, trjobs, ntrjobs, p->trans_atlas, edges_ready);
+    for (int k = 0; trjobs && k < p->n_trans_chain; k++)
+        gc_flush_raster(p, trjobs[k], ntrjobs[k], p->trans_chain[k],
+                        edges_ready);
 }
 #endif // HAVE_ASS_OUTLINE_DEFERRED
 
@@ -3136,12 +3473,21 @@ static void emit_composed_overlays(struct priv *p, const struct sub_bitmaps *ite
     ol->tex = entry->result_tex;
     ol->parts = entry->run_parts;
     ol->num_parts = entry->num_run_parts;
-    if (entry->num_spill_parts) {
+    // WP-H10: the spill suffix may span several chain links; emit one overlay
+    // per consecutive same-link run. Link use is monotonic through the item's
+    // placements, so this is at most TR_CHAIN_MAX overlays (MAX_OSD_OVERLAYS
+    // is sized for it) and the sequence preserves libass's z-order exactly.
+    for (int i = 0; i < entry->num_spill_parts; ) {
+        int link = entry->spill_links[i];
+        int j = i + 1;
+        while (j < entry->num_spill_parts && entry->spill_links[j] == link)
+            j++;
         struct pl_overlay *ols = &state->overlays[frame->num_overlays++];
         *ols = col;
-        ols->tex = p->trans_atlas;
-        ols->parts = entry->spill_parts;
-        ols->num_parts = entry->num_spill_parts;
+        ols->tex = p->trans_chain[link];
+        ols->parts = entry->spill_parts + i;
+        ols->num_parts = j - i;
+        i = j;
     }
 }
 
@@ -3201,6 +3547,7 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     p->tr_x = 0;
     p->tr_y = 0;
     p->tr_rowh = 0;
+    p->tr_link = 0;                    // WP-H10: cursor restarts at link 0
     p->tr_pass_used = false;
 
     void *tmp = talloc_new(NULL);
@@ -3214,16 +3561,23 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // the cached coverage untouched).
     bool is_outline = item->format == SUBBITMAP_LIBASS_OUTLINES;
     struct gpos *cpos = talloc_array(tmp, struct gpos, item->num_parts);
+    // WP-H10: this item's EXACT transient-store demand (uncached/overflow
+    // glyphs + result_tex spill layers, placed or failed) -- fed to
+    // tr_note_demand after the allocation loop as the reactive chain-size
+    // backstop (covers render-ahead-off and estimator misses).
+    int64_t trans_demand_px = 0;
     // Pending uploads/raster jobs, split by destination: the persistent atlas
     // (cache misses) vs the per-item transient store (WP-H1d: uncached giants
-    // + overflow -- never skipped).
-    struct gmiss *miss = NULL, *tmiss = NULL;
-    int nmiss = 0, ntmiss = 0;
-    size_t miss_bytes = 0, tmiss_bytes = 0;
+    // + overflow -- never skipped). WP-H10: one transient queue per chain
+    // link (a placement names its link in cpos[].t).
+    struct gmiss *miss = NULL, *tmiss[TR_CHAIN_MAX] = {0};
+    int nmiss = 0, ntmiss[TR_CHAIN_MAX] = {0};
+    size_t miss_bytes = 0, tmiss_bytes[TR_CHAIN_MAX] = {0};
 #if HAVE_ASS_OUTLINE_DEFERRED
     // outline raster jobs: per missed glyph, its slot + the blob's tiles
-    struct rjob *rjobs = NULL, *trjobs = NULL;
-    int nrjobs = 0, ntrjobs = 0, ne = 0;     // ne = pooled segments (2 texels each)
+    struct rjob *rjobs = NULL, *trjobs[TR_CHAIN_MAX] = {0};
+    int nrjobs = 0, ntrjobs[TR_CHAIN_MAX] = {0};
+    int ne = 0;                              // ne = pooled segments (2 texels each)
     // Vector-\clip masks found in this item: rasterized like glyphs, then used
     // to multiply each clipped run's coverage (gc_outline_features).
     struct clipmask *clips = NULL;
@@ -3233,8 +3587,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // WP-E: resolve each glyph via the epoch-evicting cache (gc_place). A miss
     // recycles at most one ring segment (bounded); nothing full-flushes.
     // WP-H1d: a glyph the cache does not admit (above the size cap) or cannot
-    // place (this item overcommitting the whole atlas; counted in
-    // gcache_reserve) goes to the per-item transient store and is re-
+    // place (this item overcommitting the whole atlas) goes to the per-item
+    // transient store (counted glyphs-uncached on success) and is re-
     // rasterized/uploaded THIS frame -- never dropped. The old skip left
     // cpos at {0,0}, so affected runs composed whatever lived at the atlas
     // origin: wrong-glyph garbage or missing text, varying with eviction
@@ -3259,17 +3613,23 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             }
         }
         if (!placed) {
+            // WP-H10: count the demand whether or not the placement lands --
+            // the exact-demand backstop that sizes the chain for next frame.
+            trans_demand_px += (int64_t) (b->w + 1) * (b->h + 1);
             if (!gc_trans_place(p, b->w, b->h, &cpos[i])) {
-                // Theoretical bound (> max-texture transient demand): make
-                // the glyph invisible rather than compose garbage, and let
-                // the acceptance gate catch it.
+                // Chain exhausted (links still allocating, or demand past the
+                // TR_CHAIN_MAX VRAM cap): make the glyph invisible rather
+                // than compose garbage, and let the acceptance gate catch it.
                 cpos[i].t = -1;
                 p->cnt_gcache_overcommit++;
                 continue;
             }
-            if (!gc_cacheable(p, b->w, b->h))
-                p->cnt_glyph_uncached++;  // policy (giant glyph); allocator
-                                          // overflow was counted as overcommit
+            // WP-H10: every successful transient placement counts here --
+            // the policy-uncacheable giants AND the cacheable glyphs the
+            // atlas ring could not admit this pass (both drawn losslessly,
+            // both pure pressure signals). gcache-overcommit is reserved
+            // for FAILED placements = content loss (the gated meaning).
+            p->cnt_glyph_uncached++;
             up = true;                    // transient content is per-item
         }
 #if HAVE_ASS_OUTLINE_DEFERRED
@@ -3300,7 +3660,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                    (size_t) ns * SEG_EXPORT_W * sizeof(float));
             struct rjob rj = { cpos[i].ax, cpos[i].ay, b->w, b->h, ne, ns, nt, gtiles };
             if (cpos[i].t) {
-                MP_TARRAY_APPEND(tmp, trjobs, ntrjobs, rj);
+                int k = cpos[i].t - 1;   // WP-H10: queue on the placed link
+                MP_TARRAY_APPEND(tmp, trjobs[k], ntrjobs[k], rj);
             } else {
                 MP_TARRAY_APPEND(tmp, rjobs, nrjobs, rj);
             }
@@ -3313,8 +3674,9 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                                 + (ptrdiff_t) b->src_y * pstride + b->src_x;
             struct gmiss gm = { cpos[i].ax, cpos[i].ay, b->w, b->h, gsrc };
             if (cpos[i].t) {
-                MP_TARRAY_APPEND(tmp, tmiss, ntmiss, gm);
-                tmiss_bytes += (size_t) b->w * b->h;
+                int k = cpos[i].t - 1;   // WP-H10: queue on the placed link
+                MP_TARRAY_APPEND(tmp, tmiss[k], ntmiss[k], gm);
+                tmiss_bytes[k] += (size_t) b->w * b->h;
             } else {
                 MP_TARRAY_APPEND(tmp, miss, nmiss, gm);
                 miss_bytes += (size_t) b->w * b->h;
@@ -3332,8 +3694,10 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // Flush the upload misses (async, buffer-backed).
     if (nmiss)
         gc_flush_misses(p, miss, nmiss, miss_bytes, pstride, p->glyph_atlas);
-    if (ntmiss)
-        gc_flush_misses(p, tmiss, ntmiss, tmiss_bytes, pstride, p->trans_atlas);
+    for (int k = 0; k < p->n_trans_chain; k++)
+        if (ntmiss[k])
+            gc_flush_misses(p, tmiss[k], ntmiss[k], tmiss_bytes[k], pstride,
+                            p->trans_chain[k]);
 
     // WP-E3 checkpoint: the miss flush is recorded (every claimed atlas slot
     // has its raster/upload in flight), so the glyph cache is consistent again
@@ -3462,8 +3826,9 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // the NEXT placement bounce off it (tr_skip_protected) onto a fresh
     // shelf row: one row band per spilled layer, ~13x row waste on the cold
     // gate3k frame, transient-store exhaustion, dropped layers.
-    struct tr_band item_bands[TR_BANDS_MAX];
-    int n_item_bands = 0;
+    // WP-H10: bands are tracked per chain link.
+    struct tr_band item_bands[TR_CHAIN_MAX][TR_BANDS_MAX];
+    int n_item_bands[TR_CHAIN_MAX] = {0};
     for (int ei = 0; ei < nems; ei++) {
         struct gc_region *r = &regs[ems[ei].reg];
         // Deferred runs are raw (unexpanded) per-glyph coverage, so they need
@@ -3495,17 +3860,21 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             spill_from = ei;    // this and all later region-layers spill
         }
         // Transient-store spill (gc_trans_place pads by 1px itself). Fails
-        // only when the store is genuinely exhausted (single-frame demand
-        // past the GPU max-texture bound, or all remaining rows protected by
-        // live spill intervals): make the layer invisible rather than
-        // compose garbage, and let the gates catch it.
+        // only when the chain is genuinely exhausted (links still allocating
+        // in the background, or single-frame demand past the TR_CHAIN_MAX
+        // VRAM cap): make the layer invisible rather than compose garbage,
+        // and let the gates catch it.
+        // WP-H10: the demand is counted whether or not the placement lands
+        // (the reactive chain-size backstop).
+        trans_demand_px += (int64_t) rw * rh;
         struct gpos sp;
         if (gc_trans_place(p, rw - 1, rh - 1, &sp)) {
-            *ax = sp.ax; *ay = sp.ay; *at = 1;
+            *ax = sp.ax; *ay = sp.ay; *at = sp.t;
             // WP-H7 (defect 1): these rows are read by the emitted overlay
             // at render (and by a bail re-present until superseded) -- track
-            // them as this build's protected spill bands.
-            tr_band_add(item_bands, &n_item_bands, sp.ay, sp.ay + rh);
+            // them as this build's protected spill bands (per link).
+            tr_band_add(item_bands[sp.t - 1], &n_item_bands[sp.t - 1],
+                        sp.ay, sp.ay + rh);
         } else {
             *at = -1;
             p->cnt_gcache_overcommit++;
@@ -3514,9 +3883,13 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     int atlas_w = MPMAX(max_w, 1), atlas_h = MPMAX(shelf_y + shelf_h, 1);
     // Flush this item's spill bands into the build protection (read by the
     // emitted overlay at render and by later items/builds; see above).
-    for (int i = 0; i < n_item_bands; i++)
-        tr_band_add(p->tr_build, &p->n_tr_build,
-                    item_bands[i].lo, item_bands[i].hi);
+    for (int k = 0; k < TR_CHAIN_MAX; k++)
+        for (int i = 0; i < n_item_bands[k]; i++)
+            tr_band_add(p->tr_build[k], &p->n_tr_build[k],
+                        item_bands[k][i].lo, item_bands[k][i].hi);
+    // WP-H10: feed the item's exact transient demand (glyphs + spill) into
+    // the chain-size target; background links spin up before the next frame.
+    tr_note_demand(p, trans_demand_px);
     bool spilled = spill_from < nems;
     if (spilled) {
         p->build_spilled = true;
@@ -3566,9 +3939,12 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         struct gc_region *r = &regs[i];
         int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
         // WP-H6 (item 1): each layer's composed coverage goes where it was
-        // allocated -- result_tex, or the transient store when spilled.
-        pl_tex dst_f = r->fill_t == 1 ? p->trans_atlas : entry->result_tex;
-        pl_tex dst_b = r->bord_t == 1 ? p->trans_atlas : entry->result_tex;
+        // allocated -- result_tex, or (WP-H10) the transient chain link it
+        // spilled to.
+        pl_tex dst_f = r->fill_t >= 1 ? p->trans_chain[r->fill_t - 1]
+                                      : entry->result_tex;
+        pl_tex dst_b = r->bord_t >= 1 ? p->trans_chain[r->bord_t - 1]
+                                      : entry->result_tex;
         // Reproduce the CPU pipeline order (ass_composite_construct):
         // ass_synth_blur (gaussian, then \be) runs on each layer BEFORE
         // ass_fix_outline subtracts the crisp fill from the (blurred) border.
@@ -3716,9 +4092,15 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                                ((sg >> 8) & 0xFF) / 255.0f, (255 - (sg & 0xFF)) / 255.0f },
                 };
                 // WP-H6 (item 1): spilled region-layers form a suffix of the
-                // emission order and go into the second (transient-store)
-                // overlay -- z-order preserved across the texture split.
-                if (lt == 1) {
+                // emission order and go into the extra (transient-store)
+                // overlays -- z-order preserved across the texture split.
+                // WP-H10: each part records its chain link; the emitter cuts
+                // one overlay per consecutive same-link run (monotonic within
+                // the item by construction, so <= TR_CHAIN_MAX overlays).
+                if (lt >= 1) {
+                    int ns = entry->num_spill_parts;
+                    MP_TARRAY_GROW(p, entry->spill_links, ns);
+                    entry->spill_links[ns] = (uint8_t) (lt - 1);
                     MP_TARRAY_APPEND(p, entry->spill_parts,
                                      entry->num_spill_parts, part);
                 } else {
@@ -3850,7 +4232,7 @@ static bool gc_prefill_item(struct priv *p, const struct sub_bitmaps *item,
     p->gc_no_recycle = false;
 #if HAVE_ASS_OUTLINE_DEFERRED
     if (ne) {
-        gc_flush_raster_all(p, ne, rjobs, nrjobs, NULL, 0);
+        gc_flush_raster_all(p, ne, rjobs, nrjobs, NULL, NULL);
         p->cnt_prefill_glyphs += nrjobs;
     }
 #endif
@@ -3862,6 +4244,104 @@ static bool gc_prefill_item(struct priv *p, const struct sub_bitmaps *item,
         complete = true;              // never spin on a refused entry
     talloc_free(tmp);
     return complete;
+}
+
+// WP-H10 (seek/cold-aware sizing): PREDICTIVE transient-store demand estimate
+// for an upcoming (peeked render-ahead) item, so chain links are requested
+// BEFORE the first frame that needs them. Mirrors the compose path's
+// placement rules coarsely on the CPU (no GPU work, a few ops per part):
+//   - glyphs above the cache size cap always go transient (exact rule);
+//   - cacheable glyph area beyond half the persistent atlas is assumed to
+//     overflow there too (the ring cannot hold much more than the atlas);
+//   - per-(run, layer) region bboxes -- consecutive parts share a (run_id,
+//     layer) key, matching libass's emission order -- inflated by the same
+//     blur/\be margin as compose_glyph_runs, minus the result atlas capacity,
+//     spill transient.
+// Over-estimation costs bounded VRAM (the chain caps at TR_CHAIN_MAX);
+// under-estimation costs one reactive frame (the compose backstop feeds the
+// EXACT demand next). Called from the idle pre-fill (linear approach: the
+// ring banks a dense wall ~1 s ahead) and the post-reset probe (a seek
+// target, during the video-restart grace window).
+static void tr_estimate_item(struct priv *p, const struct sub_bitmaps *item)
+{
+    if (!p->gc_warmed || !p->n_trans_chain || !item)
+        return;
+    if (item->format != SUBBITMAP_LIBASS_GLYPHS &&
+        item->format != SUBBITMAP_LIBASS_OUTLINES)
+        return;
+    double gs = 1.0;
+    if (item->render_w > 0 && p->osd_res.w > 0)
+        gs = MPMIN(1.0, (double) item->render_w / p->osd_res.w);
+    int64_t glyph_px = 0, cache_px = 0, layer_px = 0;
+    bool in_grp = false;
+    uint32_t grp_run = 0;
+    uint8_t grp_layer = 0;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0, be = 0;
+    float blur = 0;
+    for (int i = 0; i <= item->num_parts; i++) {
+        const struct sub_bitmap *b =
+            i < item->num_parts ? &item->parts[i] : NULL;
+        bool usable = b && b->libass.glyph_id &&
+                      !(b->libass.run_flags & RUN_FLAG_CLIP_MASK);
+        bool same = usable && in_grp && b->libass.run_id == grp_run &&
+                    (uint8_t) (b->libass.layer == 1) == grp_layer;
+        if (in_grp && !same) {
+            int m = blur_expand_pad(blur) + be;
+            layer_px += ((int64_t) llrint((x1 - x0) * gs) + 2 * m) *
+                        ((int64_t) llrint((y1 - y0) * gs) + 2 * m);
+            in_grp = false;
+        }
+        if (!usable)
+            continue;
+        if (gc_cacheable(p, b->w, b->h)) {
+            cache_px += (int64_t) (b->w + 1) * (b->h + 1);
+        } else {
+            glyph_px += (int64_t) (b->w + 1) * (b->h + 1);
+        }
+        if (!in_grp) {
+            in_grp = true;
+            grp_run = b->libass.run_id;
+            grp_layer = b->libass.layer == 1;
+            x0 = b->x; y0 = b->y;
+            x1 = b->x + b->dw; y1 = b->y + b->dh;
+            blur = b->libass.blur_x;
+            be = b->libass.be;
+        } else {
+            x0 = MPMIN(x0, b->x); y0 = MPMIN(y0, b->y);
+            x1 = MPMAX(x1, b->x + b->dw); y1 = MPMAX(y1, b->y + b->dh);
+            blur = MPMAX(blur, b->libass.blur_x);
+            be = MPMAX(be, (int) b->libass.be);
+        }
+    }
+    pl_tex rt = p->osd_guard.states[0].entries[0].result_tex;
+    int64_t result_cap = rt ? (int64_t) rt->params.w * rt->params.h : 0;
+    int64_t atlas_half = (int64_t) p->gatlas_w * p->gatlas_h / 2;
+    int64_t est = glyph_px + MPMAX((int64_t) 0, cache_px - atlas_half) +
+                  MPMAX((int64_t) 0, layer_px - result_cap);
+    tr_note_demand(p, est);
+}
+
+// WP-H10: post-seek probe. VOCTRL_RESET arms it; for a few frames the VO
+// peeks the ring's lowest-pts entry (the seek target, rendered by the worker
+// pre-warm during the video-restart window -- the same grace window F1 uses)
+// and estimates its transient demand, so a seek INTO a dense wall has its
+// chain links allocating before -- or overlapping -- the first post-seek
+// compose. The prefill ack is NOT sent (the entry stays pre-fillable).
+static void tr_reset_probe_run(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    if (p->tr_reset_probe <= 0 || !p->gc_warmed || !p->n_trans_chain)
+        return;
+    p->tr_reset_probe--;
+    double pts = 0;
+    struct sub_bitmaps *item = osd_sub_peek_ahead(vo->osd, &pts);
+    if (!item)
+        return;
+    if (pts != p->tr_probe_pts) {
+        p->tr_probe_pts = pts;
+        tr_estimate_item(p, item);
+    }
+    talloc_free(item);
 }
 
 // WP-H1b idle GPU pre-fill: on frames whose sub state didn't change (empty or
@@ -3893,6 +4373,10 @@ static void sub_prefill_idle(struct vo *vo)
     bool done = true;
     if ((item->format == SUBBITMAP_LIBASS_GLYPHS ||
          item->format == SUBBITMAP_LIBASS_OUTLINES) && item->num_parts) {
+        // WP-H10: size the transient-store chain for this upcoming item
+        // before it plays (pure CPU walk; background alloc overlaps the
+        // remaining ring lead time).
+        tr_estimate_item(p, item);
         stats_time_start(p->stats, "sub-prefill");
         done = gc_prefill_item(p, item, now + budget_ns);
         stats_time_end(p->stats, "sub-prefill");
@@ -3972,7 +4456,8 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
     // screenshot rebuild) starts with no spill rows of its own; the committed
     // good snapshot's rows stay protected via tr_good[] until superseded.
     // Spill COMMIT state tracks the MAIN guard only.
-    p->n_tr_build = 0;
+    for (int k = 0; k < TR_CHAIN_MAX; k++)
+        p->n_tr_build[k] = 0;
     if (present && g == &p->osd_guard)
         p->build_spilled = false;
 
@@ -4447,20 +4932,25 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
         memcpy(g->good_ol_rindex, g->build_ol_rindex, sizeof(g->good_ol_rindex));
         memcpy(g->good_ol_change, g->build_ol_change, sizeof(g->good_ol_change));
         // WP-H6 (item 1) / WP-H7 (defect 1): a committed spill overlay pins
-        // its transient-store ROWS (and blocks a trans_atlas pre-grow swap)
-        // until superseded. The interval is exactly this build's spill rows;
-        // the previous snapshot's rows stop being protected right here --
-        // reclaimed by the next build instead of ratcheting the store full.
+        // its transient-store ROWS (per chain link, WP-H10) until superseded.
+        // The intervals are exactly this build's spill rows; the previous
+        // snapshot's rows stop being protected right here -- reclaimed by the
+        // next build instead of ratcheting the store full. A pinned link is
+        // never destroyed/retired, but the chain still GROWS freely (append
+        // never touches existing links) -- the H7-era pin-vs-pregrow deadlock
+        // cannot recur.
         if (g == &p->osd_guard) {
-            g->good_trans_tex = p->build_spilled ? p->trans_atlas : NULL;
-            g->n_good_trans = p->build_spilled ? p->n_tr_build : 0;
-            if (g->n_good_trans)
-                memcpy(g->good_trans, p->tr_build,
-                       g->n_good_trans * sizeof(g->good_trans[0]));
-            p->n_tr_good = g->n_good_trans;
-            if (p->n_tr_good)
-                memcpy(p->tr_good, g->good_trans,
-                       p->n_tr_good * sizeof(p->tr_good[0]));
+            for (int k = 0; k < TR_CHAIN_MAX; k++) {
+                int n = p->build_spilled ? p->n_tr_build[k] : 0;
+                g->n_good_trans[k] = n;
+                if (n)
+                    memcpy(g->good_trans[k], p->tr_build[k],
+                           n * sizeof(g->good_trans[k][0]));
+                p->n_tr_good[k] = n;
+                if (n)
+                    memcpy(p->tr_good[k], g->good_trans[k],
+                           n * sizeof(p->tr_good[k][0]));
+            }
         }
     }
     return true;
@@ -5616,6 +6106,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // WP-H6 (item 1): swap in any background pre-grown pools at the frame
     // boundary, before the overlay build touches them.
     pregrow_swap_in(vo);
+#if HAVE_ASS_COMPOSITE_DEFERRED
+    // WP-H10: post-seek transient-demand probe (no-op unless VOCTRL_RESET
+    // armed it) -- runs before the overlay build so a link request overlaps
+    // this frame's work instead of trailing it.
+    tr_reset_probe_run(vo);
+#endif
     // WP-H6 (item 2 side): per-frame base for the staging-ring wrap counter.
     p->stage_frame_base = p->glyph_stage_idx;
     int64_t gdl = 0;
@@ -5804,6 +6300,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "glyphs-uncached",           p->cnt_glyph_uncached,      &p->stat_glyph_uncached);
     emit_counter(vo, "raster-pool-pregrow",       p->cnt_raster_pool_pregrow, &p->stat_raster_pool_pregrow);
     emit_counter(vo, "result-spill",              p->cnt_result_spill,        &p->stat_result_spill);
+    // WP-H10: transient-store chain forensics (info): cumulative link
+    // appends/retires + the current chain length as a gauge.
+    emit_counter(vo, "trans-link-append",         p->cnt_trans_link_append,   &p->stat_trans_link_append);
+    emit_counter(vo, "trans-link-retire",         p->cnt_trans_link_retire,   &p->stat_trans_link_retire);
+    emit_counter(vo, "trans-links",               p->n_trans_chain,           &p->stat_trans_links);
     emit_counter(vo, "blob-hash-hit",             p->cnt_blob_hash_hit,       &p->stat_blob_hash_hit);
     emit_counter(vo, "compose-reuse",             p->cnt_compose_reuse,       &p->stat_compose_reuse);
     emit_counter(vo, "staging-wrap",              p->cnt_staging_wrap,        &p->stat_staging_wrap);
@@ -5895,10 +6396,11 @@ static int query_format(struct vo *vo, int format)
 static void guard_invalidate(struct priv *p)
 {
     p->osd_guard.good = -1;
-    p->osd_guard.good_trans_tex = NULL;
-    p->osd_guard.n_good_trans = 0;
-    p->n_tr_good = 0;
-    p->n_tr_build = 0;
+    for (int k = 0; k < TR_CHAIN_MAX; k++) {
+        p->osd_guard.n_good_trans[k] = 0;
+        p->n_tr_good[k] = 0;
+        p->n_tr_build[k] = 0;
+    }
     for (int s = 0; s < 2; s++) {
         for (int e = 0; e < MAX_OSD_PARTS; e++)
             p->osd_guard.states[s].entries[e].built_valid = false;
@@ -6441,6 +6943,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
         // (frame_priv) need no invalidation: they die with their frames when
         // the queue is reset, and each is only ever served for its own frame.
         guard_invalidate(p);
+        // WP-H10: arm the post-seek transient-demand probe (a few frames of
+        // peeking the ring's pre-warmed seek target; see tr_reset_probe_run).
+        p->tr_reset_probe = 8;
+        p->tr_probe_pts = MP_NOPTS_VALUE;
         return VO_TRUE;
 
     case VOCTRL_PERFORMANCE_DATA: {
@@ -6717,7 +7223,9 @@ static void uninit(struct vo *vo)
     pl_tex_destroy(p->gpu, &p->run_cov_f);
     pl_tex_destroy(p->gpu, &p->run_cov_b);
     pl_tex_destroy(p->gpu, &p->glyph_atlas);
-    pl_tex_destroy(p->gpu, &p->trans_atlas);   // WP-H1d store; was leaked at teardown
+    for (int k = 0; k < TR_CHAIN_MAX; k++)     // WP-H1d/H10 store chain; was
+        pl_tex_destroy(p->gpu, &p->trans_chain[k]);   // leaked at teardown
+    p->n_trans_chain = 0;
     pl_tex_destroy(p->gpu, &p->edge_tex);
     pl_tex_destroy(p->gpu, &p->work_tex);
     for (int i = 0; i < 3; i++)
@@ -6799,6 +7307,9 @@ static int preinit(struct vo *vo)
     p->stat_glyph_uncached = -1;
     p->stat_raster_pool_pregrow = -1;
     p->stat_result_spill = -1;
+    p->stat_trans_link_append = -1;
+    p->stat_trans_link_retire = -1;
+    p->stat_trans_links = -1;
     p->stat_blob_hash_hit = -1;
     p->stat_compose_reuse = -1;
     p->stat_staging_wrap = -1;
