@@ -342,9 +342,33 @@ the WP-H7 defect-1 wall (77 static `\blur8` drawing layers + 2 shadow-text
 layers + a drawing pair that changes EVERY frame; result_tex demand ~34k rows
 at 8K = sustained spill). Gate it at 5328x3000 locally (sustained spill that
 still fits 2 frames of transient-store footprint under lavapipe's 16384 texel
-cap) and at 7680x4320 on the rig. Local 8K is NOT gateable: one frame's spill
-footprint alone exceeds the lavapipe texture bound, content is dropped by
-capacity (gcache-overcommit counts it — gated in acceptance).
+cap) and at 7680x4320 on the rig. (WP-H10 note: the "local 8K is NOT
+gateable" caveat that used to sit here is retired — the transient store is a
+CHAIN now, so single-frame demand past one texture's lavapipe bound grows the
+chain instead of dropping content; `gcache-overcommit` stays gated ==0.)
+
+**Pinned regression scenario — WP-H10 dense-typeset wall (seek-in +
+cold-ramp)**: the round-5 ep09 defect shape (giant uncacheable glyphs +
+sustained result_tex spill, ~3.2-3.5x the warm-up store per frame at true 8K,
+animated every frame so compose reuse never engages). Synthesize with
+`gen_wall.py` (writes `wall_big.ass`/`wall_small.ass`; wall at media
+20.0-26.0s over any lavfi gray source). Gates: a realtime run that seeks
+straight into the wall (accept_run.lua `arun-seek_to=22.5`) must end with
+`gcache-overcommit==0`, `raster-pool-grow==0`, and `trans-link-append >= 1`
+(the chain grew instead of dropping content — links land via the post-seek
+probe/estimators or the bounded mid-pass wait); the temporal gate across the
+seek window must show no VANISH at tol8=3. `big` = 5328x3000 with the auto
+16384 atlas (the max-feasible local geometry; ~15-25 s/frame on lavapipe),
+`small` = 1920x1080 with `--sub-glyph-atlas-size=4096` (fast: the x3 /
+sanitizer workhorse; also exercises tail retire with ~85 s of light content
+after the wall).
+
+New INFO counters (WP-H10, not gated): `trans-link-append` /
+`trans-link-retire` (cumulative chain growth/shrink) and `trans-links` (the
+current chain length, a gauge). On any `gcache-overcommit` firing, check
+these first: append==0 means the demand estimators/waits never got their
+links (mechanism bug); trans-links==4 (TR_CHAIN_MAX) with overcommit means
+single-frame demand beyond the VRAM cap (content bug or cap too small).
 
 Rig runs pop a real mpv window on the Windows desktop; keep them batched.
 

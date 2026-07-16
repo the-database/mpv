@@ -167,6 +167,14 @@ INFO_COUNTERS = [
     "guard-first-late",
     "staging-wrap",
     "glyphs-uncached",
+    # WP-H10 transient-store chain forensics: links appended/retired
+    # (cumulative) and the current chain length (gauge, last sample). On any
+    # gcache-overcommit firing read these first: append==0 means the chain
+    # never grew (estimator/wait mechanism bug); trans-links at its cap (4)
+    # with overcommit means single-frame demand beyond the chain VRAM cap.
+    "trans-link-append",
+    "trans-link-retire",
+    "trans-links",
 ]
 
 # The mis-linked-build tell: stock (non-fork) libass makes mpv warn-and-ignore
