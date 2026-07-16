@@ -599,9 +599,11 @@ struct priv {
     int64_t stat_raster_pool_grow;
     // WP-E: epoch-eviction + warm-up counters. gcache-epoch-advance = segment
     // recycles (bounded, replaces the flush); gcache-evict-n = entries evicted
-    // (cumulative); gcache-overcommit = glyphs skipped because a single item's
-    // working set exceeded the whole atlas (never a stall); shader-warmups =
-    // compute variants dispatched once at config time (no playback-time compile).
+    // (cumulative); gcache-overcommit = FAILED gc_trans_place placements --
+    // glyphs/region-layers dropped invisible, i.e. content loss, gated ==0
+    // (WP-H7 re-gate; WP-H10 removed the lossless atlas-refusal pre-count
+    // that also bumped it); shader-warmups = compute variants dispatched
+    // once at config time (no playback-time compile).
     int64_t cnt_gcache_epoch_advance, cnt_gcache_evict_n, cnt_gcache_overcommit;
     int64_t cnt_shader_warmups;
     int64_t stat_gcache_epoch_advance, stat_gcache_evict_n, stat_gcache_overcommit;
@@ -1968,16 +1970,15 @@ static bool gc_ensure_pool(struct priv *p, pl_tex *t, pl_fmt fmt, int w, int h,
 // size): *upload stays false. Miss: a ring slot is allocated + the id inserted,
 // *upload set true (the caller uploads/rasterizes the pixels). Returns false
 // only when no slot could be claimed this pass (bigger than the atlas, or
-// overcommit -- the current item's working set exceeded the whole atlas);
-// WP-H1d: the caller then falls back to the per-item transient store
-// (gc_trans_place) so the glyph is still drawn -- NEVER skipped (the old skip
-// was silent content loss). The overcommit counter thus now means "took the
-// lossless per-frame transient path for a big/overflow glyph" (proven pixel-
-// identical to CPU under atlas pressure), NOT content loss. Post-H1d it is an
-// ungated tuning signal in acceptance (INFO, not gated ==0): dense 8K signs
-// legitimately trip it; its only cost is per-frame re-raster, already gated by
-// the video-draw budget. Nonzero => raise --sub-glyph-atlas-size if any frames
-// are over budget.
+// the current item's working set exceeded the whole atlas); WP-H1d: the
+// caller then falls back to the per-item transient store (gc_trans_place) so
+// the glyph is still drawn -- NEVER skipped (the old skip was silent content
+// loss). WP-H10: an atlas refusal is NOT counted as gcache-overcommit
+// anymore -- that counter is gated ==0 in acceptance with the documented
+// WP-H7 meaning "a gc_trans_place FAILURE = content dropped invisible", and
+// the refusal path loses nothing (the successful transient fallback counts
+// as glyphs-uncached, the pressure signal: nonzero => consider raising
+// --sub-glyph-atlas-size if frames are over budget).
 //
 // One open-addressed probe locates the key (if present) and the first
 // reusable (empty or stale) slot. Stale slots act as reusable tombstones that
@@ -2045,7 +2046,11 @@ static int gcache_place_new(struct priv *p, uint64_t id, int ktype, int w, int h
             p->gc_refused = true;
             return -1;
         }
-        p->cnt_gcache_overcommit++;  // bigger than atlas, or table genuinely full
+        // WP-H10: NOT counted as gcache-overcommit -- the caller falls back
+        // to the transient store, which draws the glyph losslessly; only a
+        // FAILED gc_trans_place is content loss (the H7 re-gate semantics
+        // the ==0 acceptance gate documents). This pre-count made a heavy
+        // atlas-ring pass fail the gate with zero pixels lost.
         return -1;
     }
     int gx, gy, seg;
@@ -2054,7 +2059,9 @@ static int gcache_place_new(struct priv *p, uint64_t id, int ktype, int w, int h
             p->gc_refused = true;
             return -1;
         }
-        p->cnt_gcache_overcommit++;  // ring exhausted this pass: skip (never stall)
+        // WP-H10: ring exhausted this pass -- same as above: the transient
+        // fallback keeps the glyph visible, so this is pressure (counted as
+        // glyphs-uncached at the successful fallback), never content loss.
         return -1;
     }
     p->gcache[reuse] = (struct gcache_slot){ id, gx, gy, w, h,
@@ -3578,8 +3585,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // WP-E: resolve each glyph via the epoch-evicting cache (gc_place). A miss
     // recycles at most one ring segment (bounded); nothing full-flushes.
     // WP-H1d: a glyph the cache does not admit (above the size cap) or cannot
-    // place (this item overcommitting the whole atlas; counted in
-    // gcache_reserve) goes to the per-item transient store and is re-
+    // place (this item overcommitting the whole atlas) goes to the per-item
+    // transient store (counted glyphs-uncached on success) and is re-
     // rasterized/uploaded THIS frame -- never dropped. The old skip left
     // cpos at {0,0}, so affected runs composed whatever lived at the atlas
     // origin: wrong-glyph garbage or missing text, varying with eviction
@@ -3615,9 +3622,12 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                 p->cnt_gcache_overcommit++;
                 continue;
             }
-            if (!gc_cacheable(p, b->w, b->h))
-                p->cnt_glyph_uncached++;  // policy (giant glyph); allocator
-                                          // overflow was counted as overcommit
+            // WP-H10: every successful transient placement counts here --
+            // the policy-uncacheable giants AND the cacheable glyphs the
+            // atlas ring could not admit this pass (both drawn losslessly,
+            // both pure pressure signals). gcache-overcommit is reserved
+            // for FAILED placements = content loss (the gated meaning).
+            p->cnt_glyph_uncached++;
             up = true;                    // transient content is per-item
         }
 #if HAVE_ASS_OUTLINE_DEFERRED
