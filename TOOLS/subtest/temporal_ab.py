@@ -224,7 +224,8 @@ def run_one(mpv: str, media: str, cfg_flags: list[str], run_dir: str,
         ("--script-opts=" +
          f"tstep-start={args.start},tstep-frames={args.frames}," +
          f"tstep-out={out_arg},tstep-settle={args.settle}," +
-         f"tstep-settle0={args.settle0},tstep-warmup={args.warmup}"),
+         f"tstep-settle0={args.settle0},tstep-warmup={args.warmup}," +
+         f"tstep-step_timeout={args.step_timeout}"),
         f"--dump-stats={stats_arg}",
         f"--log-file={log_arg}",
         "-v",
@@ -402,6 +403,11 @@ def main(argv=None) -> int:
                          "reference run (state-dependent defects)")
     ap.add_argument("--settle", type=float, default=0.25)
     ap.add_argument("--settle0", type=float, default=3.0)
+    ap.add_argument("--step-timeout", type=float, default=30.0,
+                    help="temporal_step watchdog: seconds before an unlanded "
+                         "frame-step ends the capture (raise for lavapipe "
+                         "frames that legitimately exceed 30s, e.g. the "
+                         "WP-H10 max-geometry dense wall)")
     ap.add_argument("--warmup", type=float, default=0.0,
                     help="play this many seconds past --start once (unpaused) "
                          "before re-seeking and stepping: warms the monotonic "
