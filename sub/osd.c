@@ -634,6 +634,17 @@ bool osd_query_and_reset_want_redraw(struct osd_state *osd)
     return r;
 }
 
+// WP-H12: whether any subtitle track is currently attached (either sub
+// object). VOs use it to gate worst-case resource preallocation policies
+// (no track => no subtitle rendering => don't budget the VRAM).
+bool osd_has_attached_sub(struct osd_state *osd)
+{
+    mp_mutex_lock(&osd->lock);
+    bool r = osd->objs[OSDTYPE_SUB]->sub || osd->objs[OSDTYPE_SUB2]->sub;
+    mp_mutex_unlock(&osd->lock);
+    return r;
+}
+
 struct mp_osd_res osd_get_vo_res(struct osd_state *osd)
 {
     mp_mutex_lock(&osd->lock);
