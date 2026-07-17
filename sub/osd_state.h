@@ -163,6 +163,13 @@ struct sub_bitmaps *osd_object_render_async(struct osd_state *osd,
                                             struct osd_object *obj,
                                             struct mp_osd_res res,
                                             int format);
+// WP-H14b (item b): issue an OSDTYPE_OSD content-change render request to the
+// async worker from the CONTENT-ORIGIN thread (osd_set_text/osd_set_progbar/
+// osd_changed), so the worker kick is no longer done per-change on the VO serve
+// path -- osd_object_render_async then does the SAME work on changed and
+// unchanged frames (serve the last completed snapshot). Mirrors osd_set_external
+// for OSDTYPE_EXTERNAL. Called under osd->lock; obj must be the OSDTYPE_OSD object.
+void osd_object_request_render(struct osd_state *osd, struct osd_object *obj);
 void osd_destroy_backend(struct osd_state *osd);
 
 #endif
