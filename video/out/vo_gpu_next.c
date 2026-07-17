@@ -3271,6 +3271,18 @@ static void gc_prealloc_pools(struct priv *p)
                   false, true, false, false, true);
         gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, MPMAX(eh, 1),
                   false, true, false, false, true);
+        // WP-H14 (item c1): floor the edge/work-list upload staging buffers to
+        // the pool byte size so the wall-entry `.ptr` upload finds a buffer
+        // ready instead of allocating a driver slab (the :3232 staging class).
+        // Monotonic (only grows); re-floored on every reconfig like the pools.
+        size_t esz = (size_t) EDGE_TEX_W * p->edge_tex->params.h * 4 * sizeof(float);
+        size_t wsz = (size_t) WORK_TEX_W * p->work_tex->params.h * 4 * sizeof(float);
+        if (!p->edge_stage || p->edge_stage->params.size < esz)
+            pl_buf_recreate(gpu, &p->edge_stage,
+                            pl_buf_params(.size = esz, .host_writable = true));
+        if (!p->work_stage || p->work_stage->params.size < wsz)
+            pl_buf_recreate(gpu, &p->work_stage,
+                            pl_buf_params(.size = wsz, .host_writable = true));
     }
 #endif
 }
@@ -3567,6 +3579,38 @@ static int gc_work_cap_tiles(struct priv *p)
                        : 0;
 }
 
+// WP-H14 (item c1): upload `row_pitch * y1` bytes from `src` into `tex` via a
+// PERSISTENT staging buffer instead of a bare `.ptr` transfer. A `.ptr` upload
+// makes libplacebo allocate a fresh driver slab per call ("allocating slab
+// (slow!)") -- round-7 measured two such slabs (~110 MB edge + ~33 MB work-
+// list) INSIDE the ep09 wall-entry builds, the vo_gpu_next.c:3232 staging class
+// the WP-H12 prealloc policy did not cover (9-10 drops at the linear entry).
+// The staging buffer is preallocated to the pool's worst-frame byte size at
+// warm-up (gc_prealloc_pools) and reused; a real over-floor frame still grows
+// it once (counted as staging-grow), never a per-call slab.
+static bool gc_staged_tex_upload(struct priv *p, pl_buf *stage, pl_tex tex,
+                                 int x1, int y1, size_t row_pitch,
+                                 const void *src)
+{
+    size_t bytes = row_pitch * (size_t) y1;
+    struct pl_tex_transfer_params tp = {
+        .tex = tex, .rc = { .x1 = x1, .y1 = y1 }, .row_pitch = row_pitch,
+    };
+    if (!(*stage) || (*stage)->params.size < bytes) {
+        size_t want = (bytes + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
+        if (pl_buf_recreate(p->gpu, stage,
+                            pl_buf_params(.size = want, .host_writable = true)))
+            vo_alloc_bump(p, &p->cnt_staging_grow);
+    }
+    if (*stage && (*stage)->params.size >= bytes) {
+        pl_buf_write(p->gpu, *stage, 0, src, bytes);
+        tp.buf = *stage;
+    } else {
+        tp.ptr = (void *) src;              // fallback: buffer alloc failed
+    }
+    return pl_tex_upload(p->gpu, &tp);
+}
+
 // Upload segments [seg0, seg1) of the shared CPU segment pool (p->ebuf,
 // filled by the resolve loops) to edge_tex starting at texel 0. seg0 == 0
 // with seg1 == ne is the whole-frame fast path (one upload shared by both
@@ -3587,10 +3631,9 @@ static bool gc_flush_edges_range(struct priv *p, int seg0, int seg1)
     if (!ef || !gc_ensure_pool(p, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true,
                                false, false, true, "edge_tex"))
         return false;
-    pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->edge_tex,
-        .rc = { .x1 = EDGE_TEX_W, .y1 = eh },
-        .row_pitch = (size_t) EDGE_TEX_W * 4 * sizeof(float),
-        .ptr = p->ebuf + (size_t) seg0 * SEG_EXPORT_W));
+    gc_staged_tex_upload(p, &p->edge_stage, p->edge_tex, EDGE_TEX_W, eh,
+                         (size_t) EDGE_TEX_W * 4 * sizeof(float),
+                         p->ebuf + (size_t) seg0 * SEG_EXPORT_W);
     return true;
 }
 
@@ -3676,9 +3719,8 @@ static void gc_flush_raster(struct priv *p, struct rjob *rjobs, int nrjobs,
         if (gc_ensure_pool(p, &p->work_tex, pl_find_named_fmt(gpu, "rgba32f"),
                            WORK_TEX_W, wh, false, true, false, false, true,
                            "work_tex")) {
-            pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->work_tex,
-                .rc = { .x1 = WORK_TEX_W, .y1 = wh },
-                .row_pitch = (size_t) WORK_TEX_W * 4 * sizeof(float), .ptr = p->wbuf));
+            gc_staged_tex_upload(p, &p->work_stage, p->work_tex, WORK_TEX_W, wh,
+                                 (size_t) WORK_TEX_W * 4 * sizeof(float), p->wbuf);
             gc_raster_batch(p, ntiles, dst);
             p->cnt_raster_dispatches++;
             p->cnt_raster_tiles += ntiles;
@@ -7635,6 +7677,8 @@ static void uninit(struct vo *vo)
     p->n_trans_chain = 0;
     pl_tex_destroy(p->gpu, &p->edge_tex);
     pl_tex_destroy(p->gpu, &p->work_tex);
+    pl_buf_destroy(p->gpu, &p->edge_stage);   // WP-H14 (c1)
+    pl_buf_destroy(p->gpu, &p->work_stage);   // WP-H14 (c1)
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
