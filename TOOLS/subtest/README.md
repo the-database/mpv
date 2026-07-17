@@ -349,26 +349,41 @@ chain instead of dropping content; `gcache-overcommit` stays gated ==0.)
 
 **Pinned regression scenario — WP-H10 dense-typeset wall (seek-in +
 cold-ramp)**: the round-5 ep09 defect shape (giant uncacheable glyphs +
-sustained result_tex spill, ~3.2-3.5x the warm-up store per frame at true 8K,
-animated every frame so compose reuse never engages). Synthesize with
-`gen_wall.py` (writes `wall_big.ass`/`wall_small.ass`; wall at media
-20.0-26.0s over any lavfi gray source). Gates: a realtime run that seeks
-straight into the wall (accept_run.lua `arun-seek_to=22.5`) must end with
-`gcache-overcommit==0`, `raster-pool-grow==0`, and `trans-link-append >= 1`
-(the chain grew instead of dropping content — links land via the post-seek
-probe/estimators or the bounded mid-pass wait); the temporal gate across the
-seek window must show no VANISH at tol8=3. `big` = 5328x3000 with the auto
-16384 atlas (the max-feasible local geometry; ~15-25 s/frame on lavapipe),
-`small` = 1920x1080 with `--sub-glyph-atlas-size=4096` (fast: the x3 /
-sanitizer workhorse; also exercises tail retire with ~85 s of light content
-after the wall).
+sustained result_tex spill, ~3.2-3.5x the warm-up store per frame at true
+8K). Synthesize with `gen_wall.py` (writes `wall_big.ass`/`wall_small.ass`;
+wall at media 20.0-26.0s over any lavfi gray source). WP-H12: the REAL ep09
+wall is STATIC typesetting (byte-identical `\pos` events for its whole
+~3.5 s), so `gen_wall.py --static` emits that shape; the default (moving)
+wall stays as the change_id-churn stress that forces a full recompose every
+frame. Gates: a realtime run that seeks straight into the wall
+(accept_run.lua `arun-seek_to=22.5`) must end with `gcache-overcommit==0`
+and `raster-pool-grow==0`; below the WP-H12 prealloc-policy geometry (<4K)
+also `trans-link-append >= 1` (the chain grew instead of dropping content),
+at >=4K instead `trans-prealloc-links==8` with `trans-link-append==0` (the
+full chain pre-exists; nothing left to append). A STATIC wall run must
+additionally end with `result-spill` at ~1-2 and `compose-reuse-spill`
+~1/frame in-wall (the shared reuse slot serving every frame after the entry
+compose; a climbing result-spill on static content means the slot broke).
+The temporal gate across the seek window must show no VANISH at tol8=3.
+`big` = 5328x3000 with the auto 16384 atlas (the max-feasible local
+geometry; ~15-25 s/frame on lavapipe), `small` = 1920x1080 with
+`--sub-glyph-atlas-size=4096` (fast: the x3 / sanitizer workhorse; also
+exercises tail retire with ~85 s of light content after the wall).
 
 New INFO counters (WP-H10, not gated): `trans-link-append` /
 `trans-link-retire` (cumulative chain growth/shrink) and `trans-links` (the
 current chain length, a gauge). On any `gcache-overcommit` firing, check
 these first: append==0 means the demand estimators/waits never got their
-links (mechanism bug); trans-links==4 (TR_CHAIN_MAX) with overcommit means
+links (mechanism bug); trans-links at TR_CHAIN_MAX with overcommit means
 single-frame demand beyond the VRAM cap (content bug or cap too small).
+WP-H12 additions: `trans-prealloc-links` (gauge; links created by the >=4K
+reconfig prealloc — expect 8 on the 8K rig with GPU subs + a sub track),
+`trans-want-uncapped` (gauge; the honest unclamped demand estimate — a value
+above TR_CHAIN_MAX=8 means the cap itself is undersized) and
+`compose-reuse-spill` (spilled composes served from the WP-H12 shared reuse
+slot; a subset of compose-reuse). check_acceptance.py additionally FAILS a
+run where trans-prealloc-links==8 and trans-link-append>0 (an append after
+full prealloc is a mechanism failure).
 
 Rig runs pop a real mpv window on the Windows desktop; keep them batched.
 
