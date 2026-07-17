@@ -173,12 +173,30 @@ INFO_COUNTERS = [
     # WP-H10 transient-store chain forensics: links appended/retired
     # (cumulative) and the current chain length (gauge, last sample). On any
     # gcache-overcommit firing read these first: append==0 means the chain
-    # never grew (estimator/wait mechanism bug); trans-links at its cap (4)
+    # never grew (estimator/wait mechanism bug); trans-links at its cap
     # with overcommit means single-frame demand beyond the chain VRAM cap.
+    # WP-H12: under the >=4K prealloc policy the FULL chain (TR_CHAIN_MAX=8)
+    # exists before playback -- trans-prealloc-links gauges it (expect 8 on
+    # the 8K rig with GPU subs + a sub track) and trans-link-append becomes
+    # "append DURING playback", expected 0 there (see the conditional
+    # integrity check in evaluate()). trans-want-uncapped gauges the honest
+    # unclamped demand estimate (round-6 had to back-compute it);
+    # compose-reuse-spill counts spilled composes served from the WP-H12
+    # shared reuse slot (the ep09-wall steady state: ~1/frame in-wall).
     "trans-link-append",
     "trans-link-retire",
     "trans-links",
+    "trans-prealloc-links",
+    "trans-want-uncapped",
+    "compose-reuse-spill",
 ]
+
+# WP-H12: TR_CHAIN_MAX in vo_gpu_next.c -- the full-prealloc chain length.
+# When trans-prealloc-links reports this value the policy engaged fully, and
+# ANY trans-link-append afterwards is a mechanism failure (the chain can not
+# want more than the cap, so an append can only mean the policy did not
+# actually pin want / retire regressed below the floor).
+TR_CHAIN_MAX = 8
 
 # The mis-linked-build tell: stock (non-fork) libass makes mpv warn-and-ignore
 # the GPU sub options. If this shows up in a scene log the capture is invalid.
@@ -268,6 +286,20 @@ def adjudicate(stats_path: str, default_budget: float,
     if fired:
         detail = ", ".join(f"{k}={int(round(v))}" for k, v in sorted(fired.items()))
         reasons.append(f"integrity counters fired: {detail}")
+
+    # WP-H12 conditional integrity check: with the chain FULLY preallocated
+    # (>=4K policy engaged, all TR_CHAIN_MAX links from before playback), any
+    # mid-playback append is a mechanism failure -- there is nothing left to
+    # append toward. A PARTIAL prealloc (alloc failure fallback, gauge <
+    # TR_CHAIN_MAX) may legitimately be followed by estimator appends and is
+    # only reported, not failed.
+    prealloc = int(round(counters.get("trans-prealloc-links", 0.0)))
+    appends = int(round(counters.get("trans-link-append", 0.0)))
+    if prealloc >= TR_CHAIN_MAX and appends > 0:
+        reasons.append(
+            f"trans-link-append={appends} despite full chain prealloc "
+            f"({prealloc}/{TR_CHAIN_MAX}) -- append-during-playback must be 0 "
+            f"under the WP-H12 policy")
 
     # log cross-check (optional)
     log_info = None
