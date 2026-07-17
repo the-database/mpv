@@ -436,6 +436,14 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
         // by the async worker; serve its last completed snapshot without
         // ever putting libass work on this (usually the VO) thread.
         res = osd_external_render_async(osd, obj, render_res, format);
+    } else if (obj->type == OSDTYPE_OSD) {
+        // WP-H12 (sub-C): osd_message + progress bar render on the same
+        // worker. The DEFAULT stats page is one mp.osd_message event
+        // re-shaped at 1 Hz -- synchronously that was a ~42 ms layout per
+        // refresh at 8K (the 1-drop-per-second signature), fixed before only
+        // by the stats-persistent_overlay opt-in. Now both stats-page paths
+        // are worker-rendered.
+        res = osd_object_render_async(osd, obj, render_res, format);
     } else {
         res = osd_object_get_bitmaps(osd, obj, render_res, format);
     }
