@@ -327,6 +327,9 @@ void osd_set_external_remove_owner(struct osd_state *osd, void *owner);
 // presented promptly while paused.
 void osd_set_ext_wakeup_cb(struct osd_state *osd, void (*cb)(void *ctx),
                            void *ctx);
+// WP-H12: true when a subtitle track is attached to either sub object (VO
+// resource-prealloc policy input).
+bool osd_has_attached_sub(struct osd_state *osd);
 void osd_get_text_size(struct osd_state *osd, int *out_screen_h, int *out_font_h);
 void osd_get_function_sym(char *buffer, size_t buffer_size, int osd_function);
 void osd_mangle_ass(bstr *dst, const char *in, bool replace_newlines);
