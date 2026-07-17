@@ -742,6 +742,12 @@ struct priv {
     int64_t cnt_trans_link_append, stat_trans_link_append;
     int64_t cnt_trans_link_retire, stat_trans_link_retire;
     int64_t cnt_chain_rebuild, stat_chain_rebuild;  // WP-H14 (a): off-thread rebuilds
+    // WP-H14b (item c2): a store-eligible all-spill compose that was let run to
+    // completion (guard disabled mid-compose) so it STORES the reuse slot on the
+    // wall-entry frame -- collapsing the documented two-build entry into one.
+    // Fires exactly once per wall entry (the compose only runs when reuse missed).
+    // Info.
+    int64_t cnt_entry_mustcomplete, stat_entry_mustcomplete;
     int64_t stat_trans_links;
     int64_t stat_trans_prealloc_links;
     int64_t stat_trans_want_uncapped;
@@ -4089,7 +4095,17 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // WP-E3 checkpoint: the miss flush is recorded (every claimed atlas slot
     // has its raster/upload in flight), so the glyph cache is consistent again
     // and bailing is safe from here on.
-    if (sub_guard_expired(p)) {
+    // WP-H14b (item c2): but a store-eligible sub item may be about to spill
+    // EVERYTHING into the state-independent transient chain -- which is learned
+    // only in the allocation loop just below, and which makes finishing the
+    // compose presentation-safe and lets it store the reuse slot (collapsing the
+    // wall-entry double build). Defer this raster-deadline bail for such items:
+    // proceed to the alloc loop, where a spill disables the guard and runs to
+    // completion, and a non-spilling item still bails at the per-region
+    // checkpoint below. The alloc loop is pure CPU bookkeeping, so the deferral
+    // costs nothing when the item turns out not to spill.
+    if (sub_guard_expired(p) &&
+        !(p->trs_store_ok && item->render_index <= 1)) {
         talloc_free(tmp);
         return false;
     }
@@ -4312,6 +4328,31 @@ restart_alloc:
                    "%d/%d region-layers composed via the transient store "
                    "this frame\n", MPMAX(dm_max_w, 1), dm_y + dm_h,
                    cap_w, cap_h, nems - spill_from, nems);
+    }
+    // WP-H14b (item c2): the wall-entry double build. A store-eligible all-spill
+    // compose is STATE-INDEPENDENT -- every region-layer lives in the shared
+    // transient chain, none in this state's ping-pong result_tex -- so finishing
+    // it can never corrupt the presentable snapshot the guard protects. Bailing
+    // at the per-region checkpoints below, however, abandons the compose BEFORE
+    // the reuse-slot store at the end of this function, so the entry pays TWO
+    // full composes: build #1 bails mid-compose, build #2 (must_complete after
+    // the bail) recomposes from scratch and stores. Rig (round-7): 146.9+277.1 ms
+    // (seek) / 189.8+336.5 ms (linear) at the ep09 8K wall entry. Let this one
+    // compose run to completion instead: it stores the slot on frame 1, so every
+    // following wall frame reuses it -- two builds collapse to one longer frame
+    // (fewer total drops; content never lost -- the flagged safer-but-slower
+    // tradeoff). Gated to the store-eligible spill ONLY (same predicate as the
+    // slot store below: main-guard present build, render_index<=1, can_spill), so
+    // it can never force an arbitrary sub frame to must_complete; and only when a
+    // guard was actually armed (guard_abs != 0), so build #2 does not re-count.
+    // A static wall reuses the slot on every later frame, so the compose (and
+    // this branch) runs once per entry -> entry-mustcomplete == 1/entry.
+    if (spilled && can_spill && p->trs_store_ok && item->render_index <= 1 &&
+        p->guard_abs) {
+        p->guard_abs = 0;
+        p->cnt_entry_mustcomplete++;
+        MP_VERBOSE(p, "[present-guard] wall-entry all-spill compose runs to "
+                   "completion (stores the reuse slot; entry-mustcomplete)\n");
     }
     // WP-H6 (item 1): pre-grow watermarks on this frame's true demand. The
     // result atlases of BOTH ping-pong states are kept in step (the sibling
@@ -6723,6 +6764,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "trans-link-append",         p->cnt_trans_link_append,   &p->stat_trans_link_append);
     emit_counter(vo, "trans-link-retire",         p->cnt_trans_link_retire,   &p->stat_trans_link_retire);
     emit_counter(vo, "chain-rebuild",             p->cnt_chain_rebuild,       &p->stat_chain_rebuild);
+    emit_counter(vo, "entry-mustcomplete",        p->cnt_entry_mustcomplete,  &p->stat_entry_mustcomplete);
     emit_counter(vo, "trans-links",               p->n_trans_chain,           &p->stat_trans_links);
     emit_counter(vo, "trans-prealloc-links",      p->tr_prealloc_links,       &p->stat_trans_prealloc_links);
     emit_counter(vo, "trans-want-uncapped",       p->tr_want_uncapped,        &p->stat_trans_want_uncapped);
@@ -7759,6 +7801,7 @@ static int preinit(struct vo *vo)
     p->stat_trans_link_append = -1;
     p->stat_trans_link_retire = -1;
     p->stat_chain_rebuild = -1;
+    p->stat_entry_mustcomplete = -1;
     p->stat_trans_links = -1;
     p->stat_trans_prealloc_links = -1;
     p->stat_trans_want_uncapped = -1;
