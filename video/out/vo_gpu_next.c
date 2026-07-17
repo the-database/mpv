@@ -164,10 +164,22 @@ struct osd_entry {
 // NEXT link (background-allocated) activates; nothing ever swaps, so pinned
 // rows never block growth, and total capacity scales past the single-texture
 // dimension limit. VRAM is bounded: each link is at most the warm-up link's
-// size, so the chain caps at TR_CHAIN_MAX x that (2 GiB at the 8K worst case,
-// only ever reached by content that actually demands it; idle tail links
-// retire after TR_LINK_RETIRE_FRAMES unused frames).
-#define TR_CHAIN_MAX 4
+// size, so the chain caps at TR_CHAIN_MAX x that.
+//
+// WP-H12 sizing (round-6 rig, ep09 wall at true 8K, 16384x32768 links =
+// 512 MiB r8 each): one full wall compose demands ~433 Mpx of uncacheable
+// glyph coverage + ~1.74 Gpx of region-layers (result_tex demand
+// 5599x310348) -- with the measured ~1.5x shelf waste and the WP-H12
+// all-spill rule (a spilling item composes ALL its layers into the chain,
+// +~0.13 Gpx) that is ~3.45 Gpx =~ 6.5 links. The round-6 estimator
+// back-computed "uncapped want =~ 6" from the pre-H12 demand; 8 covers the
+// measured worst case plus waste-factor variance and a second spilling sub
+// entry. 8 x 512 MiB = 4 GiB at the 8K worst case -- a deliberate budget
+// (the target card has 32 GiB); it is only ever fully resident under the
+// >=4K prealloc policy (tr_prealloc_chain) or when content actually demands
+// it, and idle tail links retire after TR_LINK_RETIRE_FRAMES unused frames
+// (never below the prealloc floor).
+#define TR_CHAIN_MAX 8
 // Frames a tail link must sit unused (and unpinned) before it is destroyed.
 // ~75 s at 24 fps: longer than any scene gap inside one dense sequence, so a
 // wall that comes back does not churn allocations.
@@ -444,6 +456,18 @@ struct priv {
     int tr_link;                             // link the shelf cursor is on
     int tr_x, tr_y, tr_rowh;                 // per-item shelf cursor
     int tr_want_links;                       // demand-estimated chain size
+    // WP-H12: UNCAPPED demand estimate (gauge). tr_note_demand clamps the
+    // request at TR_CHAIN_MAX, which round-6 rig forensics had to back-compute
+    // around ("want 4" logged while true demand was ~6 links); this keeps the
+    // honest number for logs/stats so undersizing is one look, not archaeology.
+    int tr_want_uncapped;
+    // WP-H12 prealloc policy: the FULL chain was created at reconfig (>=4K
+    // display + an attached sub track). Links below this floor never retire
+    // (destroying a 512 MiB slab risks the same driver-level VO contention as
+    // allocating one -- round-6: 160-330 ms vkAllocateMemory on the helper
+    // thread stalled a concurrent video-draw), and mid-playback appends are
+    // not expected at all (trans-link-append == 0 is the acceptance signal).
+    int tr_prealloc_links;
     uint64_t tr_link_used_frame[TR_CHAIN_MAX]; // draw_frame count of last
                                              // placement into each link (tail
                                              // retire; see pregrow_swap_in)
@@ -475,6 +499,47 @@ struct priv {
     struct tr_band tr_good[TR_CHAIN_MAX][TR_BANDS_MAX];
     struct tr_band tr_build[TR_CHAIN_MAX][TR_BANDS_MAX];
     int n_tr_good[TR_CHAIN_MAX], n_tr_build[TR_CHAIN_MAX];
+    // WP-H12: shared reuse slot for SPILLED composes, one per subtitle entry
+    // (render_index OSDTYPE_SUB==0 / OSDTYPE_SUB2==1). Round-6 called the
+    // ep09 wall "animated" from compose-reuse staying flat in-storm, but the
+    // wall's ASS text is byte-identical for its whole ~3.5 s (static \pos
+    // typesetting, zero \move/\t; change_id is stable through the RA path) --
+    // reuse never fired because a spilled build was declared unreusable
+    // (built_valid = !spilled), so the whole resolve+raster+upload+compose
+    // pipeline re-ran EVERY frame: the 55-140 ms/frame VO-thread storm.
+    // With the WP-H12 all-spill rule a spilling item composes ALL its region
+    // layers into the transient CHAIN (never entry->result_tex), so the
+    // composed content lives only in state-independent storage and one slot
+    // can serve both ping-pong states: a later build with the same change_id/
+    // geometry re-emits the recorded parts and re-protects the recorded row
+    // bands (merged into tr_build -> committed into tr_good), keeping the
+    // rows pinned CONTINUOUSLY while the content is being served. The slot
+    // dies the first build that does not use it (bands would leave tr_good =
+    // rows reclaimable), on any guard invalidation, and on recompose.
+    // Per-frame wall cost collapses to an emit-only path -- no libass, no
+    // resolve, no raster, no upload, no GPU submission (what the TensorRT-
+    // contention envelope needs: the GPU is busy with inference).
+    struct trs_slot {
+        bool valid;
+        bool used;                   // referenced by the current/last build
+        int64_t change_id;
+        int format;
+        double gs;
+        struct mp_osd_res res;
+        struct pl_overlay_part *parts;   // talloc'd on p, grown monotonically
+        uint8_t *links;                  // chain link of each part
+        int num_parts;
+        struct tr_band bands[TR_CHAIN_MAX][TR_BANDS_MAX];
+        int nbands[TR_CHAIN_MAX];
+    } trs[2];
+    // WP-H12: the current update_overlays build may read AND write the slots
+    // (present main-guard builds only). Screenshot builds share the guard
+    // STATES (video_screenshot passes &osd_guard with present=false) but
+    // never commit, so letting one store a slot would record row bands whose
+    // tr_build protection is discarded with the uncommitted build -- the next
+    // present build would then serve unprotected rows. They recompose fully
+    // instead (their spill rows are consumed within the same render call).
+    bool trs_store_ok;
     bool build_spilled;                      // any spill in the current build
     bool tr_pass_used;                       // WP-H7: anything placed in the
                                              // store this pass (its rastered
@@ -642,9 +707,21 @@ struct priv {
     // WP-H10: transient-store chain links appended (background alloc landed)
     // and retired (tail idle+unpinned). trans-links additionally samples the
     // CURRENT chain length as a gauge. All info, for rig forensics.
+    // WP-H12: under the prealloc policy every link exists before playback, so
+    // trans-link-append is now "append DURING playback" -- the acceptance
+    // expectation at >=4K is 0 (an append means the policy under-provisioned
+    // or did not engage). trans-prealloc-links gauges the policy itself
+    // (rig expectation: TR_CHAIN_MAX). trans-want-uncapped gauges the honest
+    // uncapped demand estimate (see tr_want_uncapped).
     int64_t cnt_trans_link_append, stat_trans_link_append;
     int64_t cnt_trans_link_retire, stat_trans_link_retire;
     int64_t stat_trans_links;
+    int64_t stat_trans_prealloc_links;
+    int64_t stat_trans_want_uncapped;
+    // WP-H12: spilled composes served from the shared reuse slot (also counted
+    // in compose-reuse). The ep09-wall steady-state signal: expect ~1/frame
+    // in-wall once the entry frame composed. Info.
+    int64_t cnt_spill_reuse, stat_spill_reuse;
     // WP-H6 (item 3): outline cache hits keyed by blob CONTENT hash after the
     // glyph_id key missed (animated text with fresh ids but unchanged
     // outlines skips re-raster/re-upload). Info.
@@ -1748,6 +1825,18 @@ static void tr_note_demand(struct priv *p, int64_t px)
     pl_tex l0 = p->trans_chain[0];
     int64_t rows = px * 3 / 2 / MPMAX(l0->params.w, 1);
     int links = (int)(1 + (rows - 1) / MPMAX(l0->params.h, 1));
+    // WP-H12: keep (and log) the UNCAPPED estimate -- round-6 clamped it
+    // before logging, so "want 4" hid a true demand of ~6 links and the
+    // undersizing had to be back-computed from raw pixel demand.
+    if (links > p->tr_want_uncapped) {
+        p->tr_want_uncapped = links;
+        if (links > TR_CHAIN_MAX) {
+            MP_VERBOSE(p, "[pool-spill] transient demand estimate %d links "
+                       "exceeds TR_CHAIN_MAX %d (%.2f Gpx incl. shelf waste); "
+                       "capacity will clamp\n", links, (int) TR_CHAIN_MAX,
+                       px * 1.5 / 1e9);
+        }
+    }
     links = MPCLAMP(links, 1, TR_CHAIN_MAX);
     if (links > p->tr_want_links)
         p->tr_want_links = links;
@@ -1919,9 +2008,13 @@ static void pregrow_swap_in(struct vo *vo)
     // WP-H10: tail retire -- give a link back once its pinned rows died
     // naturally (no committed/build spill bands) and it sat unused for
     // TR_LINK_RETIRE_FRAMES. Only the tail retires (indices stay stable for
-    // every t/band reference) and only one per frame.
+    // every t/band reference) and only one per frame. WP-H12: never below
+    // the prealloc floor -- the policy budgeted that VRAM deliberately, and
+    // a destroy/realloc cycle risks the round-6 driver-level contention
+    // (slab (de)allocation stalling a concurrent video-draw).
     int tail = p->n_trans_chain - 1;
-    if (tail >= 1 && !p->n_tr_good[tail] && !p->n_tr_build[tail] &&
+    if (tail >= 1 && tail >= p->tr_prealloc_links &&
+        !p->n_tr_good[tail] && !p->n_tr_build[tail] &&
         !trans_pending &&
         p->tr_frame - p->tr_link_used_frame[tail] > TR_LINK_RETIRE_FRAMES) {
         pl_tex old = p->trans_chain[tail];
@@ -2360,12 +2453,13 @@ retry:
                         p->trans_chain[p->n_trans_chain - 1] : NULL;
             MP_VERBOSE(p, "[pool-spill] trans store exhausted: need %dx%d at "
                        "row %d of link %d/%d (%dx%d; %d good + %d build bands "
-                       "on it, want %d links); placements fail this item\n",
+                       "on it, want %d links, uncapped %d); placements fail "
+                       "this item\n",
                        nw, nh, p->tr_y, p->tr_link + 1, p->n_trans_chain,
                        tl ? tl->params.w : 0, tl ? tl->params.h : 0,
                        p->n_trans_chain ? p->n_tr_good[p->tr_link] : 0,
                        p->n_trans_chain ? p->n_tr_build[p->tr_link] : 0,
-                       p->tr_want_links);
+                       p->tr_want_links, p->tr_want_uncapped);
         }
         return false;
     }
@@ -3208,6 +3302,74 @@ static void gc_warmup(struct priv *p)
     pl_gpu_finish(gpu);
 }
 
+// WP-H12 (sub-A): pre-create the FULL transient-store chain at reconfig --
+// the E1 philosophy applied to the round-6 findings: the worst case is now
+// measured (see TR_CHAIN_MAX), and on the NVIDIA driver each 16384x32768 link
+// slab-allocates in 160-330 ms AND contends with the VO thread even from the
+// helper thread ("Spent 330 ms allocating slab (slow!)" INSIDE a 330.7 ms
+// video-draw -> a 0.77 s present hole, 19 drops, one guard-empty vanish and
+// an A/V desync at the ep09 wall's linear entry). Creating the links here --
+// at reconfig, before playback traffic -- is the only spot with genuinely
+// zero contention. Dormant links cost VRAM but no time.
+//
+// POLICY (documented trade-off): the full chain is 4 GiB at the 8K link size,
+// too much to hold unconditionally, so it is created only when
+//   (a) the display is >=4K class (the same `big` predicate the warm-up store
+//       uses -- below that, links are small and background appends are cheap
+//       and uncontended in practice), AND
+//   (b) a subtitle track is attached (osd_has_attached_sub) -- no track, no
+//       deferred items, no store use. A track selected AFTER reconfig falls
+//       back to the demand-estimator append path (one-time background allocs,
+//       accepting the contention risk for that transition only), AND
+//   (c) --sub-gpu-composite or --sub-gpu-raster is enabled -- otherwise
+//       sd_ass never emits deferred items and the store can only ever be
+//       touched by the theoretical debug fallbacks (the CPU-baseline gate
+//       configs run at >=4K geometry with the GPU path off; they must not
+//       pay 2-4 GiB for a store they never use).
+// With the policy engaged, want is pinned at TR_CHAIN_MAX, links never
+// retire below the floor, and trans-link-append during playback is expected
+// to stay 0 (the mid-pass wait remains as a last resort but should never
+// fire).
+static void tr_prealloc_chain(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    if (!p->gpu || !p->n_trans_chain || p->tr_prealloc_links)
+        return;
+    bool big = p->osd_res.w >= 3840 || p->osd_res.h >= 2160;
+    if (!big || !osd_has_attached_sub(vo->osd))
+        return;
+    void *tmp = talloc_new(NULL);
+    struct mp_subtitle_opts *so =
+        mp_get_config_group(tmp, p->global, &mp_subtitle_sub_opts);
+    bool gpu_subs = so && (so->sub_gpu_composite || so->sub_gpu_raster);
+    talloc_free(tmp);
+    if (!gpu_subs)
+        return;
+    struct pl_tex_params par = p->trans_chain[0]->params;
+    par.initial_data = NULL;
+    par.user_data = NULL;
+    while (p->n_trans_chain < TR_CHAIN_MAX) {
+        pl_tex tex = pl_tex_create(p->gpu, &par);
+        if (!tex) {
+            MP_WARN(vo, "[pool-pregrow] trans_atlas prealloc stopped at "
+                    "%d/%d links (allocation failed); falling back to "
+                    "demand-driven appends\n", p->n_trans_chain,
+                    (int) TR_CHAIN_MAX);
+            break;
+        }
+        int k = p->n_trans_chain++;
+        p->trans_chain[k] = tex;
+        p->n_tr_good[k] = p->n_tr_build[k] = 0;
+        p->tr_link_used_frame[k] = p->tr_frame;
+    }
+    p->tr_prealloc_links = p->n_trans_chain;
+    p->tr_want_links = MPMAX(p->tr_want_links, p->n_trans_chain);
+    MP_VERBOSE(vo, "[pool-pregrow] trans_atlas chain preallocated: %d links "
+               "of %dx%d (%.1f MiB each) at reconfig (>=4K + subtitle track "
+               "policy)\n", p->tr_prealloc_links, par.w, par.h,
+               (double) par.w * par.h / (1 << 20));
+}
+
 // A pending glyph-atlas upload (non-outline cache miss): the glyph's slot and
 // its source pixels in the item's packed image.
 struct gmiss { int ax, ay, w, h; const uint8_t *src; };
@@ -3468,11 +3630,15 @@ static void emit_composed_overlays(struct priv *p, const struct sub_bitmaps *ite
     };
     if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
         col.color = src->params.color;
-    struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
-    *ol = col;
-    ol->tex = entry->result_tex;
-    ol->parts = entry->run_parts;
-    ol->num_parts = entry->num_run_parts;
+    // WP-H12: an all-spill compose has no result_tex content at all -- skip
+    // the empty main overlay (its parts all live in the spill overlays).
+    if (entry->num_run_parts) {
+        struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
+        *ol = col;
+        ol->tex = entry->result_tex;
+        ol->parts = entry->run_parts;
+        ol->num_parts = entry->num_run_parts;
+    }
     // WP-H10: the spill suffix may span several chain links; emit one overlay
     // per consecutive same-link run. Link use is monotonic through the item's
     // placements, so this is at most TR_CHAIN_MAX overlays (MAX_OSD_OVERLAYS
@@ -3566,6 +3732,12 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // tr_note_demand after the allocation loop as the reactive chain-size
     // backstop (covers render-ahead-off and estimator misses).
     int64_t trans_demand_px = 0;
+    // WP-H12: overcommit baseline for the slot-store gate below -- an entry
+    // compose with FAILED placements (chain still growing after a cold seek)
+    // must not be frozen into the reuse slot, or the missing content would
+    // persist for the wall's whole lifetime; without the slot the next frame
+    // recomposes against the by-then-appended links and completes.
+    int64_t overcommit0 = p->cnt_gcache_overcommit;
     // Pending uploads/raster jobs, split by destination: the persistent atlas
     // (cache misses) vs the per-item transient store (WP-H1d: uncached giants
     // + overflow -- never skipped). WP-H10: one transient queue per chain
@@ -3820,6 +3992,18 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // (what the atlas WOULD need to fit everything without spilling).
     int dm_x = 0, dm_y = 0, dm_h = 0, dm_max_w = 0;
     int spill_from = nems;
+    // WP-H12: when a guard-state item spills AT ALL, it spills EVERYTHING --
+    // no region-layer of it goes to entry->result_tex. The composed content
+    // then lives only in the (state-independent) transient chain, which is
+    // what makes a spilled compose reusable across the ping-pong states via
+    // the shared slot (see struct trs_slot): re-emitting it never references
+    // a per-state texture a later build could overwrite. The result_tex
+    // capacity a partial spill would have used is small next to a spilling
+    // item's total demand (ep09 wall: ~0.13 of ~1.87 Gpx), and the restart
+    // below is pure CPU bookkeeping -- at the moment of the FIRST overflow
+    // no region-layer has touched the transient store yet (glyph placements
+    // from the resolve phase stay where they are).
+    bool all_spill = false;
     // WP-H7: this item's spill placements become PROTECTED bands only after
     // the allocation loop -- the intra-item shelf cursor is monotonic, so
     // they cannot overlap each other, and adding each band immediately made
@@ -3829,6 +4013,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // WP-H10: bands are tracked per chain link.
     struct tr_band item_bands[TR_CHAIN_MAX][TR_BANDS_MAX];
     int n_item_bands[TR_CHAIN_MAX] = {0};
+    const int64_t glyph_demand_px = trans_demand_px;   // WP-H12: restart base
+restart_alloc:
     for (int ei = 0; ei < nems; ei++) {
         struct gc_region *r = &regs[ems[ei].reg];
         // Deferred runs are raw (unexpanded) per-glyph coverage, so they need
@@ -3857,7 +4043,20 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                 max_w = MPMAX(max_w, shelf_x);
                 continue;
             }
-            spill_from = ei;    // this and all later region-layers spill
+            if (!all_spill) {
+                // WP-H12: first overflow -> restart with EVERY layer spilling
+                // (see all_spill above). Nothing to unwind: no transient
+                // placement has happened for layers yet, and the result_tex
+                // slots assigned so far are simply overwritten.
+                all_spill = true;
+                spill_from = 0;
+                shelf_x = shelf_y = shelf_h = max_w = 0;
+                dm_x = dm_y = dm_h = dm_max_w = 0;
+                run_acc_w = run_acc_h = 0;
+                trans_demand_px = glyph_demand_px;
+                goto restart_alloc;
+            }
+            spill_from = ei;    // unreachable (all_spill starts spilled); keep
         }
         // Transient-store spill (gc_trans_place pads by 1px itself). Fails
         // only when the chain is genuinely exhausted (links still allocating
@@ -4116,13 +4315,46 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 
     // WP-H6 (item 6): the compose is complete; record its content key so an
     // identical later frame (same item change_id at the same geometry) can
-    // re-emit it without re-composing. A spilled build is NOT reusable: its
-    // transient-store rows are only protected while THIS snapshot is good.
+    // re-emit it without re-composing. A spilled build is not reusable via
+    // the per-state key (its rows live in the shared chain, not this state's
+    // result_tex)...
     entry->built_valid = !spilled;
     entry->built_change_id = item->change_id;
     entry->built_format = item->format;
     entry->built_gs = gs;
     entry->built_res = res;
+    // ...WP-H12: but it IS reusable via the shared slot: with the all-spill
+    // rule every one of its region-layers lives in the transient chain
+    // (state-independent), so record the emitted parts + the row bands they
+    // reference. A later build of EITHER state with the same change_id/
+    // geometry re-emits them and re-protects the bands (see the reuse fast
+    // path in update_overlays). Main-guard states only: the blend/screenshot
+    // states can never spill (can_spill), and only the main guard maintains
+    // the tr_good protection chain the slot depends on.
+    if (spilled && can_spill && p->trs_store_ok && item->render_index <= 1 &&
+        p->cnt_gcache_overcommit == overcommit0) {
+        struct trs_slot *s = &p->trs[item->render_index];
+        s->num_parts = 0;
+        for (int i = 0; i < entry->num_spill_parts; i++) {
+            MP_TARRAY_GROW(p, s->parts, s->num_parts);
+            MP_TARRAY_GROW(p, s->links, s->num_parts);
+            s->parts[s->num_parts] = entry->spill_parts[i];
+            s->links[s->num_parts] = entry->spill_links[i];
+            s->num_parts++;
+        }
+        for (int k = 0; k < TR_CHAIN_MAX; k++) {
+            s->nbands[k] = n_item_bands[k];
+            if (n_item_bands[k])
+                memcpy(s->bands[k], item_bands[k],
+                       n_item_bands[k] * sizeof(s->bands[k][0]));
+        }
+        s->change_id = item->change_id;
+        s->format = item->format;
+        s->gs = gs;
+        s->res = res;
+        s->valid = true;
+        s->used = true;   // this build IS a use (bands are in tr_build)
+    }
     return true;
 }
 
@@ -4413,6 +4645,27 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
     // a bail runs deadline-free (must_complete) to guarantee progress.
     uint64_t sub_epoch = osd_sub_track_epoch(vo->osd);
     bool guard_on = present && p->guard_deadline_ns > 0 && !g->must_complete;
+    // WP-H12 (sub-B item 3): a deadline is only useful while a bail has a
+    // valid previous snapshot to serve. With nothing servable (cold start,
+    // post-seek/reset, geometry/flags/epoch change, pts discontinuity) a
+    // bail presents EMPTY overlays -- the vanish class the acceptance gates
+    // treat as strictly worse than a late frame -- so such builds run to
+    // completion instead (the same unbounded-build precedent as
+    // must_complete). Round-6 evidence: the ep09 wall entry fired
+    // guard-empty at the exact frames where good was invalid (post-seek and
+    // the linear-entry present hole); with the WP-H12 reuse slot only the
+    // single entry compose is heavy, and it now lands late-but-correct.
+    // The servability predicate mirrors the bail path's exactly.
+    if (guard_on) {
+        double now = src ? src->pts : MP_NOPTS_VALUE;
+        bool pts_ok = now == g->good_pts ||
+                      (now != MP_NOPTS_VALUE && g->good_pts != MP_NOPTS_VALUE &&
+                       now >= g->good_pts && now - g->good_pts <= 0.5);
+        if (!(g->good >= 0 && flags == g->good_flags &&
+              coords == g->good_coords && osd_res_equals(res, g->good_res) &&
+              sub_epoch == g->good_epoch && pts_ok))
+            guard_on = false;
+    }
     p->guard_abs = guard_on ? p->guard_t0 + p->guard_deadline_ns : 0;
     if (present)
         g->must_complete = false;
@@ -4458,8 +4711,18 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
     // Spill COMMIT state tracks the MAIN guard only.
     for (int k = 0; k < TR_CHAIN_MAX; k++)
         p->n_tr_build[k] = 0;
-    if (present && g == &p->osd_guard)
+    // WP-H12: only present main-guard builds may touch the reuse slots (see
+    // trs_store_ok); everything else -- screenshot builds included, which
+    // share the guard states -- recomposes without recording.
+    p->trs_store_ok = present && g == &p->osd_guard;
+    if (p->trs_store_ok) {
         p->build_spilled = false;
+        // Slot use is re-established per build (reuse or re-store); a slot
+        // this build does not use is invalidated at commit (its rows leave
+        // tr_good there and become reclaimable).
+        p->trs[0].used = false;
+        p->trs[1].used = false;
+    }
 
     // WP-E3 checkpoint: after the fetch, before anything is mutated (covers a
     // stalled osd_render, e.g. a render-ahead miss-wait blown far past its
@@ -4516,12 +4779,51 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
              item->format == SUBBITMAP_LIBASS_OUTLINES)) {
             double gs = item->render_w > 0 && subs->w > 0
                       ? (double) item->render_w / subs->w : 1.0;
-            if (entry->built_valid &&
-                entry->built_change_id == item->change_id &&
-                entry->built_format == item->format &&
-                entry->built_gs == gs &&
-                osd_res_equals(entry->built_res, res))
-            {
+            bool reuse = entry->built_valid &&
+                         entry->built_change_id == item->change_id &&
+                         entry->built_format == item->format &&
+                         entry->built_gs == gs &&
+                         osd_res_equals(entry->built_res, res);
+            // WP-H12: spilled composes reuse via the SHARED slot (their
+            // content lives in the state-independent transient chain, not in
+            // this state's result_tex; see struct trs_slot). Restoring it =
+            // copying the recorded parts into this state's entry arrays and
+            // re-protecting the recorded row bands, so the commit keeps them
+            // in tr_good CONTINUOUSLY while the content is served. Main
+            // present path only (other consumers recompose; they neither
+            // maintain tr_good nor may mutate the slot). This is what turns
+            // the ep09 wall -- static typesetting that spills every frame --
+            // from a full per-frame recompose (round-6: 55-140 ms of
+            // VO-thread 'other' per frame) into an emit-only frame.
+            if (!reuse && p->trs_store_ok && item->render_index <= 1) {
+                struct trs_slot *s = &p->trs[item->render_index];
+                if (s->valid &&
+                    s->change_id == item->change_id &&
+                    s->format == item->format &&
+                    s->gs == gs &&
+                    osd_res_equals(s->res, res))
+                {
+                    entry->num_run_parts = 0;
+                    entry->num_spill_parts = 0;
+                    for (int i = 0; i < s->num_parts; i++) {
+                        int ns = entry->num_spill_parts;
+                        MP_TARRAY_GROW(p, entry->spill_links, ns);
+                        entry->spill_links[ns] = s->links[i];
+                        MP_TARRAY_APPEND(p, entry->spill_parts,
+                                         entry->num_spill_parts, s->parts[i]);
+                    }
+                    for (int k = 0; k < TR_CHAIN_MAX; k++) {
+                        for (int i = 0; i < s->nbands[k]; i++)
+                            tr_band_add(p->tr_build[k], &p->n_tr_build[k],
+                                        s->bands[k][i].lo, s->bands[k][i].hi);
+                    }
+                    p->build_spilled = true;
+                    s->used = true;
+                    p->cnt_spill_reuse++;
+                    reuse = true;
+                }
+            }
+            if (reuse) {
                 emit_composed_overlays(p, item, entry, frame, state, coords, src);
                 p->cnt_compose_reuse++;
                 if (item->format == SUBBITMAP_LIBASS_OUTLINES)
@@ -4950,6 +5252,15 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
                 if (n)
                     memcpy(p->tr_good[k], g->good_trans[k],
                            n * sizeof(p->tr_good[k][0]));
+            }
+            // WP-H12: a shared reuse slot this build did not use loses its
+            // row protection right here (its bands are not in the new
+            // tr_good), so it must not be served again -- invalidate. Set
+            // by: the item vanished, changed content (recompose re-stored
+            // it with used=true), or geometry moved on.
+            for (int e = 0; e < 2; e++) {
+                if (p->trs[e].valid && !p->trs[e].used)
+                    p->trs[e].valid = false;
             }
         }
     }
@@ -6305,6 +6616,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "trans-link-append",         p->cnt_trans_link_append,   &p->stat_trans_link_append);
     emit_counter(vo, "trans-link-retire",         p->cnt_trans_link_retire,   &p->stat_trans_link_retire);
     emit_counter(vo, "trans-links",               p->n_trans_chain,           &p->stat_trans_links);
+    emit_counter(vo, "trans-prealloc-links",      p->tr_prealloc_links,       &p->stat_trans_prealloc_links);
+    emit_counter(vo, "trans-want-uncapped",       p->tr_want_uncapped,        &p->stat_trans_want_uncapped);
+    emit_counter(vo, "compose-reuse-spill",       p->cnt_spill_reuse,         &p->stat_spill_reuse);
     emit_counter(vo, "blob-hash-hit",             p->cnt_blob_hash_hit,       &p->stat_blob_hash_hit);
     emit_counter(vo, "compose-reuse",             p->cnt_compose_reuse,       &p->stat_compose_reuse);
     emit_counter(vo, "staging-wrap",              p->cnt_staging_wrap,        &p->stat_staging_wrap);
@@ -6405,6 +6719,10 @@ static void guard_invalidate(struct priv *p)
         for (int e = 0; e < MAX_OSD_PARTS; e++)
             p->osd_guard.states[s].entries[e].built_valid = false;
     }
+    // WP-H12: the shared spilled-compose slots reference transient rows whose
+    // protection (tr_good) was just dropped -- never serve them again.
+    p->trs[0].valid = false;
+    p->trs[1].valid = false;
 }
 
 static void resize(struct vo *vo)
@@ -6577,6 +6895,11 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     // reaches this on reconfig. Uses plain gc_ensure (monotonic MPMAX), off the
     // hot path, so it never bumps raster-pool-grow.
     gc_prealloc_pools(p);
+    // WP-H12 (sub-A): full transient-chain preallocation under the >=4K +
+    // subtitle-track policy -- idempotent, re-checked on every reconfig (a
+    // resize onto a >=4K display or a track attach reaches it here, still at
+    // a reconfig boundary, never mid-frame).
+    tr_prealloc_chain(vo);
 #endif
     // WP-H6 (item 5): compile the video pipeline NOW, before playback, so the
     // first real frame's render-submit doesn't pay the driver JIT.
@@ -7310,6 +7633,9 @@ static int preinit(struct vo *vo)
     p->stat_trans_link_append = -1;
     p->stat_trans_link_retire = -1;
     p->stat_trans_links = -1;
+    p->stat_trans_prealloc_links = -1;
+    p->stat_trans_want_uncapped = -1;
+    p->stat_spill_reuse = -1;
     p->stat_blob_hash_hit = -1;
     p->stat_compose_reuse = -1;
     p->stat_staging_wrap = -1;

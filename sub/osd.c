@@ -436,6 +436,14 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
         // by the async worker; serve its last completed snapshot without
         // ever putting libass work on this (usually the VO) thread.
         res = osd_external_render_async(osd, obj, render_res, format);
+    } else if (obj->type == OSDTYPE_OSD) {
+        // WP-H12 (sub-C): osd_message + progress bar render on the same
+        // worker. The DEFAULT stats page is one mp.osd_message event
+        // re-shaped at 1 Hz -- synchronously that was a ~42 ms layout per
+        // refresh at 8K (the 1-drop-per-second signature), fixed before only
+        // by the stats-persistent_overlay opt-in. Now both stats-page paths
+        // are worker-rendered.
+        res = osd_object_render_async(osd, obj, render_res, format);
     } else {
         res = osd_object_get_bitmaps(osd, obj, render_res, format);
     }
@@ -630,6 +638,17 @@ bool osd_query_and_reset_want_redraw(struct osd_state *osd)
     mp_mutex_lock(&osd->lock);
     bool r = osd->want_redraw_notification;
     osd->want_redraw_notification = false;
+    mp_mutex_unlock(&osd->lock);
+    return r;
+}
+
+// WP-H12: whether any subtitle track is currently attached (either sub
+// object). VOs use it to gate worst-case resource preallocation policies
+// (no track => no subtitle rendering => don't budget the VRAM).
+bool osd_has_attached_sub(struct osd_state *osd)
+{
+    mp_mutex_lock(&osd->lock);
+    bool r = osd->objs[OSDTYPE_SUB]->sub || osd->objs[OSDTYPE_SUB2]->sub;
     mp_mutex_unlock(&osd->lock);
     return r;
 }
