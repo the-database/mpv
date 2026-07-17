@@ -740,25 +740,44 @@ struct sub_bitmaps *osd_external_render_async(struct osd_state *osd,
     return out;
 }
 
+// WP-H14b (item b): issue an OSDTYPE_OSD content-change render request. Called
+// under osd->lock from the CONTENT-ORIGIN thread (osd_set_text/osd_set_progbar/
+// osd_changed) -- the same place osd_set_external issues the request for
+// OSDTYPE_EXTERNAL. Before this, the request transfer (osd_changed -> track
+// rebuild + generation bump + worker kick) ran on the VO thread inside the
+// serve (osd_object_render_async), so an OSD content change (the stats page's
+// 1 Hz refresh) did discrete per-change work on the VO thread coupled to the
+// presentation cadence -- the r7 statspage over->drop conversion. Moving it here
+// makes the serve identical on changed and unchanged frames: no per-change work
+// on the VO thread, the new snapshot swaps in whenever the worker finishes (at
+// most one update stale -- invisible for a stats readout). The worker also gets
+// kicked the instant the content changes (in parallel with the current frame)
+// instead of only when the VO next serves, so the snapshot is usually ready by
+// the next frame.
+void osd_object_request_render(struct osd_state *osd, struct osd_object *obj)
+{
+    // The worker's phase 1 rebuilds the track from text/progbar under osd->lock.
+    obj->osd_track_dirty = true;
+    obj->ext_req_gen += 1;
+    ext_worker_start(osd);
+    mp_cond_signal(&osd->ext_wakeup);
+}
+
 // WP-H12 (sub-C): under osd->lock. Non-blocking OSDTYPE_OSD serve -- the
 // osd_message/progress-bar object (the default stats page path) renders on
 // the shared worker exactly like OSDTYPE_EXTERNAL; the VO gets the last
 // completed snapshot (at most one update stale -- the same semantics the
 // rig-proven stats-persistent_overlay path has, now without the opt-in).
+// WP-H14b (item b): the content-change request now comes from
+// osd_object_request_render on the content-origin thread; this serve does the
+// SAME work on changed and unchanged frames -- serve the last completed
+// snapshot, and re-request ONLY on a geometry/format change (res_ok, detected
+// here because the VO owns the render geometry; rare, never the 1 Hz refresh).
 struct sub_bitmaps *osd_object_render_async(struct osd_state *osd,
                                             struct osd_object *obj,
                                             struct mp_osd_res res,
                                             int format)
 {
-    if (obj->osd_changed) {
-        // Transfer the change into a render request: the worker rebuilds the
-        // track from text/progbar (osd_track_dirty, its phase 1) and
-        // re-renders. osd_changed itself is consumed here so a later
-        // unchanged serve doesn't re-request.
-        obj->osd_changed = false;
-        obj->osd_track_dirty = true;
-        obj->ext_req_gen += 1;
-    }
     if (!obj->ext_req_gen && !obj->ext_done)
         return NULL;    // never had content: don't wake anything
     obj->ext_want_res = res;
@@ -766,6 +785,12 @@ struct sub_bitmaps *osd_object_render_async(struct osd_state *osd,
     bool res_ok = osd_res_equals(obj->ext_done_res, res) &&
                   obj->ext_done_format == format;
     if (obj->ext_req_gen != obj->ext_done_gen || !res_ok) {
+        // A geometry change may need the track rebuilt (with osd-scale-by-
+        // window=no the OSD font size scales with vo_res, set in update_osd);
+        // ask the worker to re-parse. Only on an actual res/format change --
+        // the 1 Hz content refresh keeps res_ok true, so this never fires there.
+        if (!res_ok)
+            obj->osd_track_dirty = true;
         ext_worker_start(osd);
         mp_cond_signal(&osd->ext_wakeup);
     }

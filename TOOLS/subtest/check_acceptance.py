@@ -189,6 +189,26 @@ INFO_COUNTERS = [
     "trans-prealloc-links",
     "trans-want-uncapped",
     "compose-reuse-spill",
+    # WP-H14 (item a): off-thread transient-chain rebuilds. A window resize that
+    # crosses the link-size policy upward WITHOUT a reconfig (mpvnet: 960x540
+    # logo reconfig, then fullscreen 8K by resize only) rebuilds the whole chain
+    # at the bigger link size off the VO thread and swaps it in at a frame
+    # boundary. INFO (not gated): nonzero is CORRECT and expected on the mpvnet
+    # geometry path (it is the fix for the round-7 overcommit-30678 content loss);
+    # gcache-overcommit staying 0 across the rebuild is the real integrity signal.
+    # On mpv.exe (reconfigs at final 8K geometry) this stays 0.
+    "chain-rebuild",
+    # WP-H14b (item c2): a store-eligible all-spill compose let run to completion
+    # (guard disabled mid-compose) so it STORES the reuse slot on the wall-entry
+    # frame -- collapsing the documented two-build entry (build #1 bails before
+    # the store, build #2 must_complete recomposes) into ONE longer build.
+    # INFO (not gated): expect exactly 1 per wall ENTRY (the compose runs only
+    # when reuse missed, i.e. the first frame of the static wall; every later
+    # frame reuses the slot). A value >1 per entry means the slot is not being
+    # reused (result-spill would climb in lockstep -- check that first); 0 across
+    # a linear/seek wall entry with a servable pre-wall snapshot means the guard
+    # bailed the entry compose the old way (the double build was not collapsed).
+    "entry-mustcomplete",
 ]
 
 # WP-H12: TR_CHAIN_MAX in vo_gpu_next.c -- the full-prealloc chain length.
