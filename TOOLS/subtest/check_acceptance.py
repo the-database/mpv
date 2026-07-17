@@ -189,6 +189,15 @@ INFO_COUNTERS = [
     "trans-prealloc-links",
     "trans-want-uncapped",
     "compose-reuse-spill",
+    # WP-H14 (item a): off-thread transient-chain rebuilds. A window resize that
+    # crosses the link-size policy upward WITHOUT a reconfig (mpvnet: 960x540
+    # logo reconfig, then fullscreen 8K by resize only) rebuilds the whole chain
+    # at the bigger link size off the VO thread and swaps it in at a frame
+    # boundary. INFO (not gated): nonzero is CORRECT and expected on the mpvnet
+    # geometry path (it is the fix for the round-7 overcommit-30678 content loss);
+    # gcache-overcommit staying 0 across the rebuild is the real integrity signal.
+    # On mpv.exe (reconfigs at final 8K geometry) this stays 0.
+    "chain-rebuild",
 ]
 
 # WP-H12: TR_CHAIN_MAX in vo_gpu_next.c -- the full-prealloc chain length.
