@@ -610,6 +610,14 @@ struct priv {
     int tr_rebuild_want;                     // target link count (0 = idle)
     int tr_rebuild_tries;                    // frames requested w/o progress (abort guard)
     struct pl_tex_params tr_rebuild_par;     // params for each rebuild link
+    // WP-H16: last osd_sub_track_epoch() the VO acted on. A sub track that
+    // attaches AFTER the geometry already crossed to >=4K by resize (mpvnet's
+    // order: 960x540 logo reconfig -> fullscreen 8K by resize with no sub, then
+    // the sub attaches at steady 8K) is never seen by the resize-time prealloc
+    // (osd_has_attached_sub() was false then, and no later resize re-runs it).
+    // draw_frame watches this epoch and kicks the off-thread full-chain prealloc
+    // (tr_start_rebuild) when it advances under a policy-qualifying geometry.
+    uint64_t tr_last_sub_epoch;
 
     // GPU glyph rasterizer (SUBBITMAP_LIBASS_OUTLINES): cache misses are
     // rasterized into glyph_atlas from libass's tile-export blobs instead of
@@ -3532,10 +3540,10 @@ static void tr_start_rebuild(struct vo *vo)
     int want_w, want_h;
     tr_link_dims(p, &want_w, &want_h);
     pl_tex l0 = p->trans_chain[0];
-    // Rebuild only on an UPWARD link-size crossing (bigger area). Equal/smaller
-    // keeps the current chain (a shrink would only free VRAM; not worth a swap).
-    if ((int64_t) want_w * want_h <= (int64_t) l0->params.w * l0->params.h)
-        return;
+    // An UPWARD link-size crossing (bigger area) -- the WP-H14 case: geometry
+    // reached >=4K by resize only, so the links latched small and must grow.
+    bool size_up =
+        (int64_t) want_w * want_h > (int64_t) l0->params.w * l0->params.h;
     // Target link count: the prealloc policy (>=4K + attached sub + GPU subs)
     // wants the full chain; otherwise just re-size the links already present.
     int want_n = p->n_trans_chain;
@@ -3548,6 +3556,20 @@ static void tr_start_rebuild(struct vo *vo)
             want_n = TR_CHAIN_MAX;
         talloc_free(tmp);
     }
+    // Rebuild on EITHER an upward size crossing (WP-H14) OR a link-COUNT deficit
+    // under the policy with no size change to carry it (WP-H16, the late-sub-
+    // attach order): the geometry crossed to >=4K while no sub was attached, so
+    // the resize-time prealloc early-returned and this rebuild fell back to
+    // want_n=n_trans_chain=1; the sub then attached at steady 8K and no further
+    // resize re-runs the prealloc, leaving the dense wall to append links on the
+    // VO thread at entry. A count-only grow keeps the current (already-correct)
+    // link size -- never shrink (hysteresis) -- and just adds links off-thread.
+    if (!size_up && want_n <= p->n_trans_chain)
+        return;
+    if (!size_up) {
+        want_w = l0->params.w;
+        want_h = l0->params.h;
+    }
     p->tr_rebuild_par = l0->params;
     p->tr_rebuild_par.w = want_w;
     p->tr_rebuild_par.h = want_h;
@@ -3556,9 +3578,11 @@ static void tr_start_rebuild(struct vo *vo)
     p->tr_rebuild_want = want_n;
     p->n_tr_rebuild = 0;
     p->tr_rebuild_tries = 0;
-    MP_VERBOSE(vo, "[pool-pregrow] transient chain rebuild scheduled: %d links "
-               "%dx%d -> %dx%d (upward crossing to osd %dx%d; off-thread)\n",
-               want_n, l0->params.w, l0->params.h, want_w, want_h,
+    MP_VERBOSE(vo, "[pool-pregrow] transient chain rebuild scheduled: %d -> %d "
+               "links %dx%d -> %dx%d (%s to osd %dx%d; off-thread)\n",
+               p->n_trans_chain, want_n, l0->params.w, l0->params.h,
+               want_w, want_h, size_up ? "upward size crossing"
+                                       : "late-sub-attach count grow",
                p->osd_res.w, p->osd_res.h);
     pregrow_request(p, POOL_TRANS_REBUILD, &p->tr_rebuild_par);
 }
@@ -6676,6 +6700,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // boundary, before the overlay build touches them.
     pregrow_swap_in(vo);
 #if HAVE_ASS_COMPOSITE_DEFERRED
+    // WP-H16: a subtitle track can attach AFTER the geometry already crossed to
+    // >=4K by resize (mpvnet's order: 960x540 logo reconfig -> fullscreen 8K by
+    // resize with no sub attached, then the sub attaches at steady 8K). The
+    // resize-time tr_prealloc_chain/tr_start_rebuild both saw
+    // osd_has_attached_sub()==false and left the chain at one link; no later
+    // resize ever re-runs them, so the dense ep09 wall then appends links on the
+    // VO thread at entry (160-330 ms slab allocs each -> the round-8 wall-entry
+    // drops). Re-run the full-chain prealloc when the sub-track epoch advances
+    // while a policy-qualifying geometry is already active. Off the VO thread
+    // (tr_start_rebuild schedules the pregrow/rebuild worker, swaps in whole at
+    // a frame boundary, guard_invalidate, hysteresis, chain-rebuild counter);
+    // no-op when the chain is already at the policy floor or a rebuild/appends
+    // are in flight. pregrow_swap_in above has already applied any completed
+    // rebuild, so a still-pending one short-circuits on tr_rebuild_want.
+    //
+    // Only CONSUME the epoch once nothing is pending afterward: if the sub
+    // attaches while the WP-H14 size-crossing rebuild is still in flight,
+    // tr_start_rebuild no-ops on tr_rebuild_want, so we must keep re-evaluating
+    // on later frames (after that rebuild completes) until the chain actually
+    // reaches the policy floor -- otherwise a one-shot latch would strand it at
+    // one link. Once the chain is at the floor (or the geometry/opts do not
+    // qualify) tr_start_rebuild leaves tr_rebuild_want==0 and the epoch is done.
+    uint64_t sub_epoch_now = osd_sub_track_epoch(vo->osd);
+    if (sub_epoch_now != p->tr_last_sub_epoch && p->gc_warmed) {
+        tr_start_rebuild(vo);
+        if (!p->tr_rebuild_want)
+            p->tr_last_sub_epoch = sub_epoch_now;
+    }
     // WP-H10: post-seek transient-demand probe (no-op unless VOCTRL_RESET
     // armed it) -- runs before the overlay build so a link request overlaps
     // this frame's work instead of trailing it.
@@ -7178,6 +7230,12 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     // resize onto a >=4K display or a track attach reaches it here, still at
     // a reconfig boundary, never mid-frame).
     tr_prealloc_chain(vo);
+    // WP-H16: baseline the sub-track epoch to reconfig time. tr_prealloc_chain
+    // above already covers a sub attached AS OF this reconfig; the draw_frame
+    // watcher only needs to catch an attach that lands LATER (mpvnet's order),
+    // so re-baselining here keeps the common case (attached at reconfig) from
+    // firing a redundant rebuild on the first frame.
+    p->tr_last_sub_epoch = osd_sub_track_epoch(vo->osd);
 #endif
     // WP-H6 (item 5): compile the video pipeline NOW, before playback, so the
     // first real frame's render-submit doesn't pay the driver JIT.
