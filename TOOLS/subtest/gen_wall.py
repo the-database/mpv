@@ -19,6 +19,16 @@ Presets:
          demand also beats the display-derived result_tex. Fast (~1 s/frame):
          the x3 seek/ramp/retire/sanitizer workhorse.
 
+WP-H12 --static: emit the wall with static \\pos instead of \\move. This is
+the REAL ep09 wall shape -- its ~247 events are byte-identical static
+typesetting for the whole ~3.5 s (zero \\move/\\t; verified by per-frame
+sub-text/ass dumps at 1122.8s) -- so change_id is stable in-wall and the
+WP-H12 spilled-compose reuse slot must serve every frame after the first
+(compose-reuse-spill =~ 1/frame in-wall, glyphs-uncached flat after entry).
+The default (moving) wall stays as the change_id-churn stress: it re-composes
+every frame by construction and gates the chain capacity under sustained
+recompose.
+
 Timeline (media time):
    0.0-16.0   light dialogue (cheap frames; prefill/estimator territory)
   20.0-26.0   THE WALL (dense typeset)
@@ -56,7 +66,7 @@ def ts(t):
     h = int(t // 3600); m = int(t % 3600 // 60); s = t % 60
     return f"{h}:{m:02d}:{s:05.2f}"
 
-def main(preset, out):
+def main(preset, out, static=False):
     P = PRESETS[preset]
     ev = []
     for i in range(8):
@@ -72,25 +82,32 @@ def main(preset, out):
         gx = (i % 8) * 230 + 10
         gy = (i // 8) * 200 + 20
         ch = blocks[i % len(blocks)]
+        mv = (f"\\pos({gx},{gy})" if static else
+              f"\\move({gx},{gy},{gx+8},{gy})")
         ev.append(
             f"Dialogue: 1,{t0s},{t1s},Giant,,0,0,0,,"
-            f"{{\\move({gx},{gy},{gx+8},{gy})\\blur{P['giant_blur']}\\alpha&H90&}}{ch}")
+            f"{{{mv}\\blur{P['giant_blur']}\\alpha&H90&}}{ch}")
     words = ["DENSETYPESET", "WALLOFSIGNSX", "KANJIKANJIKA", "SUBTITLEWALL"]
     for i in range(P["n_runs"]):
         rx = (i % 10) * 190 + 5
         ry = (i * 37) % 900 + 30
         w = words[i % len(words)]
         c = ["&H00FFD0D0&", "&H00D0FFD0&", "&H00D0D0FF&", "&H00FFFFD0&"][i % 4]
+        mv = (f"\\pos({rx},{ry})" if static else
+              f"\\move({rx},{ry},{rx+6},{ry+2})")
         ev.append(
             f"Dialogue: 2,{t0s},{t1s},Wall,,0,0,0,,"
-            f"{{\\move({rx},{ry},{rx+6},{ry+2})\\blur{P['run_blur']}\\bord4\\1c{c}}}{w}")
+            f"{{{mv}\\blur{P['run_blur']}\\bord4\\1c{c}}}{w}")
     with open(out, "w") as f:
         f.write(HDR.format(preset=preset, **P))
         f.write("\n".join(ev) + "\n")
-    print(f"wrote {out} [{preset}]: {len(ev)} events "
+    print(f"wrote {out} [{preset}{' static' if static else ''}]: {len(ev)} events "
           f"({P['n_giant']} giants + {P['n_runs']} runs in [{WALL_T0},{WALL_T1}))")
 
 if __name__ == "__main__":
-    preset = sys.argv[1] if len(sys.argv) > 1 else "big"
-    out = sys.argv[2] if len(sys.argv) > 2 else f"wall_{preset}.ass"
-    main(preset, out)
+    args = [a for a in sys.argv[1:] if a != "--static"]
+    static = "--static" in sys.argv[1:]
+    preset = args[0] if len(args) > 0 else "big"
+    sfx = "_static" if static else ""
+    out = args[1] if len(args) > 1 else f"wall_{preset}{sfx}.ass"
+    main(preset, out, static)
