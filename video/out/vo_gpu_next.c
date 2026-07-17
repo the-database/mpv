@@ -216,6 +216,13 @@ enum {
     POOL_TRANS,
     POOL_RESULT,                 // 4 slots: states[0..1] x entries[0..1]
     POOL_COUNT = POOL_RESULT + 4,
+    // WP-H14 (item a): sentinel pool for the off-thread transient-chain
+    // REBUILD (a late upward geometry crossing needs bigger links than the
+    // first-reconfig-latched size). Rebuild links ride the same pregrow
+    // request/done queue but land in a side chain (tr_rebuild[]), never in a
+    // real pool slot, so pregrow_slot() is never asked for it.
+    POOL_TRANS_REBUILD = POOL_COUNT,
+    POOL_SLOTS,                  // request/done array sizing (real pools + 1)
 };
 
 #if HAVE_ASS_COMPOSITE_DEFERRED
@@ -233,6 +240,7 @@ static const char *pool_name(int pool)
     case POOL_RESULT + 1: return "result_tex[0][SUB2]";
     case POOL_RESULT + 2: return "result_tex[1][SUB]";
     case POOL_RESULT + 3: return "result_tex[1][SUB2]";
+    case POOL_TRANS_REBUILD: return "trans_rebuild";
     }
     return "?";
 }
@@ -577,19 +585,39 @@ struct priv {
     mp_cond pregrow_wakeup;
     bool pregrow_exit;
     bool pregrow_threaded;
-    struct pregrow_job { int pool; struct pl_tex_params par; } pg_req[POOL_COUNT];
+    struct pregrow_job { int pool; struct pl_tex_params par; } pg_req[POOL_SLOTS];
     int num_pg_req;
-    struct pregrow_done { int pool; pl_tex tex; } pg_done[POOL_COUNT];
+    struct pregrow_done { int pool; pl_tex tex; } pg_done[POOL_SLOTS];
     int num_pg_done;
     uint32_t pg_pending;                     // bit per pool: in flight or unswapped
+
+    // WP-H14 (item a): off-thread transient-chain rebuild for a late upward
+    // geometry crossing. mpvnet first-reconfigs at its 960x540 logo, video-
+    // loads while still windowed, then reaches fullscreen 8K by RESIZE only --
+    // no reconfig fires -- so the first-reconfig link size (8192x8192) latches
+    // and the 8K wall overcommits a chain that is ~1/8 the rows it needs
+    // (round-7: gcache-overcommit 30678, silent content loss). Chain links are
+    // per-frame content, so the fix builds a bigger chain OFF the VO thread
+    // (POOL_TRANS_REBUILD jobs) and swaps it in whole at a frame boundary
+    // (pregrow_swap_in); guard_invalidate drops any snapshot/reuse-slot that
+    // referenced the retired links. Downward crossings keep the bigger chain
+    // (hysteresis). All fields below are VO-thread-owned (touched only in
+    // resize()/pregrow_swap_in, both on the VO thread).
+    pl_tex tr_rebuild[TR_CHAIN_MAX];         // new links accumulating off-thread
+    int n_tr_rebuild;                        // built so far
+    int tr_rebuild_want;                     // target link count (0 = idle)
+    int tr_rebuild_tries;                    // frames requested w/o progress (abort guard)
+    struct pl_tex_params tr_rebuild_par;     // params for each rebuild link
 
     // GPU glyph rasterizer (SUBBITMAP_LIBASS_OUTLINES): cache misses are
     // rasterized into glyph_atlas from libass's tile-export blobs instead of
     // being uploaded (only used when built with HAVE_ASS_OUTLINE_DEFERRED).
     pl_tex edge_tex;                         // rgba32f segment pool (2 texels/seg)
     float *ebuf; int ebuf_cap;               // CPU segment scratch (in float units)
+    pl_buf edge_stage;                       // WP-H14 (c1): edge upload staging (was a per-call slab)
     pl_tex work_tex;                         // batched raster: one 16x16 tile per workgroup
     float *wbuf; int wbuf_cap;               // CPU work-list scratch (in float units)
+    pl_buf work_stage;                       // WP-H14 (c1): work-list upload staging (was a per-call slab)
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -713,6 +741,7 @@ struct priv {
     // uncapped demand estimate (see tr_want_uncapped).
     int64_t cnt_trans_link_append, stat_trans_link_append;
     int64_t cnt_trans_link_retire, stat_trans_link_retire;
+    int64_t cnt_chain_rebuild, stat_chain_rebuild;  // WP-H14 (a): off-thread rebuilds
     int64_t stat_trans_links;
     int64_t stat_trans_prealloc_links;
     int64_t stat_trans_want_uncapped;
@@ -1655,6 +1684,8 @@ static void overlay_tex_floor(struct priv *p, int *fw, int *fh)
 // inline grows count as raster-pool-grow (gated ==0).
 #if HAVE_ASS_COMPOSITE_DEFERRED
 
+static void guard_invalidate(struct priv *p);   // WP-H14: used by the chain swap
+
 static MP_THREAD_VOID pregrow_thread_fn(void *arg)
 {
     struct priv *p = arg;
@@ -1672,7 +1703,7 @@ static MP_THREAD_VOID pregrow_thread_fn(void *arg)
         mp_mutex_unlock(&p->pregrow_lock);
         pl_tex tex = pl_tex_create(p->gpu, &job.par);
         mp_mutex_lock(&p->pregrow_lock);
-        if (tex && p->num_pg_done < POOL_COUNT) {
+        if (tex && p->num_pg_done < POOL_SLOTS) {
             p->pg_done[p->num_pg_done++] =
                 (struct pregrow_done){ job.pool, tex };
             // pg_pending bit stays set until the swap consumes it.
@@ -1727,6 +1758,10 @@ static void pregrow_uninit(struct priv *p)
     for (int i = 0; i < p->num_pg_done; i++)
         pl_tex_destroy(p->gpu, &p->pg_done[i].tex);
     p->num_pg_done = 0;
+    // WP-H14 (item a): free any not-yet-swapped rebuild links.
+    for (int i = 0; i < p->n_tr_rebuild; i++)
+        pl_tex_destroy(p->gpu, &p->tr_rebuild[i]);
+    p->n_tr_rebuild = p->tr_rebuild_want = 0;
     mp_cond_destroy(&p->pregrow_wakeup);
     mp_mutex_destroy(&p->pregrow_lock);
     p->pregrow_inited = false;
@@ -1742,7 +1777,7 @@ static void pregrow_request(struct priv *p, int pool,
         // ahead of the frame that will actually need the larger size, so the
         // cost lands on a frame with headroom instead of the overflow frame.
         pl_tex tex = pl_tex_create(p->gpu, par);
-        if (tex && p->num_pg_done < POOL_COUNT) {
+        if (tex && p->num_pg_done < POOL_SLOTS) {
             p->pg_pending |= 1u << pool;
             p->pg_done[p->num_pg_done++] = (struct pregrow_done){ pool, tex };
         } else if (tex) {
@@ -1751,7 +1786,7 @@ static void pregrow_request(struct priv *p, int pool,
         return;
     }
     mp_mutex_lock(&p->pregrow_lock);
-    if (!(p->pg_pending & (1u << pool)) && p->num_pg_req < POOL_COUNT) {
+    if (!(p->pg_pending & (1u << pool)) && p->num_pg_req < POOL_SLOTS) {
         p->pg_pending |= 1u << pool;
         p->pg_req[p->num_pg_req++] = (struct pregrow_job){ pool, *par };
         mp_cond_signal(&p->pregrow_wakeup);
@@ -1799,6 +1834,11 @@ static void tr_request_link(struct priv *p)
 {
     if (!p->pregrow_inited || !p->n_trans_chain ||
         p->n_trans_chain >= TR_CHAIN_MAX)
+        return;
+    // WP-H14 (item a): while an off-thread chain rebuild is in flight the
+    // current chain is about to be replaced wholesale at a bigger link size --
+    // appending an old-size link now just gets destroyed at the swap.
+    if (p->tr_rebuild_want)
         return;
     struct pl_tex_params par = p->trans_chain[0]->params;
     par.initial_data = NULL;
@@ -1939,6 +1979,23 @@ static void pregrow_swap_in(struct vo *vo)
     mp_mutex_lock(&p->pregrow_lock);
     for (int i = p->num_pg_done - 1; i >= 0; i--) {
         struct pregrow_done d = p->pg_done[i];
+        if (d.pool == POOL_TRANS_REBUILD) {
+            // WP-H14 (item a): a rebuilt (bigger) link arrived. Accumulate it
+            // in the side chain; the whole-chain swap happens below once the
+            // rebuild is complete. If the rebuild was cancelled/superseded
+            // meanwhile (tr_rebuild_want cleared), drop the link.
+            MP_TARRAY_REMOVE_AT(p->pg_done, p->num_pg_done, i);
+            p->pg_pending &= ~(1u << d.pool);
+            if (p->tr_rebuild_want && p->n_tr_rebuild < TR_CHAIN_MAX) {
+                p->tr_rebuild[p->n_tr_rebuild++] = d.tex;
+                p->tr_rebuild_tries = 0;     // progress -- reset the abort guard
+            } else {
+                mp_mutex_unlock(&p->pregrow_lock);
+                pl_tex_destroy(p->gpu, &d.tex);
+                mp_mutex_lock(&p->pregrow_lock);
+            }
+            continue;
+        }
         if (d.pool == POOL_TRANS) {
             // WP-H10: append the finished link to the transient-store chain
             // (nothing is destroyed or swapped, so no pin can defer this).
@@ -1997,6 +2054,56 @@ static void pregrow_swap_in(struct vo *vo)
     // clears/sets pg_pending under this lock).
     bool trans_pending = p->pg_pending & (1u << POOL_TRANS);
     mp_mutex_unlock(&p->pregrow_lock);
+
+    // WP-H14 (item a): drive / complete the off-thread transient-chain rebuild.
+    // trans_chain[] and tr_rebuild[] are VO-thread-owned, so the swap runs here
+    // (frame boundary, before any compose touches the pools) with only pregrow-
+    // queue accesses locked.
+    if (p->tr_rebuild_want) {
+        if (p->n_tr_rebuild >= p->tr_rebuild_want) {
+            pl_tex old[TR_CHAIN_MAX];
+            int n_old = p->n_trans_chain;
+            for (int k = 0; k < n_old; k++)
+                old[k] = p->trans_chain[k];
+            int nnew = p->tr_rebuild_want;
+            for (int k = 0; k < nnew; k++) {
+                p->trans_chain[k] = p->tr_rebuild[k];
+                p->tr_rebuild[k] = NULL;
+                p->tr_link_used_frame[k] = p->tr_frame;
+            }
+            p->n_trans_chain = nnew;
+            p->tr_prealloc_links = nnew;      // new floor (hysteresis: never retire below)
+            p->tr_want_links = MPMAX(p->tr_want_links, nnew);
+            p->n_tr_rebuild = 0;
+            p->tr_rebuild_want = 0;
+            p->tr_rebuild_tries = 0;
+            // Links are per-frame content; drop every snapshot/reuse-slot that
+            // referenced the retiring links (their t-values indexed old pixels).
+            guard_invalidate(p);
+            p->cnt_chain_rebuild++;
+            int lw = nnew ? p->trans_chain[0]->params.w : 0;
+            int lh = nnew ? p->trans_chain[0]->params.h : 0;
+            MP_VERBOSE(vo, "[pool-pregrow] transient chain REBUILT off-thread: "
+                       "%d links of %dx%d (%.1f MiB each) after an upward "
+                       "geometry crossing; %d old links retired\n",
+                       nnew, lw, lh, (double) lw * lh / (1 << 20), n_old);
+            for (int k = 0; k < n_old; k++)
+                pl_tex_destroy(p->gpu, &old[k]);
+        } else if (p->tr_rebuild_tries++ < 300) {
+            // One rebuild link in flight at a time; re-arm each frame. The abort
+            // guard (300 frames ~= no progress) frees partial links and keeps
+            // the old chain if the bigger links can't be allocated (VRAM).
+            pregrow_request(p, POOL_TRANS_REBUILD, &p->tr_rebuild_par);
+        } else {
+            MP_WARN(vo, "[pool-pregrow] transient chain rebuild aborted "
+                    "(%d/%d links after 300 frames; VRAM?); keeping the "
+                    "%d-link chain\n", p->n_tr_rebuild, p->tr_rebuild_want,
+                    p->n_trans_chain);
+            for (int k = 0; k < p->n_tr_rebuild; k++)
+                pl_tex_destroy(p->gpu, &p->tr_rebuild[k]);
+            p->n_tr_rebuild = p->tr_rebuild_want = p->tr_rebuild_tries = 0;
+        }
+    }
 
     // WP-H10: keep pumping toward the demand-estimated chain size (one link
     // is in flight at a time; each append re-arms the next request here).
@@ -3366,6 +3473,74 @@ static void tr_prealloc_chain(struct vo *vo)
                "of %dx%d (%.1f MiB each) at reconfig (>=4K + subtitle track "
                "policy)\n", p->tr_prealloc_links, par.w, par.h,
                (double) par.w * par.h / (1 << 20));
+}
+
+// WP-H14 (item a): the transient-chain link dims a FRESH reconfig at the
+// CURRENT osd_res would produce -- keyed on osd_res + the atlas-size option,
+// NOT on the (possibly latched-small) live glyph atlas. Mirrors the size math
+// in gc_ensure_atlas (auto edge) and gc_warmup (2x height at >=4K); keep in
+// sync with those two spots.
+static void tr_link_dims(struct priv *p, int *out_w, int *out_h)
+{
+    int maxd = p->gpu->limits.max_tex_2d_dim;
+    bool big = p->osd_res.w >= 3840 || p->osd_res.h >= 2160;
+    int edge = p->next_opts->sub_glyph_atlas_size;   // 0 = auto
+    if (edge <= 0)
+        edge = big ? 16384 : 8192;
+    edge = MPMIN(edge, maxd);
+    if (p->next_opts->sub_glyph_atlas_height > 0)    // WP-A3 debug cap
+        edge = MPMIN(edge, p->next_opts->sub_glyph_atlas_height);
+    *out_w = edge;
+    *out_h = big ? MPMIN(2 * edge, maxd) : edge;
+}
+
+// WP-H14 (item a): if the current geometry needs bigger transient links than
+// the live chain has (an upward crossing reached by RESIZE only -- the mpvnet
+// blocker: it first-reconfigs at 960x540, then reaches fullscreen 8K without a
+// reconfig, so gc_warmup's link size latches at 8192x8192 and the 8K wall
+// overcommits), schedule an OFF-THREAD rebuild of the whole chain at the
+// fresh-reconfig link size. VO-thread call (resize()); this allocates nothing
+// -- the pregrow worker builds the links and pregrow_swap_in installs the new
+// chain at a frame boundary (old chain retires; guard_invalidate drops stale
+// references). Downward crossings are ignored (hysteresis: keep the bigger
+// chain, per the round-6 slab-(de)alloc-contention lesson).
+static void tr_start_rebuild(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    if (!p->gpu || !p->pregrow_inited || !p->n_trans_chain || p->tr_rebuild_want)
+        return;
+    int want_w, want_h;
+    tr_link_dims(p, &want_w, &want_h);
+    pl_tex l0 = p->trans_chain[0];
+    // Rebuild only on an UPWARD link-size crossing (bigger area). Equal/smaller
+    // keeps the current chain (a shrink would only free VRAM; not worth a swap).
+    if ((int64_t) want_w * want_h <= (int64_t) l0->params.w * l0->params.h)
+        return;
+    // Target link count: the prealloc policy (>=4K + attached sub + GPU subs)
+    // wants the full chain; otherwise just re-size the links already present.
+    int want_n = p->n_trans_chain;
+    bool big = p->osd_res.w >= 3840 || p->osd_res.h >= 2160;
+    if (big && osd_has_attached_sub(vo->osd)) {
+        void *tmp = talloc_new(NULL);
+        struct mp_subtitle_opts *so =
+            mp_get_config_group(tmp, p->global, &mp_subtitle_sub_opts);
+        if (so && (so->sub_gpu_composite || so->sub_gpu_raster))
+            want_n = TR_CHAIN_MAX;
+        talloc_free(tmp);
+    }
+    p->tr_rebuild_par = l0->params;
+    p->tr_rebuild_par.w = want_w;
+    p->tr_rebuild_par.h = want_h;
+    p->tr_rebuild_par.initial_data = NULL;
+    p->tr_rebuild_par.user_data = NULL;
+    p->tr_rebuild_want = want_n;
+    p->n_tr_rebuild = 0;
+    p->tr_rebuild_tries = 0;
+    MP_VERBOSE(vo, "[pool-pregrow] transient chain rebuild scheduled: %d links "
+               "%dx%d -> %dx%d (upward crossing to osd %dx%d; off-thread)\n",
+               want_n, l0->params.w, l0->params.h, want_w, want_h,
+               p->osd_res.w, p->osd_res.h);
+    pregrow_request(p, POOL_TRANS_REBUILD, &p->tr_rebuild_par);
 }
 
 // A pending glyph-atlas upload (non-outline cache miss): the glyph's slot and
@@ -6505,6 +6680,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // appends/retires + the current chain length as a gauge.
     emit_counter(vo, "trans-link-append",         p->cnt_trans_link_append,   &p->stat_trans_link_append);
     emit_counter(vo, "trans-link-retire",         p->cnt_trans_link_retire,   &p->stat_trans_link_retire);
+    emit_counter(vo, "chain-rebuild",             p->cnt_chain_rebuild,       &p->stat_chain_rebuild);
     emit_counter(vo, "trans-links",               p->n_trans_chain,           &p->stat_trans_links);
     emit_counter(vo, "trans-prealloc-links",      p->tr_prealloc_links,       &p->stat_trans_prealloc_links);
     emit_counter(vo, "trans-want-uncapped",       p->tr_want_uncapped,        &p->stat_trans_want_uncapped);
@@ -6638,6 +6814,24 @@ static void resize(struct vo *vo)
     // WP-E3: geometry changed; a pre-resize overlay snapshot must not be
     // presented (the res equality check in the bail path is the backstop).
     guard_invalidate(p);
+#if HAVE_ASS_COMPOSITE_DEFERRED
+    // WP-H14 (item a): a window resize is the ONLY geometry signal that reaches
+    // this VO without a reconfig (mpvnet: 960x540 logo reconfig, then fullscreen
+    // 8K by resize only). Once the initial warm-up has latched sizings, re-
+    // evaluate every reconfig-time sizing that would otherwise stay latched at
+    // the first-reconfig geometry. The pool re-floors are monotonic (MPMAX) and
+    // one-time (a resize is a UI action, not steady state) so they run inline,
+    // exactly as reconfig() does them; the transient chain -- 512 MiB per link
+    // at 8K -- must not allocate on the VO thread, so it rebuilds OFF-thread and
+    // swaps in at a frame boundary. (Before gc_warmed the reconfig() body does
+    // the initial sizing; skip to avoid pre-warm-order churn.)
+    if (p->gc_warmed) {
+        ensure_overlay_pool(p);    // #7 overlay tex/buf floors (audit table)
+        gc_prealloc_pools(p);      // #4-#6 result_tex / run / work-edge floors
+        tr_prealloc_chain(vo);     // #3 prealloc count (link size fixed by rebuild)
+        tr_start_rebuild(vo);      // #2 link size: off-thread whole-chain rebuild
+    }
+#endif
 }
 
 // WP-H6 (item 5): cold-start video-pipeline pre-warm. The FIRST real frame of
@@ -7520,6 +7714,7 @@ static int preinit(struct vo *vo)
     p->stat_result_spill = -1;
     p->stat_trans_link_append = -1;
     p->stat_trans_link_retire = -1;
+    p->stat_chain_rebuild = -1;
     p->stat_trans_links = -1;
     p->stat_trans_prealloc_links = -1;
     p->stat_trans_want_uncapped = -1;
