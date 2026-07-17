@@ -225,6 +225,10 @@ void osd_set_text(struct osd_state *osd, const char *text)
         osd_obj->text = talloc_strdup(osd_obj, text);
         osd_obj->osd_changed = true;
         osd->want_redraw_notification = true;
+        // WP-H14b (item b): kick the async worker HERE (content-origin thread),
+        // not on the VO serve path -- keeps the VO-thread OSD serve free of any
+        // per-change work (the r7 statspage over->drop conversion).
+        osd_object_request_render(osd, osd_obj);
     }
     mp_mutex_unlock(&osd->lock);
 }
@@ -317,6 +321,9 @@ void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
     }
     osd_obj->osd_changed = true;
     osd->want_redraw_notification = true;
+    // WP-H14b (item b): progress-bar change -> worker request on this
+    // (content-origin) thread; the VO serve stays per-change-work-free.
+    osd_object_request_render(osd, osd_obj);
     mp_mutex_unlock(&osd->lock);
 }
 
@@ -630,6 +637,9 @@ void osd_changed(struct osd_state *osd)
     osd->want_redraw_notification = true;
     // Done here for a lack of a better place.
     m_config_cache_update(osd->opts_cache);
+    // WP-H14b (item b): style/content change -> worker request on this
+    // (caller) thread; keeps the VO serve free of per-change work.
+    osd_object_request_render(osd, osd->objs[OSDTYPE_OSD]);
     mp_mutex_unlock(&osd->lock);
 }
 
