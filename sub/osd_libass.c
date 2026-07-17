@@ -308,12 +308,18 @@ static void update_osd_text(struct osd_state *osd, struct osd_object *obj)
 
 void osd_get_text_size(struct osd_state *osd, int *out_screen_h, int *out_font_h)
 {
+    // WP-H12 (sub-C): obj->ass is rendered by the async worker now (ext_lock
+    // domain in its phase 2); take ext_lock first so this caller-thread
+    // track/style mutation can't race a worker render. LOCK ORDER: ext_lock
+    // before osd->lock, always.
+    mp_mutex_lock(&osd->ext_lock);
     mp_mutex_lock(&osd->lock);
     struct osd_object *obj = osd->objs[OSDTYPE_OSD];
     ASS_Style *style = prepare_osd_ass(osd, obj);
     *out_screen_h = obj->ass.track->PlayResY - style->MarginV;
     *out_font_h = style->FontSize;
     mp_mutex_unlock(&osd->lock);
+    mp_mutex_unlock(&osd->ext_lock);
 }
 
 // align: -1 .. +1
@@ -577,6 +583,12 @@ static int cmp_zorder(const void *pa, const void *pb)
 // THE VO THREAD: opening the 8K stats page was a 50+ ms layout inside the
 // frame (a guaranteed dropped frame), and every periodic page update put the
 // re-shape + repack on frames that at 8K have no headroom left.
+// WP-H12 (sub-C): OSDTYPE_OSD (osd_message + progress bar) renders here too.
+// The default stats page is ONE big mp.osd_message event re-rendered at 1 Hz;
+// synchronously that is a ~42 ms layout per refresh at 8K = the field-reported
+// 1-drop-per-second signature, previously only avoidable by opting into
+// stats-persistent_overlay=yes (the OSDTYPE_EXTERNAL path). Same worker, same
+// serve-latest-snapshot semantics (rig-proven 0 drops), no opt-in.
 // Runs with ext_lock held, osd->lock NOT held (taken briefly inside).
 static void ext_render_pass(struct osd_state *osd, struct osd_object *obj,
                             struct mp_osd_res res, int format, int64_t gen)
@@ -584,10 +596,17 @@ static void ext_render_pass(struct osd_state *osd, struct osd_object *obj,
     stats_time_start(osd->stats_ext, "osd-ext-worker");
 
     // Phase 1: re-parse changed tracks. Needs osd->lock (reads osd->opts for
-    // styles); parsing is small (string -> events), the EXPENSIVE phase below
-    // runs without osd->lock so neither the VO serve nor script threads block
-    // behind a render.
+    // styles and, for OSDTYPE_OSD, obj->text/progbar_state); parsing is small
+    // (string -> events), the EXPENSIVE phase below runs without osd->lock so
+    // neither the VO serve nor script threads block behind a render.
     mp_mutex_lock(&osd->lock);
+    if (obj->type == OSDTYPE_OSD) {
+        if (obj->osd_track_dirty) {
+            update_osd(osd, obj);
+            obj->osd_track_dirty = false;
+            obj->changed = true;
+        }
+    }
     for (int n = 0; n < obj->num_externals; n++) {
         struct osd_external *ext = obj->externals[n];
         if (ext->dirty) {
@@ -646,13 +665,24 @@ static MP_THREAD_VOID ext_worker_fn(void *arg)
     mp_thread_set_name("osd/ext");
     mp_mutex_lock(&osd->lock);
     while (!osd->ext_exit) {
-        struct osd_object *obj = osd->objs[OSDTYPE_EXTERNAL];
-        bool res_ok = osd_res_equals(obj->ext_done_res, obj->ext_want_res) &&
-                      obj->ext_done_format == obj->ext_want_format;
-        bool want = obj->ext_want_res.w > 0 && obj->ext_want_res.h > 0 &&
-                    obj->ext_want_format &&
-                    (obj->ext_req_gen != obj->ext_done_gen || !res_ok);
-        if (!want) {
+        // WP-H12 (sub-C): the worker serves both async objects; pick any one
+        // whose request generation or geometry moved on (a fresh request on
+        // the other lands on the next loop iteration).
+        static const int types[] = {OSDTYPE_EXTERNAL, OSDTYPE_OSD};
+        struct osd_object *obj = NULL;
+        for (int i = 0; i < MP_ARRAY_SIZE(types); i++) {
+            struct osd_object *o = osd->objs[types[i]];
+            bool res_ok = osd_res_equals(o->ext_done_res, o->ext_want_res) &&
+                          o->ext_done_format == o->ext_want_format;
+            bool want = o->ext_want_res.w > 0 && o->ext_want_res.h > 0 &&
+                        o->ext_want_format &&
+                        (o->ext_req_gen != o->ext_done_gen || !res_ok);
+            if (want) {
+                obj = o;
+                break;
+            }
+        }
+        if (!obj) {
             mp_cond_wait(&osd->ext_wakeup, &osd->lock);
             continue;
         }
@@ -692,6 +722,44 @@ struct sub_bitmaps *osd_external_render_async(struct osd_state *osd,
                                               int format)
 {
     if (!obj->num_externals && !obj->ext_done && !obj->ext_done_gen)
+        return NULL;    // never had content: don't wake anything
+    obj->ext_want_res = res;
+    obj->ext_want_format = format;
+    bool res_ok = osd_res_equals(obj->ext_done_res, res) &&
+                  obj->ext_done_format == format;
+    if (obj->ext_req_gen != obj->ext_done_gen || !res_ok) {
+        ext_worker_start(osd);
+        mp_cond_signal(&osd->ext_wakeup);
+    }
+    if (!res_ok || !obj->ext_done || !obj->ext_done->num_parts)
+        return NULL;
+    struct sub_bitmaps *out = sub_bitmaps_copy(&obj->serve_cache,
+                                               obj->ext_done);
+    if (out)
+        out->change_id = 0;   // accounted once at publish time
+    return out;
+}
+
+// WP-H12 (sub-C): under osd->lock. Non-blocking OSDTYPE_OSD serve -- the
+// osd_message/progress-bar object (the default stats page path) renders on
+// the shared worker exactly like OSDTYPE_EXTERNAL; the VO gets the last
+// completed snapshot (at most one update stale -- the same semantics the
+// rig-proven stats-persistent_overlay path has, now without the opt-in).
+struct sub_bitmaps *osd_object_render_async(struct osd_state *osd,
+                                            struct osd_object *obj,
+                                            struct mp_osd_res res,
+                                            int format)
+{
+    if (obj->osd_changed) {
+        // Transfer the change into a render request: the worker rebuilds the
+        // track from text/progbar (osd_track_dirty, its phase 1) and
+        // re-renders. osd_changed itself is consumed here so a later
+        // unchanged serve doesn't re-request.
+        obj->osd_changed = false;
+        obj->osd_track_dirty = true;
+        obj->ext_req_gen += 1;
+    }
+    if (!obj->ext_req_gen && !obj->ext_done)
         return NULL;    // never had content: don't wake anything
     obj->ext_want_res = res;
     obj->ext_want_format = format;

@@ -34,6 +34,15 @@ struct osd_object {
 
     // OSDTYPE_OSD
     bool osd_changed;
+    // WP-H12 (sub-C): OSDTYPE_OSD renders on the SAME async worker as
+    // OSDTYPE_EXTERNAL now. The default stats page is mp.osd_message = this
+    // object, re-rendered synchronously at 1 Hz on the VO thread before this
+    // -- a ~42 ms layout per refresh at 8K = the user's 1-drop-per-second
+    // signature, previously only avoidable via the stats-persistent_overlay
+    // opt-in. osd_track_dirty asks the worker's phase 1 to re-run update_osd
+    // (track rebuild from text/progbar under osd->lock); the shared ext_*
+    // fields below carry the request/serve state for both objects.
+    bool osd_track_dirty;
     char *text;
     struct osd_progbar_state progbar_state;
 
@@ -51,6 +60,8 @@ struct osd_object {
     // budget. A dedicated worker (osd_libass.c) now owns ALL libass work for
     // this object; the VO is served the last completed snapshot (at most one
     // update stale -- invisible for OSD) under osd->lock only.
+    // WP-H12 (sub-C): OSDTYPE_OSD uses the same fields/worker (see
+    // osd_track_dirty above).
     //   osd->lock domain:
     int64_t ext_req_gen;              // bumped on every content change
     int64_t ext_done_gen;             // generation the snapshot was built from
@@ -146,6 +157,12 @@ struct sub_bitmaps *osd_external_render_async(struct osd_state *osd,
                                               struct osd_object *obj,
                                               struct mp_osd_res res,
                                               int format);
+// WP-H12 (sub-C): same non-blocking serve for OSDTYPE_OSD (osd_message +
+// progress bar; the default stats page path). Called under osd->lock.
+struct sub_bitmaps *osd_object_render_async(struct osd_state *osd,
+                                            struct osd_object *obj,
+                                            struct mp_osd_res res,
+                                            int format);
 void osd_destroy_backend(struct osd_state *osd);
 
 #endif
