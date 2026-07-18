@@ -590,6 +590,17 @@ struct priv {
     struct pregrow_done { int pool; pl_tex tex; } pg_done[POOL_SLOTS];
     int num_pg_done;
     uint32_t pg_pending;                     // bit per pool: in flight or unswapped
+    // WP-H18: worker-private dispatch used ONLY by pregrow_thread_fn to
+    // first-touch (make fully resident + pay driver first-commit) each freshly
+    // created transient-store link OFF the VO thread, so pregrow_swap_in is a
+    // pointer flip with no VO-thread first-use residency stall (the round-9
+    // regression: the H16 off-thread ALLOCATION was free, but the swapped-in
+    // link's first GPU USE on the VO thread paid ~300 ms of 4 GiB first-commit,
+    // contending with the TensorRT startup load). Created on the VO thread in
+    // pregrow_init BEFORE the worker starts, used only on the worker, destroyed
+    // in pregrow_uninit AFTER the worker joins -- never concurrently accessed.
+    pl_dispatch pregrow_dp;
+    int pg_prewarm_done;                     // worker->VO handoff (under pregrow_lock)
 
     // WP-H14 (item a): off-thread transient-chain rebuild for a late upward
     // geometry crossing. mpvnet first-reconfigs at its 960x540 logo, video-
@@ -608,6 +619,19 @@ struct priv {
     int tr_rebuild_want;                     // target link count (0 = idle)
     int tr_rebuild_tries;                    // frames requested w/o progress (abort guard)
     struct pl_tex_params tr_rebuild_par;     // params for each rebuild link
+    // WP-H16: last osd_sub_track_epoch() the VO acted on. A sub track that
+    // attaches AFTER the geometry already crossed to >=4K by resize (mpvnet's
+    // order: 960x540 logo reconfig -> fullscreen 8K by resize with no sub, then
+    // the sub attaches at steady 8K) is never seen by the resize-time prealloc
+    // (osd_has_attached_sub() was false then, and no later resize re-runs it).
+    // draw_frame watches this epoch and kicks the off-thread full-chain prealloc
+    // (tr_start_rebuild) when it advances under a policy-qualifying geometry.
+    uint64_t tr_last_sub_epoch;
+    // WP-H18: VO-thread rebuild-swap wall time (max, microseconds). The swap in
+    // pregrow_swap_in is a pointer flip (old links already retired, new links
+    // already resident via the worker first-touch): this gauge proves it stays
+    // flat, i.e. no GPU first-use lands on the VO thread at the swap.
+    int64_t tr_swapin_us_max, stat_tr_swapin_us_max;
 
     // GPU glyph rasterizer (SUBBITMAP_LIBASS_OUTLINES): cache misses are
     // rasterized into glyph_atlas from libass's tile-export blobs instead of
@@ -742,6 +766,7 @@ struct priv {
     int64_t cnt_trans_link_append, stat_trans_link_append;
     int64_t cnt_trans_link_retire, stat_trans_link_retire;
     int64_t cnt_chain_rebuild, stat_chain_rebuild;  // WP-H14 (a): off-thread rebuilds
+    int64_t cnt_tr_prewarm, stat_tr_prewarm;        // WP-H18: links first-touched off-thread
     // WP-H14b (item c2): a store-eligible all-spill compose that was let run to
     // completion (guard disabled mid-compose) so it STORES the reuse slot on the
     // wall-entry frame -- collapsing the documented two-build entry into one.
@@ -1435,6 +1460,53 @@ static void osd_clear(struct priv *p, pl_tex acc, int rw, int rh)
         pl_dispatch_abort(p->osd_dp, &sh);
 }
 
+// WP-H18: first-touch a freshly created transient-store link -- force the driver
+// to make the whole allocation (512 MiB per link at 8K) resident and pay the
+// first-commit NOW, on the CALLER's thread via the CALLER's dispatch `dp`, so
+// the later VO-thread compose into it does no first-use residency work. The
+// touch is a full-extent imageStore(0) compute pass -- the SAME access class the
+// real compose uses (osd_copy/osd_clear write the link as a WRITEONLY storage
+// image), so the residency the driver commits here is exactly what the VO thread
+// would otherwise pay on first use. This is the fix for the round-9 regression:
+// H16 moved the ALLOCATION off the VO thread but the swapped-in link's first GPU
+// USE still stalled the VO thread ~300 ms first-committing the 4 GiB chain under
+// the mpvnet+TensorRT live-startup load. pl_gpu_flush submits the pass so the
+// CPU-side first-commit is paid at submit HERE (on the worker for the late-attach
+// rebuild; inline pre-playback for the mpv.exe warm-up prealloc); the GPU clear
+// runs async and finishes long before any compose, so the worker adds no per-link
+// latency to the seek-into-wall append path. Only storage-image links (the >=4K
+// GPU-subs chain, r8 storable) are touched -- other pools swap on the VO thread
+// already and are not storage-writable here. Returns true if a touch was issued.
+static bool pregrow_first_touch(struct priv *p, pl_dispatch dp, pl_tex tex)
+{
+    if (!dp || !tex || !tex->params.storable)
+        return false;
+    int rw = tex->params.w, rh = tex->params.h;
+    pl_shader sh = pl_dispatch_begin(dp);
+    struct pl_shader_desc descs[] = {
+        { .desc = { .name="acc", .type=PL_DESC_STORAGE_IMG, .binding=0,
+                    .access=PL_DESC_ACCESS_WRITEONLY }, .binding = { .object=tex } },
+    };
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_int("rw"), .data=&rw }, { .var = pl_var_int("rh"), .data=&rh },
+    };
+    struct pl_custom_shader cs = {
+        .compute = true, .compute_group_size = {16, 16},
+        .descriptors = descs, .num_descriptors = 1,
+        .variables = vars, .num_variables = 2, .body = osd_clear_body,
+    };
+    bool ok = false;
+    if (pl_shader_custom(sh, &cs)) {
+        ok = pl_dispatch_compute(dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { (rw+15)/16, (rh+15)/16, 1 }));
+    } else {
+        pl_dispatch_abort(dp, &sh);
+    }
+    if (ok)
+        pl_gpu_flush(p->gpu);   // pay the CPU-side first-commit/residency at submit
+    return ok;
+}
+
 static bool gc_ensure(pl_gpu gpu, pl_tex *t, pl_fmt fmt, int w, int h,
                       bool storable, bool sampleable, bool blit_src,
                       bool blit_dst, bool host_writable)
@@ -1708,7 +1780,24 @@ static MP_THREAD_VOID pregrow_thread_fn(void *arg)
                 p->num_pg_req * sizeof(p->pg_req[0]));
         mp_mutex_unlock(&p->pregrow_lock);
         pl_tex tex = pl_tex_create(p->gpu, &job.par);
+        // WP-H18: first-touch the transient-store chain links off the VO thread
+        // (the >=4K GPU-subs chain: POOL_TRANS single-link appends and the whole-
+        // chain POOL_TRANS_REBUILD), so the driver first-commit/residency is paid
+        // HERE, on the worker, not on the VO thread's first compose after
+        // pregrow_swap_in (the round-9 ~300 ms mpvnet-startup stall). Off the
+        // lock (it is a GPU pass + submit); worker-private dispatch.
+        bool touched = false;
+        if (tex && (job.pool == POOL_TRANS || job.pool == POOL_TRANS_REBUILD)) {
+            touched = pregrow_first_touch(p, p->pregrow_dp, tex);
+            if (touched)
+                MP_VERBOSE(p, "[pool-pregrow] %s link first-touched off-thread "
+                           "(%dx%d, %.1f MiB resident) before swap-in\n",
+                           pool_name(job.pool), tex->params.w, tex->params.h,
+                           (double) tex->params.w * tex->params.h / (1 << 20));
+        }
         mp_mutex_lock(&p->pregrow_lock);
+        if (touched)
+            p->pg_prewarm_done++;             // drained under the lock in swap_in
         if (tex && p->num_pg_done < POOL_SLOTS) {
             p->pg_done[p->num_pg_done++] =
                 (struct pregrow_done){ job.pool, tex };
@@ -1745,6 +1834,12 @@ static void pregrow_init(struct priv *p)
     // covers pl_tex_create/pl_tex_destroy from a non-VO thread. Fallback for
     // a non-thread-safe backend: create inline at the watermark (early,
     // while the current size still suffices -- see pregrow_request).
+    // WP-H18: worker-private dispatch for off-thread link first-touch. Created
+    // here on the VO thread BEFORE the worker starts (thread creation is a
+    // happens-before edge, so the worker sees it fully constructed) and used
+    // ONLY on the worker thereafter -- never concurrently with the VO thread.
+    if (p->gpu->limits.thread_safe)
+        p->pregrow_dp = pl_dispatch_create(p->pllog, p->gpu);
     p->pregrow_threaded = p->gpu->limits.thread_safe &&
         mp_thread_create(&p->pregrow_thread, pregrow_thread_fn, p) == 0;
     p->pregrow_inited = true;
@@ -1761,6 +1856,8 @@ static void pregrow_uninit(struct priv *p)
         mp_mutex_unlock(&p->pregrow_lock);
         mp_thread_join(p->pregrow_thread);
     }
+    // WP-H18: worker has joined (or never ran) -- safe to destroy its dispatch.
+    pl_dispatch_destroy(&p->pregrow_dp);
     for (int i = 0; i < p->num_pg_done; i++)
         pl_tex_destroy(p->gpu, &p->pg_done[i].tex);
     p->num_pg_done = 0;
@@ -1983,6 +2080,12 @@ static void pregrow_swap_in(struct vo *vo)
         return;
     p->tr_frame++;                          // WP-H10: frame counter (retire age)
     mp_mutex_lock(&p->pregrow_lock);
+    // WP-H18: fold the worker's off-thread first-touch tally into the VO-owned
+    // counter (both sides touch pg_prewarm_done only under this lock).
+    if (p->pg_prewarm_done) {
+        p->cnt_tr_prewarm += p->pg_prewarm_done;
+        p->pg_prewarm_done = 0;
+    }
     for (int i = p->num_pg_done - 1; i >= 0; i--) {
         struct pregrow_done d = p->pg_done[i];
         if (d.pool == POOL_TRANS_REBUILD) {
@@ -2067,6 +2170,12 @@ static void pregrow_swap_in(struct vo *vo)
     // queue accesses locked.
     if (p->tr_rebuild_want) {
         if (p->n_tr_rebuild >= p->tr_rebuild_want) {
+            // WP-H18: time the VO-thread swap. It must be a pointer flip -- the
+            // new links are already RESIDENT (worker first-touched them) and the
+            // old links are just queued for a deferred destroy -- with no GPU
+            // first-use here (that was the round-9 ~300 ms stall). This gauge
+            // (trans-swapin-us-max) proves the swap stays flat.
+            int64_t swap_t0 = mp_time_ns();
             pl_tex old[TR_CHAIN_MAX];
             int n_old = p->n_trans_chain;
             for (int k = 0; k < n_old; k++)
@@ -2089,12 +2198,25 @@ static void pregrow_swap_in(struct vo *vo)
             p->cnt_chain_rebuild++;
             int lw = nnew ? p->trans_chain[0]->params.w : 0;
             int lh = nnew ? p->trans_chain[0]->params.h : 0;
+            // WP-H16: report the actual reason -- an upward SIZE crossing (WP-H14)
+            // keeps the count and grows link area; a late-sub-attach COUNT grow
+            // keeps the size and adds links. Inferred from old vs new link0 dims.
+            bool was_size = n_old && old[0] &&
+                            ((int64_t) old[0]->params.w * old[0]->params.h <
+                             (int64_t) lw * lh);
             MP_VERBOSE(vo, "[pool-pregrow] transient chain REBUILT off-thread: "
-                       "%d links of %dx%d (%.1f MiB each) after an upward "
-                       "geometry crossing; %d old links retired\n",
-                       nnew, lw, lh, (double) lw * lh / (1 << 20), n_old);
+                       "%d links of %dx%d (%.1f MiB each) after %s; %d old links "
+                       "retired\n", nnew, lw, lh, (double) lw * lh / (1 << 20),
+                       was_size ? "an upward size crossing"
+                                : "a late-sub-attach count grow", n_old);
             for (int k = 0; k < n_old; k++)
                 pl_tex_destroy(p->gpu, &old[k]);
+            int64_t swap_us = (mp_time_ns() - swap_t0) / 1000;
+            if (swap_us > p->tr_swapin_us_max)
+                p->tr_swapin_us_max = swap_us;
+            MP_VERBOSE(vo, "[pool-pregrow] chain swap-in took %lld us on the VO "
+                       "thread (pointer flip; %d links already resident via the "
+                       "off-thread first-touch)\n", (long long) swap_us, nnew);
         } else if (p->tr_rebuild_tries++ < 300) {
             // One rebuild link in flight at a time; re-arm each frame. The abort
             // guard (300 frames ~= no progress) frees partial links and keeps
@@ -3484,6 +3606,15 @@ static void tr_prealloc_chain(struct vo *vo)
         p->trans_chain[k] = tex;
         p->n_tr_good[k] = p->n_tr_build[k] = 0;
         p->tr_link_used_frame[k] = p->tr_frame;
+        // WP-H18 (uniform path): first-touch the link on the VO thread's own
+        // dispatch here too. This warm-up prealloc runs pre-playback (reconfig
+        // at final geometry WITH the sub -- mpv.exe's order), so the residency
+        // cost is free (before first-frame presentation); routing it through the
+        // SAME first-touch helper keeps a single code path -- mpv.exe no longer
+        // relies on lazy first-compose residency while the late-attach path
+        // (worker) pre-warms explicitly.
+        if (pregrow_first_touch(p, p->osd_dp, tex))
+            p->cnt_tr_prewarm++;
     }
     p->tr_prealloc_links = p->n_trans_chain;
     p->tr_want_links = MPMAX(p->tr_want_links, p->n_trans_chain);
@@ -3530,10 +3661,10 @@ static void tr_start_rebuild(struct vo *vo)
     int want_w, want_h;
     tr_link_dims(p, &want_w, &want_h);
     pl_tex l0 = p->trans_chain[0];
-    // Rebuild only on an UPWARD link-size crossing (bigger area). Equal/smaller
-    // keeps the current chain (a shrink would only free VRAM; not worth a swap).
-    if ((int64_t) want_w * want_h <= (int64_t) l0->params.w * l0->params.h)
-        return;
+    // An UPWARD link-size crossing (bigger area) -- the WP-H14 case: geometry
+    // reached >=4K by resize only, so the links latched small and must grow.
+    bool size_up =
+        (int64_t) want_w * want_h > (int64_t) l0->params.w * l0->params.h;
     // Target link count: the prealloc policy (>=4K + attached sub + GPU subs)
     // wants the full chain; otherwise just re-size the links already present.
     int want_n = p->n_trans_chain;
@@ -3546,6 +3677,20 @@ static void tr_start_rebuild(struct vo *vo)
             want_n = TR_CHAIN_MAX;
         talloc_free(tmp);
     }
+    // WP-H16: rebuild on EITHER an upward size crossing (WP-H14) OR a link-COUNT
+    // deficit under the policy with no size change to carry it (the late-sub-
+    // attach order): the geometry crossed to >=4K while no sub was attached, so
+    // the resize-time prealloc early-returned and this rebuild fell back to
+    // want_n=n_trans_chain=1; the sub then attached at steady 8K and no further
+    // resize re-runs the prealloc, leaving the dense wall to append links on the
+    // VO thread at entry. A count-only grow keeps the current (already-correct)
+    // link size -- never shrink (hysteresis) -- and just adds links off-thread.
+    if (!size_up && want_n <= p->n_trans_chain)
+        return;
+    if (!size_up) {
+        want_w = l0->params.w;
+        want_h = l0->params.h;
+    }
     p->tr_rebuild_par = l0->params;
     p->tr_rebuild_par.w = want_w;
     p->tr_rebuild_par.h = want_h;
@@ -3554,9 +3699,11 @@ static void tr_start_rebuild(struct vo *vo)
     p->tr_rebuild_want = want_n;
     p->n_tr_rebuild = 0;
     p->tr_rebuild_tries = 0;
-    MP_VERBOSE(vo, "[pool-pregrow] transient chain rebuild scheduled: %d links "
-               "%dx%d -> %dx%d (upward crossing to osd %dx%d; off-thread)\n",
-               want_n, l0->params.w, l0->params.h, want_w, want_h,
+    MP_VERBOSE(vo, "[pool-pregrow] transient chain rebuild scheduled: %d -> %d "
+               "links %dx%d -> %dx%d (%s to osd %dx%d; off-thread)\n",
+               p->n_trans_chain, want_n, l0->params.w, l0->params.h,
+               want_w, want_h, size_up ? "upward size crossing"
+                                       : "late-sub-attach count grow",
                p->osd_res.w, p->osd_res.h);
     pregrow_request(p, POOL_TRANS_REBUILD, &p->tr_rebuild_par);
 }
@@ -6566,6 +6713,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // boundary, before the overlay build touches them.
     pregrow_swap_in(vo);
 #if HAVE_ASS_COMPOSITE_DEFERRED
+    // WP-H16: a subtitle track can attach AFTER the geometry already crossed to
+    // >=4K by resize (mpvnet's order: 960x540 logo reconfig -> fullscreen 8K by
+    // resize with no sub attached, then the sub attaches at steady 8K). The
+    // resize-time tr_prealloc_chain/tr_start_rebuild both saw
+    // osd_has_attached_sub()==false and left the chain at one link; no later
+    // resize ever re-runs them, so the dense ep09 wall then appends links on the
+    // VO thread at entry. Re-run the full-chain prealloc when the sub-track epoch
+    // advances while a policy-qualifying geometry is already active. Off the VO
+    // thread (tr_start_rebuild schedules the pregrow/rebuild worker, whose links
+    // are now ALSO first-touched off-thread -- WP-H18 -- so the frame-boundary
+    // swap and its first compose cost nothing on the VO thread; guard_invalidate,
+    // hysteresis, chain-rebuild counter). pregrow_swap_in above has already
+    // applied any completed rebuild, so a still-pending one short-circuits on
+    // tr_rebuild_want.
+    //
+    // Only CONSUME the epoch once nothing is pending afterward: if the sub
+    // attaches while the WP-H14 size-crossing rebuild is still in flight,
+    // tr_start_rebuild no-ops on tr_rebuild_want, so we must keep re-evaluating
+    // on later frames (after that rebuild completes) until the chain actually
+    // reaches the policy floor -- otherwise a one-shot latch would strand it at
+    // one link. Once at the floor (or the geometry/opts do not qualify)
+    // tr_start_rebuild leaves tr_rebuild_want==0 and the epoch is done.
+    uint64_t sub_epoch_now = osd_sub_track_epoch(vo->osd);
+    if (sub_epoch_now != p->tr_last_sub_epoch && p->gc_warmed) {
+        tr_start_rebuild(vo);
+        if (!p->tr_rebuild_want)
+            p->tr_last_sub_epoch = sub_epoch_now;
+    }
     // WP-H10: post-seek transient-demand probe (no-op unless VOCTRL_RESET
     // armed it) -- runs before the overlay build so a link request overlaps
     // this frame's work instead of trailing it.
@@ -6764,6 +6939,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "trans-link-append",         p->cnt_trans_link_append,   &p->stat_trans_link_append);
     emit_counter(vo, "trans-link-retire",         p->cnt_trans_link_retire,   &p->stat_trans_link_retire);
     emit_counter(vo, "chain-rebuild",             p->cnt_chain_rebuild,       &p->stat_chain_rebuild);
+    // WP-H18: links first-touched (made resident) off-thread before swap-in, and
+    // the max VO-thread chain-swap wall time (us) -- the pointer-flip proof.
+    emit_counter(vo, "tr-prewarm",                p->cnt_tr_prewarm,          &p->stat_tr_prewarm);
+    emit_counter(vo, "trans-swapin-us-max",       p->tr_swapin_us_max,        &p->stat_tr_swapin_us_max);
     emit_counter(vo, "entry-mustcomplete",        p->cnt_entry_mustcomplete,  &p->stat_entry_mustcomplete);
     emit_counter(vo, "trans-links",               p->n_trans_chain,           &p->stat_trans_links);
     emit_counter(vo, "trans-prealloc-links",      p->tr_prealloc_links,       &p->stat_trans_prealloc_links);
@@ -7068,6 +7247,12 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     // resize onto a >=4K display or a track attach reaches it here, still at
     // a reconfig boundary, never mid-frame).
     tr_prealloc_chain(vo);
+    // WP-H16: baseline the sub-track epoch to reconfig time. tr_prealloc_chain
+    // above already covers a sub attached AS OF this reconfig; the draw_frame
+    // watcher only needs to catch an attach that lands LATER (mpvnet's order),
+    // so re-baselining here keeps the common case (attached at reconfig) from
+    // firing a redundant rebuild on the first frame.
+    p->tr_last_sub_epoch = osd_sub_track_epoch(vo->osd);
 #endif
     // WP-H6 (item 5): compile the video pipeline NOW, before playback, so the
     // first real frame's render-submit doesn't pay the driver JIT.
