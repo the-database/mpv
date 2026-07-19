@@ -4164,6 +4164,44 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 
     if (!nregs) { talloc_free(tmp); return true; }   // no deferred runs in this item
 
+    // WP-J1: narrow each region's coverage bbox to its rectangular \clip.
+    // The clip is applied at emission as a pure dst-space crop (the vr[] rects
+    // below), so coverage outside it is provably never sampled -- but the bbox
+    // above is built from the parts alone, so a run that draws a huge shape and
+    // shows only a thin \clip band still allocated, rasterized and uploaded the
+    // WHOLE shape. The gradient-band idiom multiplies that by the band count:
+    // one big \p drawing repeated N times, each \clip'ed to a different 16px
+    // strip in its own colour to fake a vertical gradient (Kobayashi S ep02
+    // 18:36.56 = 70 bands x a full-frame drawing). At 8K that is ~1.25 Gpx of
+    // transient demand per frame -- 26 chain links wanted against
+    // TR_CHAIN_MAX=8 -- so gc_trans_place failed on the excess, those
+    // region-layers were dropped (t = -1, gcache-overcommit), and since which
+    // ones lost the race depends on per-frame chain/shelf state, a DIFFERENT
+    // subset vanished every frame: the reported "messed up, flashing and
+    // flickering" sign. Clamping is exact, not an approximation: `margin`
+    // (blur halo + \be) is kept around the clamped box, and every emitted
+    // pixel lies at or inside the clip rect, hence >= margin from the
+    // accumulator edge, so its blur/\be support is still fully covered.
+    // Inverse rect clips keep the full bbox (their visible area is OUTSIDE the
+    // rect); non-outline items carry no rect and never reach here (their parts
+    // have glyph_id == 0 and were skipped above). Runs with no \clip carry the
+    // full frame (ass_render.c:1235), so this is a no-op for them.
+    if (is_outline) {
+        for (int i = 0; i < nregs; i++) {
+            struct gc_region *r = &regs[i];
+            if (r->run_flags & RUN_FLAG_RECT_INVERSE)
+                continue;
+            r->x0 = MPMAX(r->x0, r->rcx0);
+            r->y0 = MPMAX(r->y0, r->rcy0);
+            r->x1 = MPMIN(r->x1, r->rcx1);
+            r->y1 = MPMIN(r->y1, r->rcy1);
+            // Empty intersection: the emission crop below drops it anyway; keep
+            // the box degenerate-but-valid so the allocator sees ~zero demand.
+            r->x1 = MPMAX(r->x1, r->x0);
+            r->y1 = MPMAX(r->y1, r->y0);
+        }
+    }
+
     // Emission order FIRST (libass's exact z-order; see the comment at the
     // emission loop below), because WP-H6 (item 1) allocates result-atlas
     // space in THIS order: when the shelf runs out of pre-allocated capacity,
