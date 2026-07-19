@@ -761,6 +761,8 @@ struct priv {
     // glyph_id key missed (animated text with fresh ids but unchanged
     // outlines skips re-raster/re-upload). Info.
     int64_t cnt_blob_hash_hit, stat_blob_hash_hit;
+    // WP-J2: region-layers that reused another region's composed coverage.
+    int64_t cnt_cov_share, stat_cov_share;
     // WP-H6 (item 6): deferred items served from the per-entry compose reuse
     // (identical change_id/geometry) without re-running the compose. Info.
     int64_t cnt_compose_reuse, stat_compose_reuse;
@@ -2639,6 +2641,9 @@ struct gc_region {
     int wipe_x;                  // \kf wipe boundary (render x); used iff KF_WIPE
     int be_f, be_b;              // \be [1,2,1]/4 box iterations per layer
     int shift_x, shift_y;        // shadow-run sub-pixel offset, 1/64 px (0..63)
+    // WP-J2: index of the region whose composed coverage this one reuses
+    // (== its own index for a leader; only leaders allocate and compose).
+    int share;
 };
 
 // WP-H5b: above this bbox-area x glyph-count product a run uses the per-glyph
@@ -3880,6 +3885,110 @@ static void emit_composed_overlays(struct priv *p, const struct sub_bitmaps *ite
     }
 }
 
+#if HAVE_ASS_OUTLINE_DEFERRED
+// --- WP-J2: composed-coverage sharing ------------------------------------
+// The gradient-band idiom draws ONE outline many times over, each copy
+// \clip'ed to a different thin strip and given its own colour to fake a
+// gradient (Kobayashi S ep02 18:36 = ~70 bands over one full-frame \p
+// drawing). WP-J1 stopped that from overflowing the transient chain by
+// clamping each band's coverage bbox to its clip, but every band still ran
+// the full per-region compose sequence -- clear, combine, resolve, blur, \be,
+// clip, copy, per layer -- so the item cost ~1100 compute dispatches. That is
+// pure per-dispatch overhead: halving the geometry (1920x1080 -> 1280x720)
+// halved the pixels and did not move the time at all (934.0 -> 931.7 ms).
+//
+// But the bands' coverage is IDENTICAL: they are the same outline at the same
+// position, and they differ only in colour and in the rectangular \clip --
+// both of which the emission loop applies afterwards (colour on the overlay
+// part, the clip as a plain dst-rect crop). So compose the coverage ONCE and
+// let every other band emit a part that references the same result-atlas
+// rectangle. ~70 composes collapse to one.
+//
+// gc_cov_key/gc_cov_same cover exactly what the compose loop reads -- the two
+// layers' resolved glyph placements and their offsets within the region box,
+// the box dimensions, margin, blur sigmas, \be counts, run flags, vector-clip
+// id, shadow sub-pixel shift, and each layer's visibility (an invisible layer
+// gets no atlas space, so a shared group must agree on it) -- and nothing the
+// emission loop reads (fill/border colour, \kf wipe split, the clip rect).
+// The hash only buckets; membership is decided by the exact compare, so a
+// collision cannot mismatch coverage.
+static void gc_cov_mix(uint64_t *h, int64_t v)
+{
+    *h = (*h ^ (uint64_t) v) * 0xC2B2AE3D27D4EB4Full;
+    *h ^= *h >> 29;
+}
+
+static uint64_t gc_cov_key(const struct sub_bitmaps *item,
+                           const struct gc_region *r,
+                           const struct gpos *cpos, double gs)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    uint32_t bf, bb;
+    memcpy(&bf, &r->blur_f, 4);
+    memcpy(&bb, &r->blur_b, 4);
+    // The region's absolute box, not just its size: the emission loop derives
+    // a part's DST rect from (x0 - margin, y0 - margin) as well as its src, so
+    // only regions at the same screen position may share one coverage. (Two
+    // karaoke syllables repeating a glyph at different x compose identical
+    // coverage but must still be drawn where each one sits.)
+    gc_cov_mix(&h, r->x0);         gc_cov_mix(&h, r->y0);
+    gc_cov_mix(&h, r->x1);         gc_cov_mix(&h, r->y1);
+    gc_cov_mix(&h, r->margin);     gc_cov_mix(&h, bf);
+    gc_cov_mix(&h, bb);            gc_cov_mix(&h, r->be_f);
+    gc_cov_mix(&h, r->be_b);       gc_cov_mix(&h, r->run_flags);
+    gc_cov_mix(&h, r->clip_id);    gc_cov_mix(&h, r->shift_x);
+    gc_cov_mix(&h, r->shift_y);
+    gc_cov_mix(&h, r->fill_t < 0); gc_cov_mix(&h, r->bord_t < 0);
+    for (int l = 0; l < 2; l++) {
+        const int *pl = l ? r->fill : r->bord;
+        int n = l ? r->nfill : r->nbord;
+        gc_cov_mix(&h, n);
+        for (int k = 0; k < n; k++) {
+            const struct sub_bitmap *b = &item->parts[pl[k]];
+            gc_cov_mix(&h, cpos[pl[k]].ax); gc_cov_mix(&h, cpos[pl[k]].ay);
+            gc_cov_mix(&h, cpos[pl[k]].t);
+            gc_cov_mix(&h, b->w);           gc_cov_mix(&h, b->h);
+            gc_cov_mix(&h, lrint(b->x * gs) - r->x0);
+            gc_cov_mix(&h, lrint(b->y * gs) - r->y0);
+        }
+    }
+    return h;
+}
+
+static bool gc_cov_same(const struct sub_bitmaps *item,
+                        const struct gc_region *a, const struct gc_region *b,
+                        const struct gpos *cpos, double gs)
+{
+    if (a->x0 != b->x0 || a->y0 != b->y0 ||
+        a->x1 != b->x1 || a->y1 != b->y1 ||
+        a->margin != b->margin || a->blur_f != b->blur_f ||
+        a->blur_b != b->blur_b || a->be_f != b->be_f || a->be_b != b->be_b ||
+        a->run_flags != b->run_flags || a->clip_id != b->clip_id ||
+        a->shift_x != b->shift_x || a->shift_y != b->shift_y ||
+        (a->fill_t < 0) != (b->fill_t < 0) ||
+        (a->bord_t < 0) != (b->bord_t < 0) ||
+        a->nfill != b->nfill || a->nbord != b->nbord)
+        return false;
+    for (int l = 0; l < 2; l++) {
+        const int *pa = l ? a->fill : a->bord;
+        const int *pb = l ? b->fill : b->bord;
+        int n = l ? a->nfill : a->nbord;
+        for (int k = 0; k < n; k++) {
+            const struct sub_bitmap *sa = &item->parts[pa[k]];
+            const struct sub_bitmap *sb = &item->parts[pb[k]];
+            if (cpos[pa[k]].ax != cpos[pb[k]].ax ||
+                cpos[pa[k]].ay != cpos[pb[k]].ay ||
+                cpos[pa[k]].t  != cpos[pb[k]].t  ||
+                sa->w != sb->w || sa->h != sb->h ||
+                lrint(sa->x * gs) - a->x0 != lrint(sb->x * gs) - b->x0 ||
+                lrint(sa->y * gs) - a->y0 != lrint(sb->y * gs) - b->y0)
+                return false;
+        }
+    }
+    return true;
+}
+#endif // HAVE_ASS_OUTLINE_DEFERRED
+
 static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                                struct osd_entry *entry, struct pl_frame *frame,
                                struct osd_state *state, enum pl_overlay_coords coords,
@@ -4164,44 +4273,6 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 
     if (!nregs) { talloc_free(tmp); return true; }   // no deferred runs in this item
 
-    // WP-J1: narrow each region's coverage bbox to its rectangular \clip.
-    // The clip is applied at emission as a pure dst-space crop (the vr[] rects
-    // below), so coverage outside it is provably never sampled -- but the bbox
-    // above is built from the parts alone, so a run that draws a huge shape and
-    // shows only a thin \clip band still allocated, rasterized and uploaded the
-    // WHOLE shape. The gradient-band idiom multiplies that by the band count:
-    // one big \p drawing repeated N times, each \clip'ed to a different 16px
-    // strip in its own colour to fake a vertical gradient (Kobayashi S ep02
-    // 18:36.56 = 70 bands x a full-frame drawing). At 8K that is ~1.25 Gpx of
-    // transient demand per frame -- 26 chain links wanted against
-    // TR_CHAIN_MAX=8 -- so gc_trans_place failed on the excess, those
-    // region-layers were dropped (t = -1, gcache-overcommit), and since which
-    // ones lost the race depends on per-frame chain/shelf state, a DIFFERENT
-    // subset vanished every frame: the reported "messed up, flashing and
-    // flickering" sign. Clamping is exact, not an approximation: `margin`
-    // (blur halo + \be) is kept around the clamped box, and every emitted
-    // pixel lies at or inside the clip rect, hence >= margin from the
-    // accumulator edge, so its blur/\be support is still fully covered.
-    // Inverse rect clips keep the full bbox (their visible area is OUTSIDE the
-    // rect); non-outline items carry no rect and never reach here (their parts
-    // have glyph_id == 0 and were skipped above). Runs with no \clip carry the
-    // full frame (ass_render.c:1235), so this is a no-op for them.
-    if (is_outline) {
-        for (int i = 0; i < nregs; i++) {
-            struct gc_region *r = &regs[i];
-            if (r->run_flags & RUN_FLAG_RECT_INVERSE)
-                continue;
-            r->x0 = MPMAX(r->x0, r->rcx0);
-            r->y0 = MPMAX(r->y0, r->rcy0);
-            r->x1 = MPMIN(r->x1, r->rcx1);
-            r->y1 = MPMIN(r->y1, r->rcy1);
-            // Empty intersection: the emission crop below drops it anyway; keep
-            // the box degenerate-but-valid so the allocator sees ~zero demand.
-            r->x1 = MPMAX(r->x1, r->x0);
-            r->y1 = MPMAX(r->y1, r->y0);
-        }
-    }
-
     // Emission order FIRST (libass's exact z-order; see the comment at the
     // emission loop below), because WP-H6 (item 1) allocates result-atlas
     // space in THIS order: when the shelf runs out of pre-allocated capacity,
@@ -4264,6 +4335,100 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         ems[j] = e;
     }
 
+    for (int i = 0; i < nregs; i++)
+        regs[i].share = i;              // every region composes for itself...
+#if HAVE_ASS_OUTLINE_DEFERRED
+    // WP-J2: ...unless another region already composes byte-identical
+    // coverage, in which case this one just points at it (see gc_cov_key).
+    // Open addressing over the exact comparator; the hash only buckets.
+    if (is_outline && nregs > 1) {
+        uint64_t *keys = talloc_array(tmp, uint64_t, nregs);
+        int hsz = 4;
+        while (hsz < 2 * nregs)
+            hsz <<= 1;
+        int *tab = talloc_array(tmp, int, hsz);
+        for (int i = 0; i < hsz; i++)
+            tab[i] = -1;
+        for (int i = 0; i < nregs; i++) {
+            keys[i] = gc_cov_key(item, &regs[i], cpos, gs);
+            for (int sl = (int) (keys[i] & (hsz - 1)); ; sl = (sl + 1) & (hsz - 1)) {
+                if (tab[sl] < 0) { tab[sl] = i; break; }
+                int j = tab[sl];
+                if (keys[j] == keys[i] &&
+                    gc_cov_same(item, &regs[j], &regs[i], cpos, gs)) {
+                    regs[i].share = j;
+                    p->cnt_cov_share++;
+                    break;
+                }
+            }
+        }
+    }
+
+    // WP-J1: narrow each region's coverage bbox to its rectangular \clip. The
+    // clip is applied at emission as a pure dst-space crop (the vr[] rects in
+    // the emission loop), so coverage outside it is provably never sampled --
+    // but the bbox above is built from the parts alone, so a run that draws a
+    // huge shape and shows only a thin \clip band still allocated, rasterized
+    // and uploaded the WHOLE shape. At 8K the gradient band's ~70 copies of a
+    // full-frame drawing wanted ~1.25 Gpx of transient demand per frame, far
+    // past TR_CHAIN_MAX, so gc_trans_place failed on the excess and a
+    // different subset of region-layers vanished every frame (the reported
+    // flicker).
+    //
+    // WP-J2: a share group composes ONE coverage for all its members, so the
+    // leader's box is clamped to the UNION of the group's clip rects and the
+    // followers adopt it -- each member's emitted crop still intersects its
+    // OWN clip rect, so the visible pixels are exactly what per-region
+    // clamping produced. Clamping stays exact either way: `margin` (blur halo
+    // + \be) is kept around the clamped box, and every emitted pixel lies at
+    // or inside a clip rect, hence >= margin from the accumulator edge, so its
+    // blur/\be support is still fully covered. Inverse rect clips keep the
+    // full bbox (their visible area is OUTSIDE the rect); runs with no \clip
+    // carry the full frame (ass_render.c), so this is a no-op for them.
+    if (is_outline) {
+        int *ux0 = talloc_array(tmp, int, nregs);
+        int *uy0 = talloc_array(tmp, int, nregs);
+        int *ux1 = talloc_array(tmp, int, nregs);
+        int *uy1 = talloc_array(tmp, int, nregs);
+        for (int i = 0; i < nregs; i++) {
+            ux0[i] = regs[i].rcx0; uy0[i] = regs[i].rcy0;
+            ux1[i] = regs[i].rcx1; uy1[i] = regs[i].rcy1;
+        }
+        for (int i = 0; i < nregs; i++) {
+            int l = regs[i].share;
+            if (l == i)
+                continue;
+            ux0[l] = MPMIN(ux0[l], regs[i].rcx0);
+            uy0[l] = MPMIN(uy0[l], regs[i].rcy0);
+            ux1[l] = MPMAX(ux1[l], regs[i].rcx1);
+            uy1[l] = MPMAX(uy1[l], regs[i].rcy1);
+        }
+        for (int i = 0; i < nregs; i++) {
+            struct gc_region *r = &regs[i];
+            if (r->share != i || (r->run_flags & RUN_FLAG_RECT_INVERSE))
+                continue;
+            r->x0 = MPMAX(r->x0, ux0[i]);
+            r->y0 = MPMAX(r->y0, uy0[i]);
+            r->x1 = MPMIN(r->x1, ux1[i]);
+            r->y1 = MPMIN(r->y1, uy1[i]);
+            // Empty intersection: the emission crop below drops it anyway; keep
+            // the box degenerate-but-valid so the allocator sees ~zero demand.
+            r->x1 = MPMAX(r->x1, r->x0);
+            r->y1 = MPMAX(r->y1, r->y0);
+        }
+        // Followers adopt the leader's box: the emission loop derives a part's
+        // src rect from (ax, ay) and (x0 - margin, y0 - margin), so a shared
+        // coverage needs the shared frame of reference too.
+        for (int i = 0; i < nregs; i++) {
+            int l = regs[i].share;
+            if (l == i)
+                continue;
+            regs[i].x0 = regs[l].x0; regs[i].y0 = regs[l].y0;
+            regs[i].x1 = regs[l].x1; regs[i].y1 = regs[l].y1;
+        }
+    }
+#endif // HAVE_ASS_OUTLINE_DEFERRED
+
     // WP-H6 (item 1): result-atlas allocation against the CURRENT capacity.
     // Only the presentation guard's persistent states spill (their result_tex
     // is pre-created and background-pre-grown); the per-frame blend/screenshot
@@ -4305,6 +4470,21 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 restart_alloc:
     for (int ei = 0; ei < nems; ei++) {
         struct gc_region *r = &regs[ems[ei].reg];
+        // WP-J2: a follower composes nothing and owns no result-atlas space --
+        // it re-emits its leader's coverage (placement propagated below).
+        if (r->share != ems[ei].reg)
+            continue;
+        // An empty box composites to nothing. The visibility pass above drops
+        // such a region-layer, but it runs BEFORE the \clip clamp now (the
+        // share key needs the raw box), so a box the clamp empties is only
+        // known here -- and carrying it further would size a compose dispatch
+        // 0 wide or 0 tall, which libplacebo asserts on (dispatch.c
+        // pl_dispatch_compute). Mark the layer unplaceable: the compose loop's
+        // need_fill/need_bord and the emission loop both already skip that.
+        if (r->x1 <= r->x0 || r->y1 <= r->y0) {
+            *(ems[ei].layer == 0 ? &r->bord_t : &r->fill_t) = -1;
+            continue;
+        }
         // Deferred runs are raw (unexpanded) per-glyph coverage, so they need
         // the blur halo padding (libass's exact expand amount), plus one px
         // per \be iteration (each box pass grows the support by one).
@@ -4366,6 +4546,17 @@ restart_alloc:
             *at = -1;
             p->cnt_gcache_overcommit++;
         }
+    }
+    // WP-J2: followers inherit their leader's placement, including a FAILED
+    // one (t == -1) -- the emission loop then skips the whole share group,
+    // exactly as it skips an unplaceable standalone region.
+    for (int i = 0; i < nregs; i++) {
+        int l = regs[i].share;
+        if (l == i)
+            continue;
+        regs[i].fill_ax = regs[l].fill_ax; regs[i].fill_ay = regs[l].fill_ay;
+        regs[i].bord_ax = regs[l].bord_ax; regs[i].bord_ay = regs[l].bord_ay;
+        regs[i].fill_t  = regs[l].fill_t;  regs[i].bord_t  = regs[l].bord_t;
     }
     int atlas_w = MPMAX(max_w, 1), atlas_h = MPMAX(shelf_y + shelf_h, 1);
     // Flush this item's spill bands into the build protection (read by the
@@ -4449,6 +4640,8 @@ restart_alloc:
             return false;
         }
         struct gc_region *r = &regs[i];
+        if (r->share != i)
+            continue;   // WP-J2: its leader composes this coverage
         int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
         // WP-H6 (item 1): each layer's composed coverage goes where it was
         // allocated -- result_tex, or (WP-H10) the transient chain link it
@@ -6935,6 +7128,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "trans-want-uncapped",       p->tr_want_uncapped,        &p->stat_trans_want_uncapped);
     emit_counter(vo, "compose-reuse-spill",       p->cnt_spill_reuse,         &p->stat_spill_reuse);
     emit_counter(vo, "blob-hash-hit",             p->cnt_blob_hash_hit,       &p->stat_blob_hash_hit);
+    emit_counter(vo, "cov-share",                 p->cnt_cov_share,           &p->stat_cov_share);
     emit_counter(vo, "compose-reuse",             p->cnt_compose_reuse,       &p->stat_compose_reuse);
     emit_counter(vo, "staging-wrap",              p->cnt_staging_wrap,        &p->stat_staging_wrap);
     if (want_slow) {
@@ -7974,6 +8168,7 @@ static int preinit(struct vo *vo)
     p->stat_trans_want_uncapped = -1;
     p->stat_spill_reuse = -1;
     p->stat_blob_hash_hit = -1;
+    p->stat_cov_share = -1;
     p->stat_compose_reuse = -1;
     p->stat_staging_wrap = -1;
     p->osd_guard.good = -1;   // WP-E3: no complete overlay build yet
