@@ -761,8 +761,10 @@ struct priv {
     // glyph_id key missed (animated text with fresh ids but unchanged
     // outlines skips re-raster/re-upload). Info.
     int64_t cnt_blob_hash_hit, stat_blob_hash_hit;
-    // WP-J2: region-layers that reused another region's composed coverage.
+    // WP-J2: region-layers that reused another region's composed coverage,
+    // and repeat copies of one outline that reused its transient slot.
     int64_t cnt_cov_share, stat_cov_share;
+    int64_t cnt_trans_share, stat_trans_share;
     // WP-H6 (item 6): deferred items served from the per-entry compose reuse
     // (identical change_id/geometry) without re-running the compose. Info.
     int64_t cnt_compose_reuse, stat_compose_reuse;
@@ -4086,6 +4088,11 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // to multiply each clipped run's coverage (gc_outline_features).
     struct clipmask *clips = NULL;
     int nclips = 0;
+    // WP-J2: outlines this item has already placed in the transient store,
+    // keyed by blob content hash -- see the dedupe in the resolve loop.
+    struct tshare { uint64_t hash; int w, h; struct gpos pos; };
+    struct tshare *tsh = NULL;
+    int tsh_mask = 0;
 #endif
     ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
     // WP-E: resolve each glyph via the epoch-evicting cache (gc_place). A miss
@@ -4117,24 +4124,79 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             }
         }
         if (!placed) {
-            // WP-H10: count the demand whether or not the placement lands --
-            // the exact-demand backstop that sizes the chain for next frame.
-            trans_demand_px += (int64_t) (b->w + 1) * (b->h + 1);
-            if (!gc_trans_place(p, b->w, b->h, &cpos[i])) {
-                // Chain exhausted (links still allocating, or demand past the
-                // TR_CHAIN_MAX VRAM cap): make the glyph invisible rather
-                // than compose garbage, and let the acceptance gate catch it.
-                cpos[i].t = -1;
-                p->cnt_gcache_overcommit++;
-                continue;
+            // WP-J2: an item that draws the SAME outline many times over --
+            // the gradient-band idiom, one \p drawing repeated per band --
+            // must not place, rasterize and compose one copy per band. Above
+            // the gc_cacheable size cap (which a full-frame sign drawing
+            // exceeds from ~1440p up) every copy took its own transient slot,
+            // so the item re-rasterized the whole shape per band (16.0M raster
+            // tiles on the ep02 scene at 2560x1440) and no two copies could
+            // share a composed coverage either, since their slots differ.
+            //
+            // libass's tile export is relative to (dst_x, dst_y) -- the ass.h
+            // contract -- so repeat copies of one outline export a byte-
+            // identical blob (the same key gc_resolve_outline uses for the
+            // persistent cache). Point every later copy at the first copy's
+            // slot: the store is per-item and its content is written by the
+            // raster flush below, before any compose reads it, so the sharing
+            // is valid for exactly as long as the slot itself is.
+            bool have_pos = false;
+#if HAVE_ASS_OUTLINE_DEFERRED
+            struct tshare *slot = NULL;
+            if (is_outline && b->libass.outline && b->libass.n_outline >= 2) {
+                if (!tsh) {
+                    tsh_mask = 4;
+                    while (tsh_mask < 2 * item->num_parts)
+                        tsh_mask <<= 1;
+                    tsh = talloc_zero_array(tmp, struct tshare, tsh_mask);
+                    tsh_mask--;
+                }
+                uint64_t th = gc_blob_hash(b->libass.outline,
+                                           b->libass.n_outline, b->w, b->h);
+                int sl = (int) (th & tsh_mask);
+                while (tsh[sl].hash && !(tsh[sl].hash == th &&
+                                         tsh[sl].w == b->w && tsh[sl].h == b->h))
+                    sl = (sl + 1) & tsh_mask;
+                slot = &tsh[sl];
+                if (slot->hash) {
+                    cpos[i] = slot->pos;   // placed AND queued by an earlier copy
+                    p->cnt_trans_share++;
+                    have_pos = true;       // up stays false: no re-raster
+                } else {
+                    *slot = (struct tshare){ th, b->w, b->h, {0, 0, 0} };
+                }
             }
-            // WP-H10: every successful transient placement counts here --
-            // the policy-uncacheable giants AND the cacheable glyphs the
-            // atlas ring could not admit this pass (both drawn losslessly,
-            // both pure pressure signals). gcache-overcommit is reserved
-            // for FAILED placements = content loss (the gated meaning).
-            p->cnt_glyph_uncached++;
-            up = true;                    // transient content is per-item
+#endif
+            if (!have_pos) {
+                // WP-H10: count the demand whether or not the placement lands
+                // -- the exact-demand backstop that sizes the chain for the
+                // next frame.
+                trans_demand_px += (int64_t) (b->w + 1) * (b->h + 1);
+                if (!gc_trans_place(p, b->w, b->h, &cpos[i])) {
+                    // Chain exhausted (links still allocating, or demand past
+                    // the TR_CHAIN_MAX VRAM cap): make the glyph invisible
+                    // rather than compose garbage, and let the acceptance gate
+                    // catch it.
+                    cpos[i].t = -1;
+                    p->cnt_gcache_overcommit++;
+#if HAVE_ASS_OUTLINE_DEFERRED
+                    if (slot)
+                        slot->hash = 0;   // unplaced: never share the failure
+#endif
+                    continue;
+                }
+#if HAVE_ASS_OUTLINE_DEFERRED
+                if (slot)
+                    slot->pos = cpos[i];  // later copies reuse this slot
+#endif
+                // WP-H10: every successful transient placement counts here --
+                // the policy-uncacheable giants AND the cacheable glyphs the
+                // atlas ring could not admit this pass (both drawn losslessly,
+                // both pure pressure signals). gcache-overcommit is reserved
+                // for FAILED placements = content loss (the gated meaning).
+                p->cnt_glyph_uncached++;
+                up = true;                // transient content is per-item
+            }
         }
 #if HAVE_ASS_OUTLINE_DEFERRED
         if (b->libass.run_flags & RUN_FLAG_CLIP_MASK) {
@@ -7129,6 +7191,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "compose-reuse-spill",       p->cnt_spill_reuse,         &p->stat_spill_reuse);
     emit_counter(vo, "blob-hash-hit",             p->cnt_blob_hash_hit,       &p->stat_blob_hash_hit);
     emit_counter(vo, "cov-share",                 p->cnt_cov_share,           &p->stat_cov_share);
+    emit_counter(vo, "trans-share",               p->cnt_trans_share,         &p->stat_trans_share);
     emit_counter(vo, "compose-reuse",             p->cnt_compose_reuse,       &p->stat_compose_reuse);
     emit_counter(vo, "staging-wrap",              p->cnt_staging_wrap,        &p->stat_staging_wrap);
     if (want_slow) {
@@ -8169,6 +8232,7 @@ static int preinit(struct vo *vo)
     p->stat_spill_reuse = -1;
     p->stat_blob_hash_hit = -1;
     p->stat_cov_share = -1;
+    p->stat_trans_share = -1;
     p->stat_compose_reuse = -1;
     p->stat_staging_wrap = -1;
     p->osd_guard.good = -1;   // WP-E3: no complete overlay build yet
