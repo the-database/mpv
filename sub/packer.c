@@ -96,6 +96,25 @@ static struct mp_ass_pin *ass_pin_new(void *ta_parent, ASS_Image **image_lists,
     return pin;
 }
 
+// Release the frame refs taken by the last pack.
+//
+// This MUST run before the ASS_Renderer that produced them is destroyed.
+// Dropping the last reference to a pinned glyph bitmap cascades through the
+// outline and glyph caches into the font cache, whose destructor calls
+// FT_Done_Face -- which needs the FT_Library, and therefore the ASS_Library,
+// still alive. The packer is a talloc child of the sd, so without this it would
+// be freed after assobjects_destroy() and crash on shutdown.
+//
+// Also invalidates the cached pack: its parts point into the blobs just
+// released, so they must never be served again.
+void mp_sub_packer_release_ass_pins(struct mp_sub_packer *p)
+{
+    if (!p->pin)
+        return;
+    TA_FREEP(&p->pin);
+    p->cached_subs_valid = false;
+}
+
 // An INDEPENDENT set of refs on the lists this packer currently borrows from,
 // for a consumer that outlives the packer's next pack (the render-ahead ring).
 // NULL when the last pack borrowed nothing. Free with talloc_free().
