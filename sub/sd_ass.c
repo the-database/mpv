@@ -1200,6 +1200,12 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
     case SD_CTRL_SET_VIDEO_PARAMS:
         ctx->video_params = *(struct mp_image_params *)arg;
         return CONTROL_OK;
+#if HAVE_ASS_OUTLINE_DEFERRED
+    case SD_CTRL_CLONE_ASS_PIN:
+        *(struct mp_ass_pin **)arg =
+            mp_sub_packer_clone_ass_pin(ctx->packer, NULL);
+        return CONTROL_OK;
+#endif
     case SD_CTRL_UPDATE_OPTS: {
         uint64_t flags = *(uint64_t *)arg;
         if (flags & UPDATE_SUB_FILT) {
