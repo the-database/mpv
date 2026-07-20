@@ -240,6 +240,14 @@ static void enable_output(struct sd *sd, bool enable)
     if (enable == !!ctx->ass_renderer)
         return;
     if (ctx->ass_renderer) {
+#if HAVE_ASS_OUTLINE_DEFERRED
+        // The packer borrows coverage blobs from this renderer's caches and is
+        // a talloc child of ctx, so it would otherwise outlive the renderer.
+        // Dropping the last ref to a pinned glyph cascades into the font cache
+        // and FT_Done_Face, which needs the library alive: release first.
+        if (ctx->packer)
+            mp_sub_packer_release_ass_pins(ctx->packer);
+#endif
         ass_renderer_done(ctx->ass_renderer);
         ctx->ass_renderer = NULL;
     } else {
@@ -1200,6 +1208,12 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
     case SD_CTRL_SET_VIDEO_PARAMS:
         ctx->video_params = *(struct mp_image_params *)arg;
         return CONTROL_OK;
+#if HAVE_ASS_OUTLINE_DEFERRED
+    case SD_CTRL_CLONE_ASS_PIN:
+        *(struct mp_ass_pin **)arg =
+            mp_sub_packer_clone_ass_pin(ctx->packer, NULL);
+        return CONTROL_OK;
+#endif
     case SD_CTRL_UPDATE_OPTS: {
         uint64_t flags = *(uint64_t *)arg;
         if (flags & UPDATE_SUB_FILT) {
