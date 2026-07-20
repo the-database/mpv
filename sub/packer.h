@@ -34,6 +34,24 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
                             int num_image_lists, bool changed, bool video_color_space,
                             int preferred_osd_format, struct sub_bitmaps *out);
 
+#if HAVE_ASS_OUTLINE_DEFERRED
+// SUBBITMAP_LIBASS_OUTLINES parts BORROW their coverage blobs from libass; the
+// packer holds a frame ref that keeps them alive only until its next changed
+// pack. A consumer that outlives that (the render-ahead ring) must take its own
+// independent refs with this, and hold them for as long as it can serve those
+// parts. Returns NULL when the last pack borrowed nothing. Free with
+// talloc_free().
+struct mp_ass_pin;
+struct mp_ass_pin *mp_sub_packer_clone_ass_pin(struct mp_sub_packer *p,
+                                               void *ta_parent);
+
+// Drop the borrowed-blob refs (and invalidate the cached pack that points at
+// them). MUST be called before destroying the ASS_Renderer that produced them:
+// the last unref of a pinned glyph reaches the font cache and FT_Done_Face,
+// which needs the library alive.
+void mp_sub_packer_release_ass_pins(struct mp_sub_packer *p);
+#endif
+
 #if HAVE_SUBRANDR
 struct sbr_instanced_raster_pass;
 void mp_sub_packer_pack_sbr(struct mp_sub_packer *p, struct sbr_instanced_raster_pass *pass,
