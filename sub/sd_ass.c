@@ -37,6 +37,8 @@
 #include "video/csputils.h"
 #include "video/mp_image.h"
 #include "dec_sub.h"
+#include "sub_phase.h"
+#include "osdep/timer.h"
 #include "ass_mp.h"
 #include "packer.h"
 #include "sd.h"
@@ -869,10 +871,21 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
         fill_plaintext(sd, pts);
 
     int changed;
+    // WP-K5: libass proper vs mpv's post-processing of its output. These are
+    // the only two candidates for the >115 ms inline render at 8K, and they
+    // have completely different fixes.
+    int64_t t_ar = sub_phase.on ? mp_time_ns() : 0;
     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
-    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
+    if (sub_phase.on)
+        sub_phase.assrender_ns += mp_time_ns() - t_ar;
 
-done:
+    int64_t t_pk = sub_phase.on ? mp_time_ns() : 0;
+    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
+    if (sub_phase.on)
+        sub_phase.pack_ns += mp_time_ns() - t_pk;
+
+done:;
+    int64_t t_bc = sub_phase.on ? mp_time_ns() : 0;
     // mangle_colors() modifies the color field, so copy the thing _before_.
     res = sub_bitmaps_copy(&ctx->copy_cache, res);
 
@@ -893,6 +906,9 @@ done:
 
     if (!converted && res)
         mangle_colors(sd, res);
+
+    if (sub_phase.on)
+        sub_phase.bcopy_ns += mp_time_ns() - t_bc;
 
     return res;
 }

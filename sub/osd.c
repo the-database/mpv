@@ -37,11 +37,16 @@
 #include "player/command.h"
 #include "osd.h"
 #include "osd_state.h"
+#include "sub_phase.h"
 #include "dec_sub.h"
 #include "img_convert.h"
 #include "draw_bmp.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
+
+// WP-K5: see sub/sub_phase.h. Reset + emitted by osd_render(); accumulated by
+// render_object() here and by the fetch path in sub_ahead.c / dec_sub.c.
+thread_local struct sub_phase_acc sub_phase;
 
 #define OPT_BASE_STRUCT struct osd_style_opts
 static const m_option_t style_opts[] = {
@@ -442,7 +447,15 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
         // WP-H7 (defect 2): script overlays (stats page, OSC) are rendered
         // by the async worker; serve its last completed snapshot without
         // ever putting libass work on this (usually the VO) thread.
+        // WP-K5: this runs inside vo_gpu_next's "sub-render" span whenever
+        // draw_flags is not SUB_ONLY (i.e. the main non-blend-subs call), so
+        // it must be accounted for before any residual is trusted.
+        int64_t t_as = sub_phase.on ? mp_time_ns() : 0;
         res = osd_external_render_async(osd, obj, render_res, format);
+        if (sub_phase.on) {
+            sub_phase.async_ns += mp_time_ns() - t_as;
+            sub_phase.n_async++;
+        }
     } else if (obj->type == OSDTYPE_OSD) {
         // WP-H12 (sub-C): osd_message + progress bar render on the same
         // worker. The DEFAULT stats page is one mp.osd_message event
@@ -450,7 +463,12 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
         // refresh at 8K (the 1-drop-per-second signature), fixed before only
         // by the stats-persistent_overlay opt-in. Now both stats-page paths
         // are worker-rendered.
+        int64_t t_as = sub_phase.on ? mp_time_ns() : 0;
         res = osd_object_render_async(osd, obj, render_res, format);
+        if (sub_phase.on) {
+            sub_phase.async_ns += mp_time_ns() - t_as;
+            sub_phase.n_async++;
+        }
     } else {
         res = osd_object_get_bitmaps(osd, obj, render_res, format);
     }
@@ -458,6 +476,7 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
     // Scale the capped-resolution OSD parts back up to the real output size; the
     // small packed atlas is sampled into larger dst rects (GPU bilinear upscale).
     if (res && capped) {
+        int64_t t_sc = sub_phase.on ? mp_time_ns() : 0;
         double sx = (double) osdres.w / render_res.w;
         double sy = (double) osdres.h / render_res.h;
         for (int i = 0; i < res->num_parts; i++) {
@@ -467,6 +486,8 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
             b->dw = lrint(b->w * sx);
             b->dh = lrint(b->h * sy);
         }
+        if (sub_phase.on)
+            sub_phase.scale_ns += mp_time_ns() - t_sc;
     }
 
     if (obj->vo_had_output != !!res) {
@@ -492,7 +513,22 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
                                    double video_pts, int draw_flags,
                                    const bool formats[SUBBITMAP_COUNT])
 {
+    // WP-K5: decompose this call (vo_gpu_next brackets the WHOLE of it as the
+    // single "sub-render" span). Gated on --dump-stats; see sub/sub_phase.h.
+    bool ph = mp_msg_test(osd->log, MSGL_STATS);
+    int64_t t_enter = 0;
+    if (ph) {
+        sub_phase = (struct sub_phase_acc){ .on = true };
+        t_enter = mp_time_ns();
+    }
+
     mp_mutex_lock(&osd->lock);
+
+    // Contention on osd->lock is charged here and nowhere else: the whole
+    // body below runs under it, and other threads (osd_changed, osd_set_text,
+    // osd_set_external, the OSD worker's phase-1 track rebuild) take it too.
+    if (ph)
+        sub_phase.osdlock_ns = mp_time_ns() - t_enter;
 
     int64_t start_time = mp_time_ns();
 
@@ -520,11 +556,25 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
         if ((draw_flags & OSD_DRAW_OSD_ONLY) && obj->is_sub)
             continue;
 
-        char *stat_type_render = obj->is_sub ? "sub-render" : "osd-render";
+        // WP-K5: this span used to be named "sub-render" for sub objects --
+        // the SAME name vo_gpu_next.c uses for the span wrapping the entire
+        // osd_render() call. --dump-stats lines carry no stats_ctx prefix, so
+        // both landed in one histogram bucket: every reported "sub-render"
+        // percentile was a blind mixture of one outer span (which includes
+        // the render-ahead miss-wait) and N inner per-object spans. Renamed
+        // so the two are separable. "osd-render" never collided; left alone.
+        char *stat_type_render = obj->is_sub ? "sub-obj-render" : "osd-render";
         stats_time_start(osd->stats, stat_type_render);
 
+        int64_t t_obj = ph ? mp_time_ns() : 0;
         struct sub_bitmaps *imgs =
             render_object(osd, obj, res, video_pts, draw_flags, formats);
+        if (ph) {
+            int64_t d = mp_time_ns() - t_obj;
+            sub_phase.obj_ns += d;
+            sub_phase.objmax_ns = MPMAX(sub_phase.objmax_ns, d);
+            sub_phase.n_obj++;
+        }
 
         stats_time_end(osd->stats, stat_type_render);
 
@@ -550,6 +600,66 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
            elapsed, __func__, slow ? " (slow!)" : "");
 
     mp_mutex_unlock(&osd->lock);
+
+    // WP-K5: emit one complete phase set per osd_render() call, OFF the lock
+    // (WP-H6 convention: a blocking stats write must never be held under a
+    // lock a hot path contends for). Residuals are derived here, in C, where
+    // the nesting is unambiguous -- see sub/sub_phase.h.
+    if (ph) {
+        struct sub_phase_acc a = sub_phase;
+        sub_phase.on = false;
+        int64_t total = mp_time_ns() - t_enter;
+        int64_t other = total - a.osdlock_ns - a.obj_ns;
+        int64_t objother = a.obj_ns - a.fetch_ns - a.inline_ns - a.async_ns -
+                           a.scale_ns;
+        int64_t fother = a.fetch_ns - a.flock_ns - a.fwait_ns - a.fserve_ns -
+                         a.ftail_ns;
+        int64_t iother = a.inline_ns - a.ilock_ns - a.irender_ns;
+        int64_t irother = a.irender_ns - a.assrender_ns - a.pack_ns - a.bcopy_ns;
+        int64_t pkother = a.pack_ns - a.packfree_ns - a.packcopy_ns;
+        #define SR_MS(x) MP_STATS(osd, "value %.3f sr-" #x, MP_TIME_NS_TO_MS(a.x##_ns))
+        MP_STATS(osd, "value %.3f sr-total", MP_TIME_NS_TO_MS(total));
+        SR_MS(osdlock);
+        SR_MS(obj);
+        SR_MS(fetch);
+        SR_MS(inline);
+        SR_MS(async);
+        SR_MS(scale);
+        SR_MS(flock);
+        SR_MS(fwait);
+        SR_MS(fserve);
+        SR_MS(ftail);
+        SR_MS(ilock);
+        SR_MS(irender);
+        SR_MS(assrender);
+        SR_MS(pack);
+        SR_MS(bcopy);
+        SR_MS(packfree);
+        SR_MS(packcopy);
+        #undef SR_MS
+        MP_STATS(osd, "value %.3f sr-iother", MP_TIME_NS_TO_MS(iother));
+        MP_STATS(osd, "value %.3f sr-irother", MP_TIME_NS_TO_MS(irother));
+        MP_STATS(osd, "value %.3f sr-pkother", MP_TIME_NS_TO_MS(pkother));
+        // Work volume behind sr-pack, so a ms figure can be turned into a rate.
+        MP_STATS(osd, "value %lld sr-nparts", (long long) a.pack_parts);
+        MP_STATS(osd, "value %.1f sr-blobkb", a.pack_bytes / 1024.0);
+        MP_STATS(osd, "value %.3f sr-other", MP_TIME_NS_TO_MS(other));
+        MP_STATS(osd, "value %.3f sr-objother", MP_TIME_NS_TO_MS(objother));
+        MP_STATS(osd, "value %.3f sr-fother", MP_TIME_NS_TO_MS(fother));
+        // Worst single occurrence (NOT part of the sum tree -- these
+        // deliberately duplicate time already counted above).
+        MP_STATS(osd, "value %.3f sr-objmax", MP_TIME_NS_TO_MS(a.objmax_ns));
+        MP_STATS(osd, "value %.3f sr-fwaitmax", MP_TIME_NS_TO_MS(a.fwaitmax_ns));
+        MP_STATS(osd, "value %d sr-nobj", a.n_obj);
+        MP_STATS(osd, "value %d sr-nfetch", a.n_fetch);
+        MP_STATS(osd, "value %d sr-nwait", a.n_wait);
+        MP_STATS(osd, "value %d sr-ninline", a.n_inline);
+        MP_STATS(osd, "value %d sr-nasync", a.n_async);
+        // Which of the up-to-3 osd_render() calls per frame this was: the
+        // draw_flags distinguish the main call (0 / OSD_ONLY) from the
+        // blend-subs SUB_ONLY calls.
+        MP_STATS(osd, "value %d sr-flags", draw_flags);
+    }
     return list;
 }
 
