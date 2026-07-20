@@ -4147,18 +4147,46 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     // to multiply each clipped run's coverage (gc_outline_features).
     struct clipmask *clips = NULL;
     int nclips = 0;
-    // WP-J2: outlines this item has already placed in the transient store,
-    // keyed by blob content -- see the dedupe in the resolve loop. WP-J3: the
-    // key is (n_outline, w, h) with an exact memcmp against the representative
-    // blob, not a full content hash. The gradient-band idiom reaches this path
-    // ~141 times per compose with a full-frame drawing each time, and hashing
-    // every copy end-to-end is the measured bulk of the resolve phase; memcmp
-    // is SIMD and only has to run until the first differing byte, while equal
-    // blobs (the case that matters here) cost one streaming compare instead of
-    // a scalar multiply-mix over the same bytes. It is also strictly MORE
-    // exact than the hash key it replaces, which accepted hash equality with
-    // no confirming compare.
-    struct tshare { const int32_t *blob; int32_t n; int w, h; struct gpos pos; };
+    // WP-J2: outlines this item has already placed in the transient store --
+    // see the dedupe in the resolve loop. WP-K6: the key is libass's
+    // glyph_id (ASS_Image.glyph_id = Bitmap.cache_id), not the blob bytes.
+    //
+    // J2 hashed the blob and J3 replaced that with (n_outline, w, h) + an
+    // exact memcmp; both still had to TOUCH every byte of every copy. The
+    // gradient-band idiom reaches this path ~141 times per compose with a
+    // full-frame drawing each time, which at 8K measured 335 MB compared per
+    // frame -- 70.6% of the expensive-compose time -- for a key that is
+    // strictly WEAKER than an integer already sitting in the part.
+    //
+    // glyph_id is a process-global monotonic serial over Bitmap objects
+    // (libass ass_render.c: a function-local static counter, post-increment,
+    // never reset and never recycled on eviction), so it names exactly one
+    // Bitmap, and blob/n_outline/w/h are all fields of that Bitmap. Equal id
+    // therefore IMPLIES byte-equal blob: this key is strictly more exact than
+    // the memcmp it replaces, not a weakening. The transform lives in libass's
+    // BitmapHashKey, so a different transform is a different id; integer
+    // translation does not, which is why repeat copies of one drawing share.
+    // Ids from render threads / a render-ahead renderer cannot collide (one
+    // atomic counter); only loading two copies of libass into one process
+    // could produce a second counter.
+    //
+    // What is shared is a raster-only slot (struct rjob carries slot origin,
+    // dims and a slice of the blob's tiles -- no colour, blur, be, shadow
+    // shift, clip or b->x/b->y; those all ride on the region, keyed by
+    // run_id), so id-equality is sufficient for the sharing to be correct.
+    // gc_resolve_outline already shares persistent coverage on a GC_KEY_ID
+    // lookup alone, so this is the same contract the cacheable path ships.
+    //
+    // The one thing lost is sharing between DISTINCT ids that happen to hold
+    // byte-identical blobs (e.g. an eviction/rebuild across frames). Within
+    // one item that cannot happen -- the parts come from one image list, and a
+    // repeat drawing resolves to the same libass cache entry -- and the
+    // transient store is per-item and rebuilt every frame regardless, so it
+    // costs at most a redundant raster, never a wrong pixel.
+    //
+    // id == 0 is the empty-slot sentinel: libass issues ids from 1 up, and
+    // parts with glyph_id == 0 never reach here (filtered above).
+    struct tshare { uint64_t id; int w, h; struct gpos pos; };
     struct tshare *tsh = NULL;
     int tsh_mask = 0;
 #endif
@@ -4201,13 +4229,15 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             // tiles on the ep02 scene at 2560x1440) and no two copies could
             // share a composed coverage either, since their slots differ.
             //
-            // libass's tile export is relative to (dst_x, dst_y) -- the ass.h
-            // contract -- so repeat copies of one outline export a byte-
-            // identical blob (the same key gc_resolve_outline uses for the
-            // persistent cache). Point every later copy at the first copy's
-            // slot: the store is per-item and its content is written by the
-            // raster flush below, before any compose reads it, so the sharing
-            // is valid for exactly as long as the slot itself is.
+            // Repeat copies of one outline differ only by whole-pixel
+            // position, which libass keeps out of its BitmapHashKey, so they
+            // resolve to one cached Bitmap and carry one glyph_id (and, by the
+            // same token, a byte-identical tile export -- the ass.h contract
+            // that the export is relative to (dst_x, dst_y)). Point every
+            // later copy at the first copy's slot: the store is per-item and
+            // its content is written by the raster flush below, before any
+            // compose reads it, so the sharing is valid for exactly as long as
+            // the slot itself is.
             bool have_pos = false;
 #if HAVE_ASS_OUTLINE_DEFERRED
             struct tshare *slot = NULL;
@@ -4220,35 +4250,38 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                     tsh_mask--;
                 }
                 int64_t h0 = cp_on ? mp_time_ns() : 0;
-                size_t nb = (size_t) b->libass.n_outline * sizeof(int32_t);
-                // Bucket on the cheap dims, confirm on the bytes.
-                uint64_t dk = (uint64_t) (uint32_t) b->libass.n_outline *
-                                  0x9E3779B97F4A7C15ull ^
-                              ((uint64_t) (uint32_t) b->w << 32 |
-                               (uint32_t) b->h);
+                uint64_t gid = b->libass.glyph_id;
+                // Scatter the dense serial, then linear-probe. w/h are carried
+                // and compared as a cheap invariant assertion only (they are
+                // determined by the id); a mismatch means the invariant broke,
+                // and is treated as a miss rather than shared -- mirroring
+                // gcache_lookup's size check on the persistent path. The table
+                // holds >= 2 * num_parts slots and takes at most one entry per
+                // part, so an empty slot always terminates the probe.
+                uint64_t dk = gid * 0x9E3779B97F4A7C15ull;
                 dk ^= dk >> 29;
                 int sl = (int) (dk & tsh_mask);
-                while (tsh[sl].blob &&
-                       !(tsh[sl].n == b->libass.n_outline &&
-                         tsh[sl].w == b->w && tsh[sl].h == b->h &&
-                         memcmp(tsh[sl].blob, b->libass.outline, nb) == 0))
+                while (tsh[sl].id &&
+                       !(tsh[sl].id == gid &&
+                         tsh[sl].w == b->w && tsh[sl].h == b->h))
                     sl = (sl + 1) & tsh_mask;
                 slot = &tsh[sl];
                 if (cp_on) {
                     p->cp_rhash_ns += mp_time_ns() - h0;
                     p->cp_nhash++;
-                    p->cp_hash_bytes += (int64_t) nb;
+                    // WP-K6: no blob bytes are read to build the key any more,
+                    // so keyMB now reports 0 by construction. Kept in the line
+                    // so a before/after compose profile lines up field for
+                    // field.
                 }
-                if (slot->blob) {
+                if (slot->id) {
                     cpos[i] = slot->pos;   // placed AND queued by an earlier copy
                     p->cnt_trans_share++;
                     if (cp_on)
                         p->cp_nshare++;
                     have_pos = true;       // up stays false: no re-raster
                 } else {
-                    *slot = (struct tshare){ b->libass.outline,
-                                             b->libass.n_outline,
-                                             b->w, b->h, {0, 0, 0} };
+                    *slot = (struct tshare){ gid, b->w, b->h, {0, 0, 0} };
                 }
             }
 #endif
@@ -4266,7 +4299,7 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                     p->cnt_gcache_overcommit++;
 #if HAVE_ASS_OUTLINE_DEFERRED
                     if (slot)
-                        slot->blob = NULL;  // unplaced: never share the failure
+                        slot->id = 0;       // unplaced: never share the failure
 #endif
                     continue;
                 }
