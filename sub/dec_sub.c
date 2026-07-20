@@ -27,6 +27,7 @@
 #include "sd.h"
 #include "dec_sub.h"
 #include "sub_ahead.h"
+#include "sub_phase.h"
 #include "options/m_config.h"
 #include "options/options.h"
 #include "common/global.h"
@@ -34,6 +35,7 @@
 #include "common/recorder.h"
 #include "misc/dispatch.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 
 extern const struct sd_functions sd_ass;
 extern const struct sd_functions sd_lavc;
@@ -494,7 +496,18 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
         sub_ahead_inline_begin(sub->ahead);
     }
 
+    // WP-K5: the inline path -- the ONLY route by which a synchronous libass
+    // render lands on the calling (VO) thread. n_inline must read 0 in
+    // forward play with render-ahead on; any nonzero sr-inline is real
+    // VO-thread render work that the outer "sub-render" span was hiding.
+    // Split lock-vs-render, because "115 ms of inline" has two very
+    // different explanations and they need different fixes.
+    int64_t t_inl = sub_phase.on ? mp_time_ns() : 0;
+
     mp_mutex_lock(&sub->lock);
+
+    if (sub_phase.on)
+        sub_phase.ilock_ns += mp_time_ns() - t_inl;
 
     pts = pts_to_subtitle(sub, pts);
 
@@ -503,14 +516,22 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
 
     struct sub_bitmaps *res = NULL;
 
+    int64_t t_ir = sub_phase.on ? mp_time_ns() : 0;
     if (!(sub->end != MP_NOPTS_VALUE && pts >= sub->end) &&
         sub->sd->driver->get_bitmaps)
         res = sub->sd->driver->get_bitmaps(sub->sd, dim, format, pts, draw_flags);
+    if (sub_phase.on)
+        sub_phase.irender_ns += mp_time_ns() - t_ir;
 
     mp_mutex_unlock(&sub->lock);
 
     if (sub->ahead)
         sub_ahead_inline_end(sub->ahead);
+
+    if (sub_phase.on) {
+        sub_phase.inline_ns += mp_time_ns() - t_inl;
+        sub_phase.n_inline++;
+    }
     return res;
 }
 

@@ -216,6 +216,14 @@ _RA_RE = re.compile(
     r"\[render-ahead\]\s+served=(?P<served>\d+)\s+empty=(?P<empty>\d+)\s+miss=(?P<miss>\d+)"
 )
 
+# Final client-area geometry mpv actually rendered into. This is the ONLY
+# trustworthy statement of render size: the acceptance conf sets `fs`, which
+# silently overrides --geometry, and a --fs=no + --geometry pair gets clamped
+# by the window border/title bar. Two separate resolution sweeps in this
+# project were invalidated that way (WP-K3's `fs` case and WP-K4's clamp to
+# 6927x4147 while labelled 8K). Never infer render size from the flags passed.
+_WIN_RE = re.compile(r"Window size changed to:\s*(\d+):(\d+):(\d+):(\d+)")
+
 
 def parse_log_file(path: str) -> dict:
     """Extract [slowframe] and [render-ahead] telemetry from an mpv text log."""
@@ -223,6 +231,7 @@ def parse_log_file(path: str) -> dict:
     # phase label -> (worst value, raw line)
     worst: dict[str, tuple[float, str]] = {}
     ra_count = 0
+    win: tuple[int, int] | None = None
     ra_last: tuple[int, int, int] | None = None
     ra_max_miss = 0
     ra_worst_line = ""
@@ -236,6 +245,11 @@ def parse_log_file(path: str) -> dict:
                     v = float(m.group(grp))
                     if label not in worst or v > worst[label][0]:
                         worst[label] = (v, raw.rstrip("\n"))
+                continue
+            m = _WIN_RE.search(raw)
+            if m:
+                x0, y0, x1, y1 = (int(m.group(i)) for i in (1, 2, 3, 4))
+                win = (x1 - x0, y1 - y0)
                 continue
             m = _RA_RE.search(raw)
             if m:
@@ -255,6 +269,7 @@ def parse_log_file(path: str) -> dict:
         "ra_last": ra_last,
         "ra_max_miss": ra_max_miss,
         "ra_worst_line": ra_worst_line,
+        "render_size": win,
     }
 
 
@@ -291,6 +306,9 @@ def print_table(reports: list[Report], file=sys.stdout) -> None:
 
 
 def print_log_summary(info: dict, file=sys.stdout) -> None:
+    rs = info.get("render_size")
+    print(f"render size (from the run's own log): "
+          f"{f'{rs[0]}x{rs[1]}' if rs else 'UNKNOWN'}", file=file)
     print(f"[slowframe] lines: {info['slow_count']}", file=file)
     if info["slow_worst"]:
         print("  worst by phase (ms):", file=file)
@@ -303,6 +321,154 @@ def print_log_summary(info: dict, file=sys.stdout) -> None:
         s, e, m = info["ra_last"]
         print(f"  last: served={s} empty={e} miss={m}", file=file)
         print(f"  max miss={info['ra_max_miss']}   {info['ra_worst_line']}", file=file)
+
+
+# --------------------------------------------------------------------------
+# WP-K5: osd_render() sub-phase decomposition (sr-* value lines)
+# --------------------------------------------------------------------------
+#
+# sub/osd.c emits one contiguous block of `value ... sr-<phase>` lines per
+# osd_render() call, starting with sr-total. The phases form a two-level tree
+# and C already computed each residual, so this reader only has to group the
+# blocks, re-derive the residuals independently, and report.
+#
+# Why blocks and not start/end spans: osd_render() runs up to 3x per presented
+# frame, so nested spans would produce a per-name histogram mixing parents with
+# children -- exactly the defect that made the raw "sub-render" number
+# unreadable (sub/osd.c used to emit an inner span of that same name, and
+# --dump-stats lines carry no context prefix, so both landed in one bucket).
+
+SR_TREE = {
+    "sr-total":    ["sr-osdlock", "sr-obj", "sr-other"],
+    "sr-obj":      ["sr-fetch", "sr-inline", "sr-async", "sr-scale", "sr-objother"],
+    "sr-fetch":    ["sr-flock", "sr-fwait", "sr-fserve", "sr-ftail", "sr-fother"],
+    "sr-inline":   ["sr-ilock", "sr-irender", "sr-iother"],
+    "sr-irender":  ["sr-assrender", "sr-pack", "sr-bcopy", "sr-irother"],
+    "sr-pack":     ["sr-packfree", "sr-packcopy", "sr-pkother"],
+}
+
+SR_ORDER = ["sr-total", "sr-osdlock", "sr-obj", "sr-other",
+            "sr-fetch", "sr-inline", "sr-async", "sr-scale", "sr-objother",
+            "sr-flock", "sr-fwait", "sr-fserve", "sr-ftail", "sr-fother",
+            "sr-ilock", "sr-irender", "sr-iother",
+            "sr-assrender", "sr-pack", "sr-bcopy", "sr-irother",
+            "sr-packfree", "sr-packcopy", "sr-pkother",
+            # not part of the sum tree: worst single occurrence, which
+            # separates "N objects each waited" from "one object blocked".
+            "sr-objmax", "sr-fwaitmax",
+            "sr-nobj", "sr-nfetch", "sr-nwait", "sr-ninline", "sr-nasync",
+            "sr-nparts", "sr-blobkb", "sr-flags"]
+
+_SR_L2 = {"sr-fetch", "sr-inline", "sr-async", "sr-scale", "sr-objother"}
+_SR_L3 = {"sr-flock", "sr-fwait", "sr-fserve", "sr-ftail", "sr-fother",
+          "sr-ilock", "sr-irender", "sr-iother"}
+_SR_L4 = {"sr-assrender", "sr-pack", "sr-bcopy", "sr-irother"}
+_SR_L5 = {"sr-packfree", "sr-packcopy", "sr-pkother"}
+
+
+def sr_blocks(path: str) -> list[dict]:
+    """Group the sr-* value lines into one dict per osd_render() call."""
+    out: list[dict] = []
+    cur: dict | None = None
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            tok = raw.split("#", 1)[0].split()
+            if len(tok) < 4 or tok[1] != "value" or not tok[3].startswith("sr-"):
+                continue
+            if tok[3] == "sr-total":
+                if cur:
+                    out.append(cur)
+                cur = {"ts": int(tok[0])}
+            if cur is None:
+                continue        # stray tail of a truncated first block
+            try:
+                cur[tok[3]] = float(tok[2])
+            except ValueError:
+                pass
+    if cur:
+        out.append(cur)
+    return out
+
+
+def sr_check(blocks: list[dict], tol: float = 0.01) -> list[str]:
+    """Independently re-derive every residual; return a list of problems.
+
+    A phase decomposition that does not sum to its parent, or that yields a
+    negative residual, is measuring something other than what it claims --
+    report it rather than letting it into a conclusion.
+    """
+    problems: list[str] = []
+    for i, b in enumerate(blocks):
+        for parent, kids in SR_TREE.items():
+            if parent not in b or any(k not in b for k in kids):
+                problems.append(f"block {i}: incomplete ({parent})")
+                continue
+            got, summed = b[parent], sum(b[k] for k in kids)
+            if abs(got - summed) > tol:
+                problems.append(
+                    f"block {i}: {parent}={got:.3f} != sum(children)={summed:.3f}")
+            for k in kids:
+                if b[k] < -tol:
+                    problems.append(f"block {i}: {k} negative ({b[k]:.3f})")
+    return problems
+
+
+def print_sr_table(blocks: list[dict], budget: float, file=sys.stdout) -> None:
+    if not blocks:
+        print("no sr-* phase blocks found (build lacks the WP-K5 instrumentation, "
+              "or --dump-stats was off)", file=file)
+        return
+    print(f"osd_render() phase decomposition: {len(blocks)} calls", file=file)
+    hdr = (f"{'phase':<16} {'n':>6} {'mean':>8} {'p50':>8} {'p95':>8} "
+           f"{'p99':>8} {'max':>9} {'over':>6}")
+    print(hdr, file=file)
+    print("-" * len(hdr), file=file)
+    for name in SR_ORDER:
+        vals = sorted(b[name] for b in blocks if name in b)
+        if not vals:
+            continue
+        counter = (name.startswith("sr-n") or name == "sr-flags"
+                   or name == "sr-blobkb")
+        over = 0 if counter else sum(1 for v in vals if v > budget)
+        pad = ("        " if name in _SR_L5 else
+               "      " if name in _SR_L4 else
+               "    " if name in _SR_L3 else
+               "  " if name in _SR_L2 else "")
+        print(f"{pad + name[3:]:<16} {len(vals):>6} {sum(vals)/len(vals):>8.3f} "
+              f"{percentile(vals, 0.50):>8.3f} {percentile(vals, 0.95):>8.3f} "
+              f"{percentile(vals, 0.99):>8.3f} {vals[-1]:>9.3f} {over:>6}",
+              file=file)
+
+    # The point of the exercise: for the worst calls, where did the time go?
+    cols = ["sr-total", "sr-osdlock", "sr-obj", "sr-objmax", "sr-fetch",
+            "sr-fwait", "sr-fwaitmax", "sr-flock", "sr-fserve", "sr-ftail",
+            "sr-inline", "sr-ilock", "sr-irender", "sr-assrender",
+            "sr-pack", "sr-bcopy", "sr-async", "sr-other",
+            "sr-objother", "sr-nobj", "sr-nwait", "sr-ninline"]
+    worst = sorted(blocks, key=lambda b: b.get("sr-total", 0.0), reverse=True)[:15]
+    print("\nworst 15 osd_render() calls by total (ms):", file=file)
+    print("  " + " ".join(f"{c[3:]:>9}" for c in cols) + f" {'flags':>6}", file=file)
+    for b in worst:
+        print("  " + " ".join(f"{b.get(c, float('nan')):>9.3f}" for c in cols) +
+              f" {int(b.get('sr-flags', -1)):>6}", file=file)
+
+    # How much of the tail is pure waiting? That distinction is the whole
+    # question: waiting for the worker is not per-frame work.
+    tot = [b["sr-total"] for b in blocks if "sr-total" in b]
+    if tot:
+        for thr in (10.0, 20.0, budget, 80.0, 100.0):
+            sel = [b for b in blocks if b.get("sr-total", 0) > thr]
+            if not sel:
+                continue
+            s_tot = sum(b["sr-total"] for b in sel)
+            s_wait = sum(b.get("sr-fwait", 0.0) for b in sel)
+            s_lock = sum(b.get("sr-osdlock", 0.0) + b.get("sr-flock", 0.0)
+                         for b in sel)
+            print(f"\ncalls over {thr:.1f} ms: {len(sel)}  "
+                  f"total={s_tot:.1f} ms  of which wait={s_wait:.1f} ms "
+                  f"({100.0 * s_wait / s_tot:.1f}%)  "
+                  f"lock={s_lock:.1f} ms ({100.0 * s_lock / s_tot:.1f}%)",
+                  file=file)
 
 
 # --------------------------------------------------------------------------
@@ -344,6 +510,32 @@ def run_assertions(st: Stats, args) -> int:
             )
         else:
             print(f"assert-under OK: {ev} max {mx:.1f} <= {limit:.1f} ms")
+
+    if args.assert_render_size:
+        # Refuse to let a run whose real geometry differs from the intended one
+        # be read as valid. This is an assertion, not a warning, because the
+        # warning form of it has already failed twice.
+        want = args.assert_render_size.lower().replace("*", "x")
+        m = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", want)
+        if not m:
+            _fail(f"--assert-render-size bad spec {args.assert_render_size!r} (want WxH)",
+                  failures)
+        elif not args.log:
+            _fail("--assert-render-size needs --log (render size lives in the text log)",
+                  failures)
+        else:
+            got = parse_log_file(args.log).get("render_size")
+            exp = (int(m.group(1)), int(m.group(2)))
+            if got is None:
+                _fail(f"--assert-render-size: no 'Window size changed to:' line in "
+                      f"{args.log} -- cannot prove the render size; run with -v", failures)
+            elif got != exp:
+                _fail(f"RENDER SIZE MISMATCH: ran at {got[0]}x{got[1]}, expected "
+                      f"{exp[0]}x{exp[1]}. The acceptance conf's `fs` overrides "
+                      f"--geometry, and --fs=no + --geometry gets clamped by the "
+                      f"window border. This run's numbers are VOID.", failures)
+            else:
+                print(f"assert-render-size OK: {got[0]}x{got[1]}")
 
     for spec in args.assert_count or []:
         # EVENT<=N  -- counter (event/signal/bare) markers must be <= N
@@ -410,6 +602,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print an aligned table instead of one line per event")
     p.add_argument("--anomalies", action="store_true",
                    help="also print unpaired start/end counts")
+    p.add_argument("--phases", action="store_true",
+                   help="WP-K5: decompose osd_render() from the sr-* value lines "
+                        "(validates that each phase sums to its parent)")
     # log parsing
     p.add_argument("--log", help="parse an mpv text log for slowframe/render-ahead lines")
     # assertions
@@ -417,6 +612,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="fail if any pair of EVENT exceeds MS (repeatable)")
     p.add_argument("--assert-count", action="append", metavar="EVENT<=N",
                    help="fail if counter EVENT occurs more than N times (repeatable)")
+    p.add_argument("--assert-render-size", metavar="WxH",
+                   help="fail unless the run's own log shows this client-area "
+                        "render size (use with --log); guards the `fs`/--geometry trap")
     p.add_argument("--assert-value", action="append", metavar="NAME==V",
                    help="fail if last value sample of NAME != V (repeatable)")
     p.add_argument("--value-tol", type=float, default=1e-6,
@@ -432,17 +630,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.log:
         info = parse_log_file(args.log)
         print_log_summary(info)
-        if not args.stats:
+        if not args.stats and not args.assert_render_size:
             return 0
 
     if not args.stats:
+        if args.assert_render_size:
+            return run_assertions(Stats(), args)
         print("error: no stats file given (and no --log)", file=sys.stderr)
         return 2
+
+    if args.phases:
+        blocks = sr_blocks(args.stats)
+        problems = sr_check(blocks)
+        print_sr_table(blocks, args.budget)
+        if problems:
+            print(f"\nPHASE ARITHMETIC PROBLEMS: {len(problems)}", file=sys.stderr)
+            for p_ in problems[:20]:
+                print(f"  {p_}", file=sys.stderr)
+            return 1
+        if blocks:
+            print("\nphase arithmetic OK "
+                  f"({len(blocks)} calls, every level sums to its parent)")
+        return 0
 
     st = parse_stats_file(args.stats)
 
     # assertion mode short-circuits normal reporting
-    if args.assert_under or args.assert_count or args.assert_value:
+    if (args.assert_under or args.assert_count or args.assert_value
+            or args.assert_render_size):
         return run_assertions(st, args)
 
     # choose events

@@ -100,6 +100,7 @@
 #include "osdep/timer.h"
 #include "sd.h"
 #include "sub_ahead.h"
+#include "sub_phase.h"
 #include "video/mp_image.h"
 
 // Bank only while a render costs less than this fraction of a frame interval
@@ -886,9 +887,9 @@ void sub_ahead_inline_end(struct sub_ahead *a)
     mp_mutex_unlock(&a->lock);
 }
 
-struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
-                                          struct mp_osd_res dim, int format,
-                                          double raw_video_pts, bool *handled)
+static struct sub_bitmaps *ahead_get_bitmaps(struct sub_ahead *a,
+                                             struct mp_osd_res dim, int format,
+                                             double raw_video_pts, bool *handled)
 {
     *handled = false;
     if (!a)
@@ -901,6 +902,8 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
     int64_t t_enter = mp_time_ns();
     mp_mutex_lock(&a->lock);
     int64_t lock_ns = mp_time_ns() - t_enter;
+    if (sub_phase.on)
+        sub_phase.flock_ns += lock_ns;   // WP-K5
     int64_t wait_ns = 0;
     if (a->play_dir < 0) {
         // Reverse playback: the worker only walks forward. Degraded mode --
@@ -942,6 +945,14 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
                     break;       // deadline passed
             }
             wait_ns = mp_time_ns() - wait_t0;
+            // WP-K5: this is WAITING for the worker, not work. It is bounded
+            // by one frame interval by default, which is exactly the 40-41.8ms
+            // band the raw "sub-render" span shows with render-ahead on.
+            if (sub_phase.on) {
+                sub_phase.fwait_ns += wait_ns;
+                sub_phase.fwaitmax_ns = MPMAX(sub_phase.fwaitmax_ns, wait_ns);
+                sub_phase.n_wait++;
+            }
             if (idx >= 0)
                 a->dbg_wait++;
         }
@@ -965,6 +976,7 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
             a->dbg_stale++;
     }
     struct sub_bitmaps *res = NULL;
+    int64_t t_serve = sub_phase.on ? mp_time_ns() : 0;   // WP-K5
     if (src >= 0 && a->ring[src].pl) {
         // Serve by reference: pin the entry's payload instead of deep-copying
         // parts + blobs (the copy was the dominant VO-thread cost on dense
@@ -972,6 +984,8 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
         // worker evicts the entry while the VO still holds the serve.
         res = payload_serve(a->ring[src].pl);
     }
+    if (sub_phase.on)
+        sub_phase.fserve_ns += mp_time_ns() - t_serve;
     if (src >= 0) {
         // Whatever the VO draws this frame it also resolves against the GPU
         // glyph cache, so the idle pre-fill must not reprocess this entry.
@@ -1001,6 +1015,7 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
     int nretire = 0;
     struct ahead_payload **retired = retire_steal(a, &nretire);
     mp_mutex_unlock(&a->lock);
+    int64_t t_tail = sub_phase.on ? mp_time_ns() : 0;   // WP-K5
     mp_cond_signal(&a->wakeup);  // nudge the worker to refill ahead of us
     // Log/stats writes and payload frees happen OFF the lock (item 2): a
     // blocking stats write or a big talloc free here can no longer stall a
@@ -1012,7 +1027,29 @@ struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
     }
     ahead_dbg_emit(a, &snap);
     retire_flush(retired, nretire);
+    // WP-K5: the tail is not free -- ahead_dbg_emit() can write up to 8
+    // MP_STATS lines and retire_flush() talloc_free()s evicted payloads
+    // (whole OUTLINES frames, MBs each) synchronously on the VO thread.
+    if (sub_phase.on)
+        sub_phase.ftail_ns += mp_time_ns() - t_tail;
     return res;
+}
+
+struct sub_bitmaps *sub_ahead_get_bitmaps(struct sub_ahead *a,
+                                          struct mp_osd_res dim, int format,
+                                          double raw_video_pts, bool *handled)
+{
+    // WP-K5: wrap so every early return (null ahead, reverse playback, no
+    // pts) is charged to fetch_ns too -- a phase that silently skips its own
+    // exits is how a residual grows a bogus tail.
+    if (!sub_phase.on)
+        return ahead_get_bitmaps(a, dim, format, raw_video_pts, handled);
+    int64_t t0 = mp_time_ns();
+    struct sub_bitmaps *r = ahead_get_bitmaps(a, dim, format, raw_video_pts,
+                                              handled);
+    sub_phase.fetch_ns += mp_time_ns() - t0;
+    sub_phase.n_fetch++;
+    return r;
 }
 
 struct sub_bitmaps *sub_ahead_peek_prefill(struct sub_ahead *a, double *out_pts)

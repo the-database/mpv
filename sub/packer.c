@@ -32,6 +32,8 @@
 
 #include "common/common.h"
 #include "packer.h"
+#include "sub_phase.h"
+#include "osdep/timer.h"
 #include "img_convert.h"
 #include "osd.h"
 #include "video/out/bitmap_packer.h"
@@ -291,9 +293,17 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
     // Fresh outline-blob storage for this pack (the previous cached parts'
     // outline pointers are now stale).
     if (format == SUBBITMAP_LIBASS_OUTLINES) {
+        // WP-K5: this is one talloc_free per part of the PREVIOUS frame,
+        // every frame. Timed separately from the copy that replaces it --
+        // pack_ns is measured at 89% of the whole inline render, so the two
+        // halves of it need to be distinguishable.
+        int64_t t_pf = sub_phase.on ? mp_time_ns() : 0;
         talloc_free(p->seg_ctx);
         p->seg_ctx = talloc_new(p);
+        if (sub_phase.on)
+            sub_phase.packfree_ns += mp_time_ns() - t_pf;
     }
+    int64_t t_pc = sub_phase.on ? mp_time_ns() : 0;   // WP-K5
 
     struct sub_bitmaps res = {
         .change_id = image_lists_changed,
@@ -351,6 +361,9 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
                 b->libass.outline = ta_memdup(p->seg_ctx, (void *) img->outline,
                                               (size_t) img->n_outline * sizeof(int32_t));
                 b->libass.n_outline = img->n_outline;
+                if (sub_phase.on)
+                    sub_phase.pack_bytes +=
+                        (int64_t) img->n_outline * sizeof(int32_t);   // WP-K5
                 b->bitmap = NULL;
                 b->stride = 0;
                 b->src_x = b->src_y = 0;   // unused in outline mode; don't leave stale
@@ -363,6 +376,11 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->y = img->dst_y;
             res.num_parts++;
         }
+    }
+
+    if (sub_phase.on) {   // WP-K5
+        sub_phase.packcopy_ns += mp_time_ns() - t_pc;
+        sub_phase.pack_parts += res.num_parts;
     }
 
     bool r = false;
