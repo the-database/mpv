@@ -4220,8 +4220,25 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         // space and no overlay part (t = -1 -- the emission loop skips it).
         // Its coverage is still BUILT when a visible sibling needs it for the
         // fix_outline subtraction (see the region compose below).
-        bool bord_vis = regs[i].nbord && (regs[i].bord_color & 0xFF) != 0xFF;
-        bool fill_vis = regs[i].nfill &&
+        // WP-J1 clamps a run's bbox to its rectangular \clip, and a run whose
+        // clip misses its bbox entirely clamps to an EMPTY box. Keeping that
+        // box degenerate-but-valid was meant to leave the emission crop to
+        // drop it, but the crop never runs: every compose pass below is a
+        // compute dispatch sized from the box plus `margin`, and with no
+        // blur/\be margin to pad it that dispatch is 0 wide or 0 tall.
+        // libplacebo asserts on it (dispatch.c pl_dispatch_compute:
+        // `params->width && params->height`), so mpv aborts outright --
+        // samples/c3_clip_selfint.ass under --sub-gpu-raster=yes does exactly
+        // this. (Release builds configure -Db_ndebug=true, where it degrades
+        // to a no-op dispatch instead, so this bites assert-enabled builds and
+        // the acceptance gate.) An empty box composites to nothing by
+        // definition, so drop the region-layer the same way an invisible one
+        // is dropped: no ems entry, hence no result-atlas allocation, no
+        // coverage build and no overlay part.
+        bool empty = regs[i].x1 <= regs[i].x0 || regs[i].y1 <= regs[i].y0;
+        bool bord_vis = !empty && regs[i].nbord &&
+                        (regs[i].bord_color & 0xFF) != 0xFF;
+        bool fill_vis = !empty && regs[i].nfill &&
                         ((regs[i].fill_color & 0xFF) != 0xFF ||
                          ((regs[i].run_flags & RUN_FLAG_KF_WIPE) &&
                           (regs[i].fill_color2 & 0xFF) != 0xFF));
