@@ -807,6 +807,12 @@ struct priv {
     // demotes a whole region to ONE DISPATCH PER GLYPH -- the split tells the
     // two regimes apart from a capture.
     int cp_ngather, cp_npart;
+    // WP-J3: resolve() sub-phase ns. resolve dominates an 8K compose on the
+    // rig (p50 64 ms of a 90 ms compose) but is several distinct kinds of
+    // work; split it so the next cut is aimed at the measured one.
+    int64_t cp_rhash_ns, cp_rplace_ns, cp_rjobs_ns;
+    int cp_nhash, cp_nshare;
+    int64_t cp_hash_bytes;
 
     struct mp_image_params target_params;
 };
@@ -4101,6 +4107,9 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     int64_t cp_leader_px = 0;
     int cp_maxw = 0, cp_maxh = 0;
     p->cp_ngather = p->cp_npart = 0;
+    p->cp_rhash_ns = p->cp_rplace_ns = p->cp_rjobs_ns = 0;
+    p->cp_nhash = p->cp_nshare = 0;
+    p->cp_hash_bytes = 0;
 
     // Resolve every deferred glyph to its atlas position, collecting cache
     // misses to upload in one async batch (a synchronous per-glyph .ptr upload
@@ -4139,8 +4148,17 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     struct clipmask *clips = NULL;
     int nclips = 0;
     // WP-J2: outlines this item has already placed in the transient store,
-    // keyed by blob content hash -- see the dedupe in the resolve loop.
-    struct tshare { uint64_t hash; int w, h; struct gpos pos; };
+    // keyed by blob content -- see the dedupe in the resolve loop. WP-J3: the
+    // key is (n_outline, w, h) with an exact memcmp against the representative
+    // blob, not a full content hash. The gradient-band idiom reaches this path
+    // ~141 times per compose with a full-frame drawing each time, and hashing
+    // every copy end-to-end is the measured bulk of the resolve phase; memcmp
+    // is SIMD and only has to run until the first differing byte, while equal
+    // blobs (the case that matters here) cost one streaming compare instead of
+    // a scalar multiply-mix over the same bytes. It is also strictly MORE
+    // exact than the hash key it replaces, which accepted hash equality with
+    // no confirming compare.
+    struct tshare { const int32_t *blob; int32_t n; int w, h; struct gpos pos; };
     struct tshare *tsh = NULL;
     int tsh_mask = 0;
 #endif
@@ -4201,19 +4219,36 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                     tsh = talloc_zero_array(tmp, struct tshare, tsh_mask);
                     tsh_mask--;
                 }
-                uint64_t th = gc_blob_hash(b->libass.outline,
-                                           b->libass.n_outline, b->w, b->h);
-                int sl = (int) (th & tsh_mask);
-                while (tsh[sl].hash && !(tsh[sl].hash == th &&
-                                         tsh[sl].w == b->w && tsh[sl].h == b->h))
+                int64_t h0 = cp_on ? mp_time_ns() : 0;
+                size_t nb = (size_t) b->libass.n_outline * sizeof(int32_t);
+                // Bucket on the cheap dims, confirm on the bytes.
+                uint64_t dk = (uint64_t) (uint32_t) b->libass.n_outline *
+                                  0x9E3779B97F4A7C15ull ^
+                              ((uint64_t) (uint32_t) b->w << 32 |
+                               (uint32_t) b->h);
+                dk ^= dk >> 29;
+                int sl = (int) (dk & tsh_mask);
+                while (tsh[sl].blob &&
+                       !(tsh[sl].n == b->libass.n_outline &&
+                         tsh[sl].w == b->w && tsh[sl].h == b->h &&
+                         memcmp(tsh[sl].blob, b->libass.outline, nb) == 0))
                     sl = (sl + 1) & tsh_mask;
                 slot = &tsh[sl];
-                if (slot->hash) {
+                if (cp_on) {
+                    p->cp_rhash_ns += mp_time_ns() - h0;
+                    p->cp_nhash++;
+                    p->cp_hash_bytes += (int64_t) nb;
+                }
+                if (slot->blob) {
                     cpos[i] = slot->pos;   // placed AND queued by an earlier copy
                     p->cnt_trans_share++;
+                    if (cp_on)
+                        p->cp_nshare++;
                     have_pos = true;       // up stays false: no re-raster
                 } else {
-                    *slot = (struct tshare){ th, b->w, b->h, {0, 0, 0} };
+                    *slot = (struct tshare){ b->libass.outline,
+                                             b->libass.n_outline,
+                                             b->w, b->h, {0, 0, 0} };
                 }
             }
 #endif
@@ -4231,7 +4266,7 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                     p->cnt_gcache_overcommit++;
 #if HAVE_ASS_OUTLINE_DEFERRED
                     if (slot)
-                        slot->hash = 0;   // unplaced: never share the failure
+                        slot->blob = NULL;  // unplaced: never share the failure
 #endif
                     continue;
                 }
@@ -5020,7 +5055,8 @@ restart_alloc:
                    "upload=%.1f regions=%.1f order=%.1f group=%.1f "
                    "clipbox=%.1f alloc=%.1f pools=%.1f passes=%.1f "
                    "emit=%.1f store=%.1f | leaderpx=%.2fMpx maxbox=%dx%d "
-                   "runparts=%d spillparts=%d gather=%d partdisp=%d\n",
+                   "runparts=%d spillparts=%d gather=%d partdisp=%d "
+                   "rkey=%.1f nkey=%d nshare=%d keyMB=%.1f\n",
                    item->render_index, item->num_parts, nregs, cp_leaders,
                    spilled ? 1 : 0, tot / 1e6,
                    cp[CP_RESOLVE] / 1e6, cp[CP_RASTER] / 1e6,
@@ -5031,7 +5067,9 @@ restart_alloc:
                    cp[CP_EMIT] / 1e6, cp[CP_STORE] / 1e6,
                    cp_leader_px / 1e6, cp_maxw, cp_maxh,
                    entry->num_run_parts, entry->num_spill_parts,
-                   p->cp_ngather, p->cp_npart);
+                   p->cp_ngather, p->cp_npart,
+                   p->cp_rhash_ns / 1e6, p->cp_nhash, p->cp_nshare,
+                   p->cp_hash_bytes / 1048576.0);
     }
 #undef CP_MARK
     return true;
