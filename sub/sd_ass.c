@@ -238,6 +238,14 @@ static void enable_output(struct sd *sd, bool enable)
     if (enable == !!ctx->ass_renderer)
         return;
     if (ctx->ass_renderer) {
+#if HAVE_ASS_OUTLINE_DEFERRED
+        // The packer borrows coverage blobs from this renderer's caches and is
+        // a talloc child of ctx, so it would otherwise outlive the renderer.
+        // Dropping the last ref to a pinned glyph cascades into the font cache
+        // and FT_Done_Face, which needs the library alive: release first.
+        if (ctx->packer)
+            mp_sub_packer_release_ass_pins(ctx->packer);
+#endif
         ass_renderer_done(ctx->ass_renderer);
         ctx->ass_renderer = NULL;
     } else {
