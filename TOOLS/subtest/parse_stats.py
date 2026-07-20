@@ -306,6 +306,154 @@ def print_log_summary(info: dict, file=sys.stdout) -> None:
 
 
 # --------------------------------------------------------------------------
+# WP-K5: osd_render() sub-phase decomposition (sr-* value lines)
+# --------------------------------------------------------------------------
+#
+# sub/osd.c emits one contiguous block of `value ... sr-<phase>` lines per
+# osd_render() call, starting with sr-total. The phases form a two-level tree
+# and C already computed each residual, so this reader only has to group the
+# blocks, re-derive the residuals independently, and report.
+#
+# Why blocks and not start/end spans: osd_render() runs up to 3x per presented
+# frame, so nested spans would produce a per-name histogram mixing parents with
+# children -- exactly the defect that made the raw "sub-render" number
+# unreadable (sub/osd.c used to emit an inner span of that same name, and
+# --dump-stats lines carry no context prefix, so both landed in one bucket).
+
+SR_TREE = {
+    "sr-total":    ["sr-osdlock", "sr-obj", "sr-other"],
+    "sr-obj":      ["sr-fetch", "sr-inline", "sr-async", "sr-scale", "sr-objother"],
+    "sr-fetch":    ["sr-flock", "sr-fwait", "sr-fserve", "sr-ftail", "sr-fother"],
+    "sr-inline":   ["sr-ilock", "sr-irender", "sr-iother"],
+    "sr-irender":  ["sr-assrender", "sr-pack", "sr-bcopy", "sr-irother"],
+    "sr-pack":     ["sr-packfree", "sr-packcopy", "sr-pkother"],
+}
+
+SR_ORDER = ["sr-total", "sr-osdlock", "sr-obj", "sr-other",
+            "sr-fetch", "sr-inline", "sr-async", "sr-scale", "sr-objother",
+            "sr-flock", "sr-fwait", "sr-fserve", "sr-ftail", "sr-fother",
+            "sr-ilock", "sr-irender", "sr-iother",
+            "sr-assrender", "sr-pack", "sr-bcopy", "sr-irother",
+            "sr-packfree", "sr-packcopy", "sr-pkother",
+            # not part of the sum tree: worst single occurrence, which
+            # separates "N objects each waited" from "one object blocked".
+            "sr-objmax", "sr-fwaitmax",
+            "sr-nobj", "sr-nfetch", "sr-nwait", "sr-ninline", "sr-nasync",
+            "sr-nparts", "sr-blobkb", "sr-flags"]
+
+_SR_L2 = {"sr-fetch", "sr-inline", "sr-async", "sr-scale", "sr-objother"}
+_SR_L3 = {"sr-flock", "sr-fwait", "sr-fserve", "sr-ftail", "sr-fother",
+          "sr-ilock", "sr-irender", "sr-iother"}
+_SR_L4 = {"sr-assrender", "sr-pack", "sr-bcopy", "sr-irother"}
+_SR_L5 = {"sr-packfree", "sr-packcopy", "sr-pkother"}
+
+
+def sr_blocks(path: str) -> list[dict]:
+    """Group the sr-* value lines into one dict per osd_render() call."""
+    out: list[dict] = []
+    cur: dict | None = None
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            tok = raw.split("#", 1)[0].split()
+            if len(tok) < 4 or tok[1] != "value" or not tok[3].startswith("sr-"):
+                continue
+            if tok[3] == "sr-total":
+                if cur:
+                    out.append(cur)
+                cur = {"ts": int(tok[0])}
+            if cur is None:
+                continue        # stray tail of a truncated first block
+            try:
+                cur[tok[3]] = float(tok[2])
+            except ValueError:
+                pass
+    if cur:
+        out.append(cur)
+    return out
+
+
+def sr_check(blocks: list[dict], tol: float = 0.01) -> list[str]:
+    """Independently re-derive every residual; return a list of problems.
+
+    A phase decomposition that does not sum to its parent, or that yields a
+    negative residual, is measuring something other than what it claims --
+    report it rather than letting it into a conclusion.
+    """
+    problems: list[str] = []
+    for i, b in enumerate(blocks):
+        for parent, kids in SR_TREE.items():
+            if parent not in b or any(k not in b for k in kids):
+                problems.append(f"block {i}: incomplete ({parent})")
+                continue
+            got, summed = b[parent], sum(b[k] for k in kids)
+            if abs(got - summed) > tol:
+                problems.append(
+                    f"block {i}: {parent}={got:.3f} != sum(children)={summed:.3f}")
+            for k in kids:
+                if b[k] < -tol:
+                    problems.append(f"block {i}: {k} negative ({b[k]:.3f})")
+    return problems
+
+
+def print_sr_table(blocks: list[dict], budget: float, file=sys.stdout) -> None:
+    if not blocks:
+        print("no sr-* phase blocks found (build lacks the WP-K5 instrumentation, "
+              "or --dump-stats was off)", file=file)
+        return
+    print(f"osd_render() phase decomposition: {len(blocks)} calls", file=file)
+    hdr = (f"{'phase':<16} {'n':>6} {'mean':>8} {'p50':>8} {'p95':>8} "
+           f"{'p99':>8} {'max':>9} {'over':>6}")
+    print(hdr, file=file)
+    print("-" * len(hdr), file=file)
+    for name in SR_ORDER:
+        vals = sorted(b[name] for b in blocks if name in b)
+        if not vals:
+            continue
+        counter = (name.startswith("sr-n") or name == "sr-flags"
+                   or name == "sr-blobkb")
+        over = 0 if counter else sum(1 for v in vals if v > budget)
+        pad = ("        " if name in _SR_L5 else
+               "      " if name in _SR_L4 else
+               "    " if name in _SR_L3 else
+               "  " if name in _SR_L2 else "")
+        print(f"{pad + name[3:]:<16} {len(vals):>6} {sum(vals)/len(vals):>8.3f} "
+              f"{percentile(vals, 0.50):>8.3f} {percentile(vals, 0.95):>8.3f} "
+              f"{percentile(vals, 0.99):>8.3f} {vals[-1]:>9.3f} {over:>6}",
+              file=file)
+
+    # The point of the exercise: for the worst calls, where did the time go?
+    cols = ["sr-total", "sr-osdlock", "sr-obj", "sr-objmax", "sr-fetch",
+            "sr-fwait", "sr-fwaitmax", "sr-flock", "sr-fserve", "sr-ftail",
+            "sr-inline", "sr-ilock", "sr-irender", "sr-assrender",
+            "sr-pack", "sr-bcopy", "sr-async", "sr-other",
+            "sr-objother", "sr-nobj", "sr-nwait", "sr-ninline"]
+    worst = sorted(blocks, key=lambda b: b.get("sr-total", 0.0), reverse=True)[:15]
+    print("\nworst 15 osd_render() calls by total (ms):", file=file)
+    print("  " + " ".join(f"{c[3:]:>9}" for c in cols) + f" {'flags':>6}", file=file)
+    for b in worst:
+        print("  " + " ".join(f"{b.get(c, float('nan')):>9.3f}" for c in cols) +
+              f" {int(b.get('sr-flags', -1)):>6}", file=file)
+
+    # How much of the tail is pure waiting? That distinction is the whole
+    # question: waiting for the worker is not per-frame work.
+    tot = [b["sr-total"] for b in blocks if "sr-total" in b]
+    if tot:
+        for thr in (10.0, 20.0, budget, 80.0, 100.0):
+            sel = [b for b in blocks if b.get("sr-total", 0) > thr]
+            if not sel:
+                continue
+            s_tot = sum(b["sr-total"] for b in sel)
+            s_wait = sum(b.get("sr-fwait", 0.0) for b in sel)
+            s_lock = sum(b.get("sr-osdlock", 0.0) + b.get("sr-flock", 0.0)
+                         for b in sel)
+            print(f"\ncalls over {thr:.1f} ms: {len(sel)}  "
+                  f"total={s_tot:.1f} ms  of which wait={s_wait:.1f} ms "
+                  f"({100.0 * s_wait / s_tot:.1f}%)  "
+                  f"lock={s_lock:.1f} ms ({100.0 * s_lock / s_tot:.1f}%)",
+                  file=file)
+
+
+# --------------------------------------------------------------------------
 # assertions (CI-style gating)
 # --------------------------------------------------------------------------
 
@@ -410,6 +558,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print an aligned table instead of one line per event")
     p.add_argument("--anomalies", action="store_true",
                    help="also print unpaired start/end counts")
+    p.add_argument("--phases", action="store_true",
+                   help="WP-K5: decompose osd_render() from the sr-* value lines "
+                        "(validates that each phase sums to its parent)")
     # log parsing
     p.add_argument("--log", help="parse an mpv text log for slowframe/render-ahead lines")
     # assertions
@@ -438,6 +589,20 @@ def main(argv: list[str] | None = None) -> int:
     if not args.stats:
         print("error: no stats file given (and no --log)", file=sys.stderr)
         return 2
+
+    if args.phases:
+        blocks = sr_blocks(args.stats)
+        problems = sr_check(blocks)
+        print_sr_table(blocks, args.budget)
+        if problems:
+            print(f"\nPHASE ARITHMETIC PROBLEMS: {len(problems)}", file=sys.stderr)
+            for p_ in problems[:20]:
+                print(f"  {p_}", file=sys.stderr)
+            return 1
+        if blocks:
+            print("\nphase arithmetic OK "
+                  f"({len(blocks)} calls, every level sums to its parent)")
+        return 0
 
     st = parse_stats_file(args.stats)
 
