@@ -44,6 +44,12 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
 struct mp_ass_pin;
 struct mp_ass_pin *mp_sub_packer_clone_ass_pin(struct mp_sub_packer *p,
                                                void *ta_parent);
+
+// Drop the borrowed-blob refs (and invalidate the cached pack that points at
+// them). MUST be called before destroying the ASS_Renderer that produced them:
+// the last unref of a pinned glyph reaches the font cache and FT_Done_Face,
+// which needs the library alive.
+void mp_sub_packer_release_ass_pins(struct mp_sub_packer *p);
 #endif
 
 #if HAVE_SUBRANDR
