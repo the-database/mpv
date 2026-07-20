@@ -216,6 +216,14 @@ _RA_RE = re.compile(
     r"\[render-ahead\]\s+served=(?P<served>\d+)\s+empty=(?P<empty>\d+)\s+miss=(?P<miss>\d+)"
 )
 
+# Final client-area geometry mpv actually rendered into. This is the ONLY
+# trustworthy statement of render size: the acceptance conf sets `fs`, which
+# silently overrides --geometry, and a --fs=no + --geometry pair gets clamped
+# by the window border/title bar. Two separate resolution sweeps in this
+# project were invalidated that way (WP-K3's `fs` case and WP-K4's clamp to
+# 6927x4147 while labelled 8K). Never infer render size from the flags passed.
+_WIN_RE = re.compile(r"Window size changed to:\s*(\d+):(\d+):(\d+):(\d+)")
+
 
 def parse_log_file(path: str) -> dict:
     """Extract [slowframe] and [render-ahead] telemetry from an mpv text log."""
@@ -223,6 +231,7 @@ def parse_log_file(path: str) -> dict:
     # phase label -> (worst value, raw line)
     worst: dict[str, tuple[float, str]] = {}
     ra_count = 0
+    win: tuple[int, int] | None = None
     ra_last: tuple[int, int, int] | None = None
     ra_max_miss = 0
     ra_worst_line = ""
@@ -236,6 +245,11 @@ def parse_log_file(path: str) -> dict:
                     v = float(m.group(grp))
                     if label not in worst or v > worst[label][0]:
                         worst[label] = (v, raw.rstrip("\n"))
+                continue
+            m = _WIN_RE.search(raw)
+            if m:
+                x0, y0, x1, y1 = (int(m.group(i)) for i in (1, 2, 3, 4))
+                win = (x1 - x0, y1 - y0)
                 continue
             m = _RA_RE.search(raw)
             if m:
@@ -255,6 +269,7 @@ def parse_log_file(path: str) -> dict:
         "ra_last": ra_last,
         "ra_max_miss": ra_max_miss,
         "ra_worst_line": ra_worst_line,
+        "render_size": win,
     }
 
 
@@ -291,6 +306,9 @@ def print_table(reports: list[Report], file=sys.stdout) -> None:
 
 
 def print_log_summary(info: dict, file=sys.stdout) -> None:
+    rs = info.get("render_size")
+    print(f"render size (from the run's own log): "
+          f"{f'{rs[0]}x{rs[1]}' if rs else 'UNKNOWN'}", file=file)
     print(f"[slowframe] lines: {info['slow_count']}", file=file)
     if info["slow_worst"]:
         print("  worst by phase (ms):", file=file)
@@ -493,6 +511,32 @@ def run_assertions(st: Stats, args) -> int:
         else:
             print(f"assert-under OK: {ev} max {mx:.1f} <= {limit:.1f} ms")
 
+    if args.assert_render_size:
+        # Refuse to let a run whose real geometry differs from the intended one
+        # be read as valid. This is an assertion, not a warning, because the
+        # warning form of it has already failed twice.
+        want = args.assert_render_size.lower().replace("*", "x")
+        m = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", want)
+        if not m:
+            _fail(f"--assert-render-size bad spec {args.assert_render_size!r} (want WxH)",
+                  failures)
+        elif not args.log:
+            _fail("--assert-render-size needs --log (render size lives in the text log)",
+                  failures)
+        else:
+            got = parse_log_file(args.log).get("render_size")
+            exp = (int(m.group(1)), int(m.group(2)))
+            if got is None:
+                _fail(f"--assert-render-size: no 'Window size changed to:' line in "
+                      f"{args.log} -- cannot prove the render size; run with -v", failures)
+            elif got != exp:
+                _fail(f"RENDER SIZE MISMATCH: ran at {got[0]}x{got[1]}, expected "
+                      f"{exp[0]}x{exp[1]}. The acceptance conf's `fs` overrides "
+                      f"--geometry, and --fs=no + --geometry gets clamped by the "
+                      f"window border. This run's numbers are VOID.", failures)
+            else:
+                print(f"assert-render-size OK: {got[0]}x{got[1]}")
+
     for spec in args.assert_count or []:
         # EVENT<=N  -- counter (event/signal/bare) markers must be <= N
         m = re.match(r"^\s*(.+?)\s*<=\s*(\d+)\s*$", spec)
@@ -568,6 +612,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="fail if any pair of EVENT exceeds MS (repeatable)")
     p.add_argument("--assert-count", action="append", metavar="EVENT<=N",
                    help="fail if counter EVENT occurs more than N times (repeatable)")
+    p.add_argument("--assert-render-size", metavar="WxH",
+                   help="fail unless the run's own log shows this client-area "
+                        "render size (use with --log); guards the `fs`/--geometry trap")
     p.add_argument("--assert-value", action="append", metavar="NAME==V",
                    help="fail if last value sample of NAME != V (repeatable)")
     p.add_argument("--value-tol", type=float, default=1e-6,
@@ -583,10 +630,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.log:
         info = parse_log_file(args.log)
         print_log_summary(info)
-        if not args.stats:
+        if not args.stats and not args.assert_render_size:
             return 0
 
     if not args.stats:
+        if args.assert_render_size:
+            return run_assertions(Stats(), args)
         print("error: no stats file given (and no --log)", file=sys.stderr)
         return 2
 
@@ -607,7 +656,8 @@ def main(argv: list[str] | None = None) -> int:
     st = parse_stats_file(args.stats)
 
     # assertion mode short-circuits normal reporting
-    if args.assert_under or args.assert_count or args.assert_value:
+    if (args.assert_under or args.assert_count or args.assert_value
+            or args.assert_render_size):
         return run_assertions(st, args)
 
     # choose events
