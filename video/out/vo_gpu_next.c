@@ -795,6 +795,12 @@ struct priv {
     // MSGL_V is active. The phase start/end dump-stats events themselves come
     // from stats_time_*() and are independent of these timers.
     int64_t dbg_subrender_ns, dbg_capcomp_ns, dbg_blur_ns;
+    // WP-J3 compose profiling (see the [composeprof] line): per-compose tally
+    // of the coverage-combine dispatches, split by path. The gather batch is
+    // capped by GATHER_GPU_CAP on bbox*count, so a large leader box silently
+    // demotes a whole region to ONE DISPATCH PER GLYPH -- the split tells the
+    // two regimes apart from a capture.
+    int cp_ngather, cp_npart;
 
     struct mp_image_params target_params;
 };
@@ -2694,6 +2700,7 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
                 // bounded by nglyph), same as the zero-padded tail.
                 osd_combine_gather(p, p->run_acc, gl, gn, bw, bh,
                                    p->trans_chain[glink]);
+                p->cp_ngather++;
                 gn = 0;
             }
             if (link >= 0)
@@ -2705,6 +2712,7 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
             if (++gn == GATHER_MAXG) {
                 osd_combine_gather(p, p->run_acc, gl, gn, bw, bh,
                                    glink >= 0 ? p->trans_chain[glink] : NULL);
+                p->cp_ngather++;
                 gn = 0;
                 glink = -1;
             }
@@ -2715,11 +2723,14 @@ static void gc_build_cov(struct priv *p, const struct sub_bitmaps *item,
                          p->trans_chain[cpos[parts[k]].t - 1] : p->glyph_atlas;
             osd_combine_part(p, src, p->run_acc, cpos[parts[k]].ax,
                              cpos[parts[k]].ay, dx, dy, b->w, b->h);
+            p->cp_npart++;
         }
     }
-    if (gn > 0)
+    if (gn > 0) {
         osd_combine_gather(p, p->run_acc, gl, gn, bw, bh,
                            glink >= 0 ? p->trans_chain[glink] : NULL);
+        p->cp_ngather++;
+    }
     osd_unop(p, p->run_acc, cov, bw, bh, "acc", false, "dst", osd_resolve_body);
 }
 
@@ -4052,6 +4063,32 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
 
     void *tmp = talloc_new(NULL);
 
+    // WP-J3: per-compose phase profile. One MP_VERBOSE line per compose with
+    // the CPU ms split plus the structural shape (regions, share leaders, the
+    // leader bboxes the per-run passes actually dispatch over). The rig
+    // evidence is that a single 8K compose costs ~100 ms of VO-thread CPU with
+    // gpu-passes ~1.3 ms, so the split has to be taken on the CPU side, per
+    // phase, not from GPU timers. Verbose-gated: with -v off this is a single
+    // predictable branch per phase and no clock reads at all.
+    bool cp_on = mp_msg_test(p->log, MSGL_V);
+    int64_t cp_t = cp_on ? mp_time_ns() : 0;
+    enum { CP_RESOLVE, CP_RASTER, CP_UPLOAD, CP_REGIONS, CP_ORDER, CP_GROUP,
+           CP_CLIPBOX, CP_ALLOC, CP_POOLS, CP_PASSES, CP_EMIT, CP_STORE,
+           CP_COUNT };
+    int64_t cp[CP_COUNT] = {0};
+#define CP_MARK(slot) do {                              \
+        if (cp_on) {                                    \
+            int64_t cp_n = mp_time_ns();                \
+            cp[slot] += cp_n - cp_t;                    \
+            cp_t = cp_n;                                \
+        }                                               \
+    } while (0)
+    // Structural shape of this compose (filled in by the phases below).
+    int cp_leaders = 0;
+    int64_t cp_leader_px = 0;
+    int cp_maxw = 0, cp_maxh = 0;
+    p->cp_ngather = p->cp_npart = 0;
+
     // Resolve every deferred glyph to its atlas position, collecting cache
     // misses to upload in one async batch (a synchronous per-glyph .ptr upload
     // stalls the VO thread on d3d11; see the staging-buffer note below).
@@ -4250,12 +4287,16 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         }
     }
 
+    CP_MARK(CP_RESOLVE);
+
 #if HAVE_ASS_OUTLINE_DEFERRED
     // Rasterize the outline-mode misses: the shared segment pool once
     // (chunked at capacity, WP-H6 item 1), then batched dispatches per
     // destination.
     gc_flush_raster_all(p, ne, rjobs, nrjobs, trjobs, ntrjobs);
 #endif // HAVE_ASS_OUTLINE_DEFERRED
+
+    CP_MARK(CP_RASTER);
 
     // Flush the upload misses (async, buffer-backed).
     if (nmiss)
@@ -4282,6 +4323,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         talloc_free(tmp);
         return false;
     }
+
+    CP_MARK(CP_UPLOAD);
 
     int max_run = 0;
     for (int i = 0; i < item->num_parts; i++)
@@ -4332,6 +4375,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             MP_TARRAY_APPEND(tmp, r->fill, r->nfill, i);
         }
     }
+
+    CP_MARK(CP_REGIONS);
 
     if (!nregs) { talloc_free(tmp); return true; }   // no deferred runs in this item
 
@@ -4397,6 +4442,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         ems[j] = e;
     }
 
+    CP_MARK(CP_ORDER);
+
     for (int i = 0; i < nregs; i++)
         regs[i].share = i;              // every region composes for itself...
 #if HAVE_ASS_OUTLINE_DEFERRED
@@ -4425,6 +4472,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
             }
         }
     }
+
+    CP_MARK(CP_GROUP);
 
     // WP-J1: narrow each region's coverage bbox to its rectangular \clip. The
     // clip is applied at emission as a pure dst-space crop (the vr[] rects in
@@ -4490,6 +4539,8 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
         }
     }
 #endif // HAVE_ASS_OUTLINE_DEFERRED
+
+    CP_MARK(CP_CLIPBOX);
 
     // WP-H6 (item 1): result-atlas allocation against the CURRENT capacity.
     // Only the presentation guard's persistent states spill (their result_tex
@@ -4664,6 +4715,8 @@ restart_alloc:
         MP_VERBOSE(p, "[present-guard] wall-entry all-spill compose runs to "
                    "completion (stores the reuse slot; entry-mustcomplete)\n");
     }
+    CP_MARK(CP_ALLOC);
+
     // WP-H6 (item 1): pre-grow watermarks on this frame's true demand. The
     // result atlases of BOTH ping-pong states are kept in step (the sibling
     // state builds the same content next frame). The run scratch quartet
@@ -4692,6 +4745,8 @@ restart_alloc:
         return true;
     }
 
+    CP_MARK(CP_POOLS);
+
     for (int i = 0; i < nregs; i++) {
         // WP-E3 checkpoint: between regions. Each iteration only records
         // dispatches into this build buffer's result_tex and the shared
@@ -4705,6 +4760,17 @@ restart_alloc:
         if (r->share != i)
             continue;   // WP-J2: its leader composes this coverage
         int bw = r->x1 - r->x0 + 2 * r->margin, bh = r->y1 - r->y0 + 2 * r->margin;
+        // WP-J3: every pass below (coverage build, blur, \be, fix_outline,
+        // clip multiply, the result copies) dispatches over this leader box,
+        // so its area is the per-group work unit worth reporting.
+        if (cp_on) {
+            cp_leaders++;
+            cp_leader_px += (int64_t) bw * bh;
+            if ((int64_t) bw * bh > (int64_t) cp_maxw * cp_maxh) {
+                cp_maxw = bw;
+                cp_maxh = bh;
+            }
+        }
         // WP-H6 (item 1): each layer's composed coverage goes where it was
         // allocated -- result_tex, or (WP-H10) the transient chain link it
         // spilled to.
@@ -4781,6 +4847,8 @@ restart_alloc:
                 osd_copy(p, p->run_cov_b, dst_b, r->bord_ax, r->bord_ay, bw, bh);
         }
     }
+
+    CP_MARK(CP_PASSES);
 
     // Emit the overlay in libass's EXACT z-order: the ASS_Image list order,
     // which item->parts preserves. Within one event libass emits every run's
@@ -4881,6 +4949,8 @@ restart_alloc:
 
     emit_composed_overlays(p, item, entry, frame, state, coords, src);
 
+    CP_MARK(CP_EMIT);
+
     // WP-H6 (item 6): the compose is complete; record its content key so an
     // identical later frame (same item change_id at the same geometry) can
     // re-emit it without re-composing. A spilled build is not reusable via
@@ -4923,6 +4993,32 @@ restart_alloc:
         s->valid = true;
         s->used = true;   // this build IS a use (bands are in tr_build)
     }
+
+    CP_MARK(CP_STORE);
+
+    if (cp_on) {
+        int64_t tot = 0;
+        for (int i = 0; i < CP_COUNT; i++)
+            tot += cp[i];
+        MP_VERBOSE(p, "[composeprof] item=%d parts=%d regs=%d leaders=%d "
+                   "spilled=%d total=%.1f | resolve=%.1f raster=%.1f "
+                   "upload=%.1f regions=%.1f order=%.1f group=%.1f "
+                   "clipbox=%.1f alloc=%.1f pools=%.1f passes=%.1f "
+                   "emit=%.1f store=%.1f | leaderpx=%.2fMpx maxbox=%dx%d "
+                   "runparts=%d spillparts=%d gather=%d partdisp=%d\n",
+                   item->render_index, item->num_parts, nregs, cp_leaders,
+                   spilled ? 1 : 0, tot / 1e6,
+                   cp[CP_RESOLVE] / 1e6, cp[CP_RASTER] / 1e6,
+                   cp[CP_UPLOAD] / 1e6, cp[CP_REGIONS] / 1e6,
+                   cp[CP_ORDER] / 1e6, cp[CP_GROUP] / 1e6,
+                   cp[CP_CLIPBOX] / 1e6, cp[CP_ALLOC] / 1e6,
+                   cp[CP_POOLS] / 1e6, cp[CP_PASSES] / 1e6,
+                   cp[CP_EMIT] / 1e6, cp[CP_STORE] / 1e6,
+                   cp_leader_px / 1e6, cp_maxw, cp_maxh,
+                   entry->num_run_parts, entry->num_spill_parts,
+                   p->cp_ngather, p->cp_npart);
+    }
+#undef CP_MARK
     return true;
 }
 
@@ -5390,6 +5486,38 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
                     p->cnt_spill_reuse++;
                     reuse = true;
                 }
+            }
+            // WP-J3: attribute every reuse MISS. A miss costs a full compose
+            // (~100 ms at 8K on the rig), so the question "why did this frame
+            // recompose?" has to be answerable from a normal -v capture.
+            // xstate reports whether the SIBLING ping-pong state already holds
+            // a compose with exactly this key: the guard alternates the build
+            // buffer every commit (build = 1 - good), and each state carries
+            // its own built_* key, so one content change makes BOTH states
+            // recompose before either can reuse. xstate=1 on a miss means this
+            // compose is recomputing content that already exists in the other
+            // state's result_tex, i.e. it is pure double-buffering waste.
+            if (!reuse && mp_msg_test(p->log, MSGL_V)) {
+                struct osd_entry *oe =
+                    &g->states[1 - build].entries[item->render_index];
+                bool xstate = oe->built_valid &&
+                              oe->built_change_id == item->change_id &&
+                              oe->built_format == item->format &&
+                              oe->built_gs == gs &&
+                              osd_res_equals(oe->built_res, res);
+                const char *why = !entry->built_valid ? "novalid"
+                    : entry->built_change_id != item->change_id ? "changeid"
+                    : entry->built_format != item->format ? "format"
+                    : entry->built_gs != gs ? "gs"
+                    : !osd_res_equals(entry->built_res, res) ? "res"
+                    : "slot";
+                MP_VERBOSE(p, "[composemiss] item=%d build=%d why=%s "
+                           "change=%lld built=%lld xstate=%d slotvalid=%d\n",
+                           item->render_index, build, why,
+                           (long long) item->change_id,
+                           (long long) entry->built_change_id, xstate ? 1 : 0,
+                           (item->render_index <= 1 &&
+                            p->trs[item->render_index].valid) ? 1 : 0);
             }
             if (reuse) {
                 emit_composed_overlays(p, item, entry, frame, state, coords, src);
