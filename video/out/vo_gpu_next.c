@@ -834,6 +834,7 @@ struct gl_next_opts {
     int sub_debug_stall_ms;     // WP-E3 debug: injected overlay-section sleep
     int sub_prefill_budget_ms;  // WP-H1b: idle glyph pre-fill budget; 0 = off
     bool sub_compose_xstate;    // WP-J3: cross-state compose reuse (see below)
+    bool sub_compose_hashmemo;  // WP-J3: memoize the per-item blob hash
     char **raw_opts;
 };
 
@@ -896,6 +897,11 @@ const struct m_sub_options gl_next_conf = {
         // the cross-state block in update_overlays). Default on; =no restores
         // the per-state-only behaviour for A/B measurement.
         {"sub-compose-xstate", OPT_BOOL(sub_compose_xstate)},
+        // WP-J3: memoize the per-item outline blob content hash on the blob
+        // pointer, so the gradient-band idiom's ~105 repeats of one large
+        // drawing hash it once instead of once per band. Default on; =no
+        // restores the per-copy hash for A/B measurement.
+        {"sub-compose-hashmemo", OPT_BOOL(sub_compose_hashmemo)},
         // DEBUG/dev only: sleep this many ms inside the overlay-build section
         // (after the first guard checkpoint), so the guard can be exercised
         // deterministically in tests. Not for normal use.
@@ -919,8 +925,9 @@ const struct m_sub_options gl_next_conf = {
         .target_hint_strict = true,
         .sub_glyph_atlas_size = 0,      // WP-H1d: auto (8192; 16384 on 4K+)
         .sub_present_guard_ms = -1,     // WP-E3: auto (frame duration)
-        .sub_prefill_budget_ms = 3,
-        .sub_compose_xstate = true,     // WP-H1b: idle glyph pre-fill budget
+        .sub_prefill_budget_ms = 3,     // WP-H1b: idle glyph pre-fill budget
+        .sub_compose_xstate = true,     // WP-J3: cross-state compose reuse
+        .sub_compose_hashmemo = true,   // WP-J3: per-item blob-hash memo
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -4143,6 +4150,17 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
     struct tshare { uint64_t hash; int w, h; struct gpos pos; };
     struct tshare *tsh = NULL;
     int tsh_mask = 0;
+    // WP-J3: blob-hash memo keyed on the blob POINTER. The gradient-band idiom
+    // hands the SAME outline back once per band -- ~105 copies per compose on
+    // the ep02 sign -- and each one is above the glyph-cache size cap, so each
+    // one reaches the content hash below and re-mixes the whole (large) tile
+    // blob. Within one item the parts' blob memory is stable, so an identical
+    // (pointer, n, w, h) provably names identical bytes and the hash can be
+    // taken once. Open-addressed on the pointer; a miss falls through to the
+    // real hash, so this can only ever save work, never change the key.
+    struct tmemo { const int32_t *blob; int32_t n; int w, h; uint64_t hash; };
+    struct tmemo *tmemo = NULL;
+    int tmemo_mask = 0;
 #endif
     ptrdiff_t pstride = is_outline ? 0 : item->packed->stride[0];
     // WP-E: resolve each glyph via the epoch-evicting cache (gc_place). A miss
@@ -4201,8 +4219,39 @@ static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                     tsh = talloc_zero_array(tmp, struct tshare, tsh_mask);
                     tsh_mask--;
                 }
-                uint64_t th = gc_blob_hash(b->libass.outline,
-                                           b->libass.n_outline, b->w, b->h);
+                uint64_t th = 0;
+                struct tmemo *mm = NULL;
+                if (p->next_opts->sub_compose_hashmemo) {
+                    if (!tmemo) {
+                        tmemo_mask = 4;
+                        while (tmemo_mask < 2 * item->num_parts)
+                            tmemo_mask <<= 1;
+                        tmemo = talloc_zero_array(tmp, struct tmemo, tmemo_mask);
+                        tmemo_mask--;
+                    }
+                    uintptr_t pk = (uintptr_t) b->libass.outline;
+                    // Mix the pointer: consecutive allocations share low bits.
+                    int ml = (int) ((pk >> 4) * 0x9E3779B1u & tmemo_mask);
+                    while (tmemo[ml].blob &&
+                           !(tmemo[ml].blob == b->libass.outline &&
+                             tmemo[ml].n == b->libass.n_outline &&
+                             tmemo[ml].w == b->w && tmemo[ml].h == b->h))
+                        ml = (ml + 1) & tmemo_mask;
+                    mm = &tmemo[ml];
+                    if (mm->blob)
+                        th = mm->hash;
+                }
+                if (!th) {
+                    th = gc_blob_hash(b->libass.outline,
+                                      b->libass.n_outline, b->w, b->h);
+                    if (mm) {
+                        mm->blob = b->libass.outline;
+                        mm->n = b->libass.n_outline;
+                        mm->w = b->w;
+                        mm->h = b->h;
+                        mm->hash = th;
+                    }
+                }
                 int sl = (int) (th & tsh_mask);
                 while (tsh[sl].hash && !(tsh[sl].hash == th &&
                                          tsh[sl].w == b->w && tsh[sl].h == b->h))
