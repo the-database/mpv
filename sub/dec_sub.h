@@ -21,6 +21,12 @@ enum sd_ctrl {
     SD_CTRL_SET_VIDEO_DEF_FPS,
     SD_CTRL_RESET_SOFT,
     SD_CTRL_UPDATE_OPTS,
+    // Take INDEPENDENT refs on the libass frames backing the coverage blobs of
+    // the last get_bitmaps (SUBBITMAP_LIBASS_OUTLINES only). arg is a
+    // struct mp_ass_pin ** written with a talloc object (NULL when nothing was
+    // borrowed); the caller owns it and must hold it for as long as it can
+    // serve those parts. See sub/packer.h.
+    SD_CTRL_CLONE_ASS_PIN,
 };
 
 enum sd_text_type {

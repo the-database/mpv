@@ -347,24 +347,32 @@ static void queue_flush(struct sub_ahead *a)
     a->num_queue = 0;
 }
 
-// In OUTLINES mode each part's coverage blob is owned by the packer that
-// produced it and becomes invalid on that packer's next pack. A ring entry
-// outlives that, so the worker reparents private blob copies onto the
-// sub_bitmaps itself ONCE before storing it; serves then share those pinned
-// blobs by reference (payload_serve). No-op for all other formats (their
-// pixel data is a refcounted mp_image owned by the same payload).
-static void pin_outline_blobs(struct sub_bitmaps *b)
+// In OUTLINES mode each part's coverage blob is BORROWED from libass and stays
+// valid only while the producing packer holds its frame ref -- i.e. until that
+// packer's next changed pack, one worker render from now. A ring entry outlives
+// that, and a served copy can outlive the entry itself (the worker evicts
+// concurrently), so the worker takes its OWN refs on those libass frames once,
+// before storing, and parents them on the sub_bitmaps that the payload owns:
+// they are released when the last reference to the payload goes (ring eviction
+// or the final served copy, whichever is later).
+//
+// This used to memdup every blob instead. Refs are strictly cheaper and pin the
+// same memory: the blobs are per-glyph libass cache entries that are shared
+// across frames and would be resident anyway, so the copy was re-duplicating
+// mostly identical data on every stored render -- on the worker thread, which
+// is exactly what has to keep up to avoid a stale serve.
+//
+// No-op for all other formats (their pixel data is a refcounted mp_image owned
+// by the same payload).
+static void pin_outline_blobs(struct sd *sd, struct sub_bitmaps *b)
 {
-    if (!b || b->format != SUBBITMAP_LIBASS_OUTLINES)
+#if HAVE_ASS_OUTLINE_DEFERRED
+    if (!b || b->format != SUBBITMAP_LIBASS_OUTLINES || !sd->driver->control)
         return;
-    for (int n = 0; n < b->num_parts; n++) {
-        struct sub_bitmap *p = &b->parts[n];
-        if (p->libass.outline && p->libass.n_outline > 0) {
-            p->libass.outline =
-                talloc_memdup(b, (void *)p->libass.outline,
-                              (size_t)p->libass.n_outline * sizeof(int32_t));
-        }
-    }
+    struct mp_ass_pin *pin = NULL;
+    if (sd->driver->control(sd, SD_CTRL_CLONE_ASS_PIN, &pin) == CONTROL_OK && pin)
+        talloc_steal(b, pin);
+#endif
 }
 
 // Index of a current-gen entry for raw video pts V at the given geometry, or -1.
@@ -625,7 +633,8 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
         }
         a->last_render_content = content_id;
         a->have_last_render = true;
-        pin_outline_blobs(bmp);   // ring entries outlive the packer's blobs
+        // Ring entries outlive the packer's frame refs: take our own.
+        pin_outline_blobs(a->worker_sd, bmp);
 
         mp_mutex_lock(&a->lock);
         a->render_ema = a->render_ema <= 0

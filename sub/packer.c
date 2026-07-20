@@ -47,8 +47,85 @@ struct mp_sub_packer {
     bool cached_subs_valid;
     struct sub_bitmap rgba_imgs[MP_SUB_BB_LIST_MAX];
     struct bitmap_packer *packer;
-    void *seg_ctx;  // owns copied outline blobs for SUBBITMAP_LIBASS_OUTLINES
+#if HAVE_ASS_OUTLINE_DEFERRED
+    struct mp_ass_pin *pin;   // frame refs backing the borrowed outline blobs
+#endif
 };
+
+#if HAVE_ASS_OUTLINE_DEFERRED
+// SUBBITMAP_LIBASS_OUTLINES parts point straight into libass's per-glyph
+// coverage blobs (ASS_Image.outline) instead of owning a copy. That is safe
+// because each blob is owned by a cached Bitmap which the emitting ASS_Image
+// already pins with a cache ref, so ONE frame ref on the list head keeps every
+// blob in that list alive -- libass honours the ref against LRU eviction
+// (cut_shard skips still-referenced items), cache flush and even renderer
+// teardown (destruction is deferred to the last dec_ref). Holding the ref is
+// strictly cheaper than the memcpy it replaces: the blobs are per-glyph cache
+// entries shared across frames, so the old copy re-duplicated mostly identical
+// data every single frame (measured 771 MB/frame at 8K, plus the same again in
+// talloc_free of the previous frame's copy).
+//
+// Lifetime is the PACK, not the frame: mp_sub_packer_pack_ass() hands back the
+// previous pack's cached_parts verbatim on unchanged frames, so the borrowed
+// pointers must stay valid until the next CHANGED pack replaces them. That is
+// exactly the lifetime the copies had in the old seg_ctx.
+struct mp_ass_pin {
+    ASS_Image **lists;
+    int num_lists;
+};
+
+static void ass_pin_destroy(void *ptr)
+{
+    struct mp_ass_pin *pin = ptr;
+    for (int n = 0; n < pin->num_lists; n++)
+        ass_frame_unref(pin->lists[n]);
+}
+
+// Take frame refs on the given image lists. Free with talloc_free().
+static struct mp_ass_pin *ass_pin_new(void *ta_parent, ASS_Image **image_lists,
+                                      int num_image_lists)
+{
+    struct mp_ass_pin *pin = talloc_zero(ta_parent, struct mp_ass_pin);
+    talloc_set_destructor(pin, ass_pin_destroy);
+    for (int n = 0; n < num_image_lists; n++) {
+        if (!image_lists[n])
+            continue;
+        ass_frame_ref(image_lists[n]);
+        MP_TARRAY_APPEND(pin, pin->lists, pin->num_lists, image_lists[n]);
+    }
+    return pin;
+}
+
+// Release the frame refs taken by the last pack.
+//
+// This MUST run before the ASS_Renderer that produced them is destroyed.
+// Dropping the last reference to a pinned glyph bitmap cascades through the
+// outline and glyph caches into the font cache, whose destructor calls
+// FT_Done_Face -- which needs the FT_Library, and therefore the ASS_Library,
+// still alive. The packer is a talloc child of the sd, so without this it would
+// be freed after assobjects_destroy() and crash on shutdown.
+//
+// Also invalidates the cached pack: its parts point into the blobs just
+// released, so they must never be served again.
+void mp_sub_packer_release_ass_pins(struct mp_sub_packer *p)
+{
+    if (!p->pin)
+        return;
+    TA_FREEP(&p->pin);
+    p->cached_subs_valid = false;
+}
+
+// An INDEPENDENT set of refs on the lists this packer currently borrows from,
+// for a consumer that outlives the packer's next pack (the render-ahead ring).
+// NULL when the last pack borrowed nothing. Free with talloc_free().
+struct mp_ass_pin *mp_sub_packer_clone_ass_pin(struct mp_sub_packer *p,
+                                               void *ta_parent)
+{
+    if (!p->pin || !p->pin->num_lists)
+        return NULL;
+    return ass_pin_new(ta_parent, p->pin->lists, p->pin->num_lists);
+}
+#endif
 
 // Free with talloc_free().
 struct mp_sub_packer *mp_sub_packer_alloc(void *ta_parent)
@@ -290,19 +367,22 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
     *out = (struct sub_bitmaps){.change_id = 1};
     p->cached_subs_valid = false;
 
-    // Fresh outline-blob storage for this pack (the previous cached parts'
-    // outline pointers are now stale).
+    // Borrow this pack's outline blobs from libass instead of copying them:
+    // pin the new image lists FIRST, then drop the previous pack's pins, so a
+    // list handed to us twice can never transit a zero refcount. See struct
+    // mp_ass_pin above for why borrowing is safe.
+#if HAVE_ASS_OUTLINE_DEFERRED
     if (format == SUBBITMAP_LIBASS_OUTLINES) {
-        // WP-K5: this is one talloc_free per part of the PREVIOUS frame,
-        // every frame. Timed separately from the copy that replaces it --
-        // pack_ns is measured at 89% of the whole inline render, so the two
-        // halves of it need to be distinguishable.
+        // WP-K5: packfree_ns now measures dropping the PREVIOUS pack's frame
+        // refs, which replaced the per-part talloc_free of the blob copies.
         int64_t t_pf = sub_phase.on ? mp_time_ns() : 0;
-        talloc_free(p->seg_ctx);
-        p->seg_ctx = talloc_new(p);
+        struct mp_ass_pin *old = p->pin;
+        p->pin = ass_pin_new(p, image_lists, num_image_lists);
+        talloc_free(old);
         if (sub_phase.on)
             sub_phase.packfree_ns += mp_time_ns() - t_pf;
     }
+#endif
     int64_t t_pc = sub_phase.on ? mp_time_ns() : 0;   // WP-K5
 
     struct sub_bitmaps res = {
@@ -355,15 +435,18 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             b->libass.shift_y64 = img->shift_y64;
 #endif
             if (format == SUBBITMAP_LIBASS_OUTLINES && img->n_outline > 0) {
-                // Own a copy: libass's tile-export blob is only valid for this
-                // frame. n_outline is the blob's int32 count ([n_tiles, n_segs,
-                // tiles, segs] -- see ASS_Image.outline).
-                b->libass.outline = ta_memdup(p->seg_ctx, (void *) img->outline,
-                                              (size_t) img->n_outline * sizeof(int32_t));
+                // Borrow libass's tile-export blob; p->pin holds a frame ref on
+                // the list that owns it for as long as these parts can be
+                // served. n_outline is the blob's int32 count ([n_tiles,
+                // n_segs, tiles, segs] -- see ASS_Image.outline).
+                b->libass.outline = img->outline;
                 b->libass.n_outline = img->n_outline;
                 if (sub_phase.on)
+                    // WP-K5/K7: blob volume BORROWED (formerly copied). Same
+                    // value on both arms of the A/B -- it is the memcpy that
+                    // went away, not the data.
                     sub_phase.pack_bytes +=
-                        (int64_t) img->n_outline * sizeof(int32_t);   // WP-K5
+                        (int64_t) img->n_outline * sizeof(int32_t);
                 b->bitmap = NULL;
                 b->stride = 0;
                 b->src_x = b->src_y = 0;   // unused in outline mode; don't leave stale
