@@ -352,7 +352,18 @@ static AVHWFramesConstraints *build_static_constraints(struct mp_hwdec_ctx *ctx)
     return NULL;
 }
 
-static bool probe_formats(struct mp_filter *f, int hw_imgfmt, bool use_conversion_filter)
+static bool imgfmt_in_list(const int *list, int num, int fmt)
+{
+    for (int i = 0; i < num; i++) {
+        if (list[i] == fmt)
+            return true;
+    }
+    return false;
+}
+
+static bool probe_formats(struct mp_filter *f, int hw_imgfmt,
+                          bool use_conversion_filter,
+                          const int *allowed_sw_fmts, int num_allowed_sw_fmts)
 {
     struct priv *p = f->priv;
 
@@ -453,6 +464,18 @@ static bool probe_formats(struct mp_filter *f, int hw_imgfmt, bool use_conversio
 
         if (!vo_supports(ctx, hw_imgfmt, imgfmt)) {
             MP_DBG(f, "  not supported by VO\n");
+            continue;
+        }
+
+        // The consumer may only be able to ingest a specific set of surface
+        // sub-formats. When such a list is supplied, do not offer any other
+        // format as an upload target, so the pre-upload conversion targets a
+        // format the consumer accepts rather than best-matching to an arbitrary
+        // device-supported one it would reject. Empty list = no restriction.
+        if (num_allowed_sw_fmts &&
+            !imgfmt_in_list(allowed_sw_fmts, num_allowed_sw_fmts, imgfmt))
+        {
+            MP_DBG(f, "  not in the consumer's allowed sub-format list\n");
             continue;
         }
 
@@ -568,7 +591,9 @@ static bool probe_formats(struct mp_filter *f, int hw_imgfmt, bool use_conversio
 }
 
 struct mp_hwupload mp_hwupload_create(struct mp_filter *parent, int hw_imgfmt,
-                                       int sw_imgfmt, bool src_is_same_hw)
+                                       int sw_imgfmt, bool src_is_same_hw,
+                                       const int *allowed_sw_fmts,
+                                       int num_allowed_sw_fmts)
 {
     struct mp_hwupload u = {0,};
     struct mp_filter *f = mp_filter_create(parent, &hwupload_filter);
@@ -579,7 +604,8 @@ struct mp_hwupload mp_hwupload_create(struct mp_filter *parent, int hw_imgfmt,
     mp_filter_add_pin(f, MP_PIN_IN, "in");
     mp_filter_add_pin(f, MP_PIN_OUT, "out");
 
-    if (!probe_formats(f, hw_imgfmt, src_is_same_hw)) {
+    if (!probe_formats(f, hw_imgfmt, src_is_same_hw,
+                       allowed_sw_fmts, num_allowed_sw_fmts)) {
         MP_INFO(f, "hardware format not supported\n");
         goto fail;
     }
