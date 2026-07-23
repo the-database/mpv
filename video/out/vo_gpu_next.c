@@ -854,7 +854,7 @@ const struct m_opt_choice_alternatives lut_types[] = {
 #define OPT_BASE_STRUCT struct gl_next_opts
 const struct m_sub_options gl_next_conf = {
     .opts = (const struct m_option[]) {
-        {"sub-hdr-peak", OPT_CHOICE(sub_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE}),
+        {"sub-hdr-peak", OPT_CHOICE(sub_hdr_peak, {"auto", 0}, {"sdr", PL_COLOR_SDR_WHITE}),
             M_RANGE(10, 10000)},
         {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
             {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
@@ -919,7 +919,6 @@ const struct m_sub_options gl_next_conf = {
         .border_background = BACKGROUND_COLOR,
         .background_blur_radius = 16.0f,
         .inter_preserve = true,
-        .sub_hdr_peak = PL_COLOR_SDR_WHITE,
         .image_subs_hdr_peak = 1000,
         .target_hint = -1,
         .target_hint_strict = true,
@@ -5380,7 +5379,8 @@ static void sub_prefill_idle(struct vo *vo)
 static bool update_overlays(struct vo *vo, struct mp_osd_res res,
                             int flags, enum pl_overlay_coords coords,
                             struct osd_guard *g, struct pl_frame *frame,
-                            struct mp_image *src, int stereo_mode, bool present)
+                            struct mp_image *src, int stereo_mode, bool present,
+                            float ref_luma)
 {
     struct priv *p = vo->priv;
     double pts = src ? src->pts : 0;
@@ -5930,17 +5930,23 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
                             .max_luma = p->next_opts->image_subs_hdr_peak,
                         };
                     }
+                } else if (ref_luma) {
+                    ol->color.hdr.max_luma = ref_luma;
                 }
             }
             break;
         case SUBBITMAP_LIBASS_GLYPHS:   // the fallback singletons, same as LIBASS
         case SUBBITMAP_LIBASS:
-            if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
+            if (src && item->video_color_space && !pl_color_transfer_is_hdr(src->params.color.transfer))
                 ol->color = src->params.color;
-            if (src && pl_color_transfer_is_hdr(frame->color.transfer)) {
+            if (src && pl_color_transfer_is_hdr(src->params.color.transfer) &&
+                p->next_opts->sub_hdr_peak)
+            {
                 ol->color.hdr = (struct pl_hdr_metadata) {
                     .max_luma = p->next_opts->sub_hdr_peak,
                 };
+            } else if (ref_luma && !pl_color_transfer_is_hdr(ol->color.transfer)) {
+                ol->color.hdr.max_luma = ref_luma;
             }
             ol->mode = PL_OVERLAY_MONOCHROME;
             ol->repr.alpha = PL_ALPHA_INDEPENDENT;
@@ -6502,10 +6508,15 @@ static float get_ref_luma(struct priv *p)
     if (opts->hdr_reference_white)
         return opts->hdr_reference_white;
 
+#if PL_API_VER >= 371
     // auto: follow the system reference white, if available
+    // Use auto mode only on libplacebo >= 371, to avoid luminance mismatches,
+    // on SDR->SDR in some corner cases. User override is still respected, to
+    // preserve previous behavior.
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
     if (sw->fns->target_ref_luma)
         return sw->fns->target_ref_luma(sw);
+#endif
 
     return 0;
 }
@@ -7290,7 +7301,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     update_overlays(vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_guard, &target, frame->current,
-                    frame->current ? frame->current->params.stereo3d : 0, true);
+                    frame->current ? frame->current->params.stereo3d : 0, true, get_ref_luma(p));
     stats_time_end(p->stats, "osd-update");
     // Snapshot the phase timers now, before the blend-subs update_overlays loop
     // below can overwrite them (they live in priv, reset per update_overlays call).
@@ -7370,7 +7381,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                     stats_time_start(p->stats, "osd-blend-update");
                     bool done = update_overlays(vo, res, OSD_DRAW_SUB_ONLY,
                                                 rel, &fp->subs, image, mpi,
-                                                mpi->params.stereo3d, true);
+                                                mpi->params.stereo3d, true, get_ref_luma(p));
                     stats_time_end(p->stats, "osd-blend-update");
                     // WP-E3: a bailed build presented this frame's previous
                     // complete overlays; leave osd_sync behind so the next
@@ -7859,6 +7870,12 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
     // the resulting mix is the correct frame for this PTS
     struct pl_frame image = *(struct pl_frame *) mix.frames[0];
     struct mp_image *mpi = image.user_data;
+
+    // Clear reference luminance before taking a screenshot, we want screenshot
+    // to be independent of the system reference luminance.
+    if (!pl_color_transfer_is_hdr(image.color.transfer))
+        image.color.hdr.max_luma = 0;
+
     struct mp_rect src = p->src, dst = p->dst;
     struct mp_osd_res osd = p->osd_res;
     if (!args->scaled) {
@@ -7985,12 +8002,12 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
             ? PL_OVERLAY_COORDS_SRC_CROP : PL_OVERLAY_COORDS_DST_CROP;
         update_overlays(vo, res, osd_flags,
                         rel, &fp->subs, &image, mpi,
-                        mpi->params.stereo3d, false);
+                        mpi->params.stereo3d, false, 0);
     } else {
         // Disable overlays when blend_subs is disabled
         update_overlays(vo, osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
                         &p->osd_guard, &target, mpi,
-                        mpi->params.stereo3d, false);
+                        mpi->params.stereo3d, false, 0);
         image.num_overlays = 0;
     }
 
