@@ -1939,9 +1939,21 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     // AVHWFramesContext (see process()), so the filter works regardless of
     // whether the VO provides a hwdec device (e.g. with --vo=null).
 
-    mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, 0);
+    // Register the exact surface sub-formats the engine can ingest (mirrors the
+    // whitelist in process() and the aji_trt/aji_dml input guards). Passing the
+    // real sub-formats - instead of 0 ("any") - lets autoconvert constrain its
+    // hw-upload target to one of these, so a software-decoded/planar source is
+    // converted to an ingestible format before upload instead of arriving in a
+    // format the filter would reject and disable itself over. Backend gating:
+    // yuv444p16 is TensorRT/CUDA-only; x2bgr10 (packed 10-bit RGB) is
+    // DirectML/D3D11-only.
+    mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_NV12));
+    mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_P010));
+    mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P16));
 #if HAVE_D3D11
-    mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, 0);
+    mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_NV12));
+    mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_P010));
+    mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_X2BGR10));
 #endif
     mp_refqueue_set_refs(p->queue, 0, 0);
     mp_refqueue_set_mode(p->queue, 0);
