@@ -414,6 +414,89 @@ static void flush_frames(struct mp_filter *vf)
     p->decode_evt_next = 0;
 }
 
+// Tear down everything whose lifetime is tied to the currently adopted hardware
+// device/frames context, leaving the filter in a clean state that the reinit
+// path will rebuild against the new device. A context switch (e.g. hwupload_cuda
+// combined with a seek, or a decode-mode fallback) invalidates the old CUcontext,
+// stream, inference context and pools; reusing them faults the engine with
+// CUDA_ERROR_ILLEGAL_ADDRESS. Library/process-level state (the aji handle, the
+// refqueue, the CUDA function table) is deliberately kept -- only uninit() frees
+// those.
+static void release_device_state(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+
+    // Finish submitted inference before releasing referenced surfaces or objects
+    // created in the old CUDA/D3D device context. clear_ring() waits on the
+    // upscaler ring; drain_backend() also flushes RIFE-first immediate work that
+    // runs on the decode stream and is not tracked in the ring.
+    clear_ring(vf);
+    drain_backend(vf);
+
+    mp_image_unrefp(&p->rife_prev);
+    for (int i = 0; i < p->outq_n; i++)
+        mp_image_unrefp(&p->outq[p->outq_pos + i]);
+    p->outq_n = p->outq_pos = 0;
+    p->rife_num = p->rife_den = 1;
+    p->rife_acc = 1;
+
+    if (p->aji)
+        p->api.destroy(&p->aji);
+
+#if HAVE_D3D11
+    for (int i = 0; i < p->d3d_stage_count; i++) {
+        if (p->d3d_stage[i])
+            ID3D11Texture2D_Release(p->d3d_stage[i]);
+        p->d3d_stage[i] = NULL;
+    }
+    p->d3d_stage_count = 0;
+    p->d3d_stage_next = 0;
+    p->d3d_stage_w = p->d3d_stage_h = 0;
+    p->d3d_stage_fmt = DXGI_FORMAT_UNKNOWN;
+    p->d3d_dev = NULL;
+    p->d3d_ctx = NULL;
+#endif
+
+    if (p->cu && p->cuda_ctx) {
+        CUcontext dummy;
+        CUresult err = p->cu->cuCtxPushCurrent(p->cuda_ctx);
+        if (err == CUDA_SUCCESS) {
+            if (p->own_stream)
+                p->cu->cuStreamSynchronize(p->own_stream);
+            for (int i = 0; i < MAX_DEPTH; i++) {
+                if (p->decode_evt[i])
+                    p->cu->cuEventDestroy(p->decode_evt[i]);
+            }
+            if (p->own_stream)
+                p->cu->cuStreamDestroy(p->own_stream);
+            p->cu->cuCtxPopCurrent(&dummy);
+        } else if (p->own_stream || p->decode_evt_ok) {
+            MP_WARN(vf, "Could not make the old CUDA context current while "
+                        "releasing AnimeJaNai device state\n");
+        }
+    }
+
+    for (int i = 0; i < MAX_DEPTH; i++)
+        p->decode_evt[i] = NULL;
+
+    av_buffer_unref(&p->hw_pool);
+    av_buffer_unref(&p->src_pool);
+    av_buffer_unref(&p->work_pool);
+    av_buffer_unref(&p->av_device_ref);
+
+    p->cuda_ctx = NULL;
+    p->stream = NULL;
+    p->own_stream = NULL;
+    p->decode_stream = NULL;
+    p->decode_evt_next = 0;
+    p->decode_evt_ok = false;
+    p->is_d3d11 = false;
+    p->aji_active = false;
+    p->configured = false;
+    p->rife_on = false;
+    p->rife_first = false;
+}
+
 static void write_stats(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
@@ -1232,9 +1315,9 @@ static void vf_animejanai_process(struct mp_filter *vf)
 
     struct mp_image *in_fmt = mp_refqueue_execute_reinit(p->queue);
     if (in_fmt) {
-        av_buffer_unref(&p->hw_pool);
-        av_buffer_unref(&p->src_pool);
-        av_buffer_unref(&p->work_pool);
+        if (p->configured || p->aji || p->av_device_ref)
+            MP_VERBOSE(vf, "Input reinit: rebuilding AnimeJaNai device state\n");
+        release_device_state(vf);
 
         p->params = in_fmt->params;
         p->fps = in_fmt->nominal_fps;
@@ -1254,7 +1337,6 @@ static void vf_animejanai_process(struct mp_filter *vf)
         AVHWDeviceContext *avhwctx = fctx->device_ctx;
         if (avhwctx->type == AV_HWDEVICE_TYPE_CUDA && p->cu) {
             p->is_d3d11 = false;
-            av_buffer_unref(&p->av_device_ref);
             p->av_device_ref = av_buffer_ref(fctx->device_ref);
             MP_HANDLE_OOM(p->av_device_ref);
             AVCUDADeviceContext *cudactx = avhwctx->hwctx;
@@ -1308,7 +1390,6 @@ static void vf_animejanai_process(struct mp_filter *vf)
 #if HAVE_D3D11
         } else if (avhwctx->type == AV_HWDEVICE_TYPE_D3D11VA) {
             p->is_d3d11 = true;
-            av_buffer_unref(&p->av_device_ref);
             p->av_device_ref = av_buffer_ref(fctx->device_ref);
             MP_HANDLE_OOM(p->av_device_ref);
             AVD3D11VADeviceContext *d3dctx = avhwctx->hwctx;
@@ -1340,7 +1421,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 .model_dir = p->path.model_dir,
                 .trtexec = p->path.trtexec,
                 .trtexec_env = env,
-                .slot = p->opts->slot,
+                .slot = p->pending_slot,
                 .rife_model_dir = p->path.rife_model_dir,
                 .async_build = 1,
                 .engine_path = p->path.engine,
