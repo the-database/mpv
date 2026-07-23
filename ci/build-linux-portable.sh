@@ -76,6 +76,21 @@ meson setup "$DEPS/libplacebo/b" "$DEPS/libplacebo" --prefix="$PREFIX" --buildty
   -Dlibdovi=disabled -Ddemos=false -Dtests=false 2>/dev/null || true
 ninja -C "$DEPS/libplacebo/b" install
 
+# The base image ships stock libass-dev (no deferred-GPU APIs). Build the fork's
+# libass into $PREFIX so mpv links it instead (PKG_CONFIG_PATH prefers $PREFIX):
+# this is what makes mpv's meson probe light up HAVE_ASS_{COMPOSITE,OUTLINE,BLUR}
+# _DEFERRED. Autotools, not meson: libass's meson can't restrict symbol
+# visibility on a shared lib ("not suitable for distribution"), while the
+# autotools build applies the libass.sym version script. Defaults enable
+# fontconfig/libunibreak/asm/threads from the image's -dev packages, and
+# require-system-font-provider (on by default) fails the build if fontconfig is
+# missing rather than silently shipping a degraded libass.
+say "libass (this fork -- carries the deferred-GPU subtitle APIs)"
+clone https://github.com/the-database/libass.git "$DEPS/libass" master
+( cd "$DEPS/libass" && ./autogen.sh \
+  && ./configure --prefix="$PREFIX" --disable-static --enable-shared \
+  && make -j"$JOBS" && make install )
+
 say "mpv (this fork)"
 meson setup "$MPV_SRC/b" "$MPV_SRC" --prefix="$PREFIX" --buildtype=release \
   -Dlibmpv=true -Dcuda-hwaccel=enabled -Dvulkan=enabled -Dlua=enabled 2>/dev/null || true
