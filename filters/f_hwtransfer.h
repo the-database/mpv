@@ -15,8 +15,15 @@ struct mp_hwupload {
     int selected_sw_imgfmt;
 };
 
+// allowed_sw_fmts (optional): if non-empty, the uploader will only offer these
+// surface sub-formats as upload targets, so that when a conversion before upload
+// is required it lands on a format the consumer can ingest, instead of
+// best-matching to an arbitrary device-supported format. Pass NULL/0 for the
+// default (unrestricted) behavior.
 struct mp_hwupload mp_hwupload_create(struct mp_filter *parent, int hw_imgfmt,
-                                       int sw_imgfmt, bool src_is_same_hw);
+                                       int sw_imgfmt, bool src_is_same_hw,
+                                       const int *allowed_sw_fmts,
+                                       int num_allowed_sw_fmts);
 
 // A filter which downloads sw frames from hw. Ignores sw frames.
 struct mp_hwdownload {

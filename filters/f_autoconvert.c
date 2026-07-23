@@ -214,7 +214,7 @@ static bool build_image_converter(struct mp_autoconvert *c, struct mp_log *log,
          */
         struct mp_hwupload upload = mp_hwupload_create(conv, imgpar.imgfmt,
                                                        src_fmt,
-                                                       true);
+                                                       true, NULL, 0);
         if (upload.successful_init) {
             if (upload.f) {
                 mp_info(log, "Converting %s[%s] -> %s[%s]\n",
@@ -234,10 +234,25 @@ static bool build_image_converter(struct mp_autoconvert *c, struct mp_log *log,
         bool upload_created = false;
         int sw_fmt = imgfmt_is_sw ? img->imgfmt : img->params.hw_subfmt;
 
+        // Scratch for the per-container list of sub-formats the consumer
+        // registered with a non-zero subfmt (via mp_autoconvert_add_imgfmt).
+        int *allowed = talloc_array(conv, int, p->num_imgfmts);
+
         for (int i = 0; i < num_fmts; i++) {
+            // Restrict the uploader's target (surface) formats to the sub-formats
+            // the consumer can ingest for this container format. Without this the
+            // uploader best-matches against the device's full format list and can
+            // land on a format (e.g. planar yuv420p10) the consumer then rejects.
+            int num_allowed = 0;
+            for (int j = 0; j < p->num_imgfmts; j++) {
+                if (p->imgfmts[j] == fmts[i] && p->subfmts[j])
+                    allowed[num_allowed++] = p->subfmts[j];
+            }
+
             // We can probably use this! Very lazy and very approximate.
             struct mp_hwupload upload = mp_hwupload_create(conv, fmts[i],
-                                                           sw_fmt, false);
+                                                           sw_fmt, false,
+                                                           allowed, num_allowed);
             if (upload.successful_init) {
                 mp_info(log, "HW-uploading to %s\n", mp_imgfmt_to_name(fmts[i]));
                 filters[2] = upload.f;
