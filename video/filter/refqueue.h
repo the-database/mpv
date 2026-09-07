@@ -8,6 +8,7 @@
 // A helper for deinterlacers which require past/future reference frames.
 
 struct mp_refqueue;
+struct mp_image;
 
 struct mp_refqueue *mp_refqueue_alloc(struct mp_filter *f);
 
