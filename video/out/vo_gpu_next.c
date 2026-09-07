@@ -192,7 +192,11 @@ struct osd_entry {
 // WP-H10: up to one per chain link (spill placements advance monotonically
 // through the chain within an item, so the split stays a clean z-order
 // partition; see emit_composed_overlays).
-#define MAX_OSD_OVERLAYS (MAX_OSD_PARTS + 2 * TR_CHAIN_MAX)
+// + OVERLAY_RUN_SLACK: upstream emits one pl_overlay per colorspace run of an
+// item's parts (only BGRA items with per-part tags can split; an EXTERNAL2
+// item has at most 64 overlay-add parts).
+#define OVERLAY_RUN_SLACK 64
+#define MAX_OSD_OVERLAYS (MAX_OSD_PARTS + 2 * TR_CHAIN_MAX + OVERLAY_RUN_SLACK)
 
 // WP-H7: one protected transient-store row band [lo, hi); see the tr_good /
 // tr_build comments in struct priv.
@@ -343,6 +347,16 @@ struct cache {
     pl_cache cache;
 };
 
+// Mapping state of single hwdec frame.
+struct hwdec_slot {
+    struct ra_hwdec_mapper *mapper;
+    struct timer_pool *timer;
+    struct mp_pass_perf perf;
+    struct mp_image *owner;   // queue entry image that owns the mapping
+    bool acquired;            // between acquire and release of a render pass
+    pl_tex tex[4];            // plane textures of the current mapping
+};
+
 struct priv {
     struct mp_log *log;
     struct mpv_global *global;
@@ -350,11 +364,8 @@ struct priv {
     struct ra_ctx *ra_ctx;
     struct gpu_ctx *context;
     struct ra_hwdec_ctx hwdec_ctx;
-    struct ra_hwdec_mapper *hwdec_mapper;
-    struct timer_pool *hwdec_timer;
-    struct mp_pass_perf hwdec_perf;
-    struct ra_hwdec_mapper *el_hwdec_mapper;
-    struct timer_pool *el_hwdec_timer;
+    struct hwdec_slot hwdec;
+    struct hwdec_slot el_hwdec;
     struct timer_pool *sw_upload_timer;
     struct mp_pass_perf sw_upload_perf;
 
@@ -369,6 +380,7 @@ struct priv {
     pl_renderer osd_rr; // dedicated renderer for the capped-res overlay composite
     pl_dispatch osd_dp; // for the deferred-blur compute passes
     bool osd_blur_unsupported; // logged once if the format can't be blurred
+    bool osd_overlays_exhausted; // logged once if MAX_OSD_OVERLAYS is hit
     pl_fmt osd_inter_fmt; // RGBA target for the capped-res overlay composite (NULL = disabled)
     pl_queue queue;
     pl_swapchain sw;
@@ -5368,6 +5380,149 @@ static void sub_prefill_idle(struct vo *vo)
 }
 #endif // HAVE_ASS_COMPOSITE_DEFERRED
 
+// Duplicate overlay parts for each eye in stereo 3D modes
+static void dup_stereo_parts(struct priv *p, struct osd_entry *entry, int start,
+                             struct mp_osd_res res, const int div[2])
+{
+    int num_eye_parts = entry->num_parts - start;
+    for (int x = 0; x < div[0]; x++) {
+        for (int y = 0; y < div[1]; y++) {
+            if (x == 0 && y == 0)
+                continue;
+            float off_x = res.w * x;
+            float off_y = res.h * y;
+            for (int i = 0; i < num_eye_parts; i++) {
+                struct pl_overlay_part duped = entry->parts[start + i];
+                duped.dst.x0 += off_x;
+                duped.dst.x1 += off_x;
+                duped.dst.y0 += off_y;
+                duped.dst.y1 += off_y;
+                MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, duped);
+            }
+        }
+    }
+}
+
+static struct pl_color_space bgra_overlay_color(struct priv *p,
+                                                const struct sub_bitmaps *item,
+                                                const struct sub_bitmap *b,
+                                                const struct mp_image *src,
+                                                float ref_luma)
+{
+    struct pl_color_space color = pl_color_space_srgb;
+
+    if (src && (item->video_color_space || b->bgra.video_color_space)) {
+        // Muxed image subtitles and overlays tagged with video_colorspace
+        // are in the video's colorspace
+        color = src->params.color;
+        if (pl_color_transfer_is_hdr(color.transfer)) {
+            // Don't apply `image_subs_hdr_peak` for overlays.
+            if (!b->bgra.video_color_space) {
+                bool use_static = p->next_opts->image_subs_hdr_peak == -2;
+                if (use_static || p->next_opts->image_subs_hdr_peak == -3) {
+                    float max;
+                    pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+                        .color      = &color,
+                        .metadata   = use_static ? PL_HDR_METADATA_HDR10 : PL_HDR_METADATA_ANY,
+                        .scaling    = PL_HDR_NITS,
+                        .out_max    = &max,
+                    ));
+                    color.hdr = (struct pl_hdr_metadata) {
+                        .max_luma = max,
+                    };
+                } else if (p->next_opts->image_subs_hdr_peak != -1) {
+                    color.hdr = (struct pl_hdr_metadata) {
+                        .max_luma = p->next_opts->image_subs_hdr_peak,
+                    };
+                }
+            }
+        } else if (ref_luma) {
+            color.hdr.max_luma = ref_luma;
+        }
+    } else {
+        // sRGB, unless tagged explicitly
+        if (b->bgra.primaries)
+            color.primaries = b->bgra.primaries;
+        if (b->bgra.transfer)
+            color.transfer = b->bgra.transfer;
+        if (!pl_color_transfer_is_hdr(color.transfer) && ref_luma)
+            color.hdr.max_luma = ref_luma;
+    }
+
+    // Explicit luminance peak overrides every other metadata
+    if (b->bgra.max_luma) {
+        color.hdr = (struct pl_hdr_metadata) {
+            .max_luma = b->bgra.max_luma,
+        };
+    }
+
+    return color;
+}
+
+static struct pl_color_space libass_overlay_color(struct priv *p,
+                                                  const struct sub_bitmaps *item,
+                                                  const struct mp_image *src,
+                                                  float ref_luma)
+{
+    struct pl_color_space color = pl_color_space_srgb;
+
+    if (src && item->video_color_space && !pl_color_transfer_is_hdr(src->params.color.transfer))
+        color = src->params.color;
+    if (src && pl_color_transfer_is_hdr(src->params.color.transfer) &&
+        p->next_opts->sub_hdr_peak)
+    {
+        color.hdr = (struct pl_hdr_metadata) {
+            .max_luma = p->next_opts->sub_hdr_peak,
+        };
+    } else if (ref_luma && !pl_color_transfer_is_hdr(color.transfer)) {
+        color.hdr.max_luma = ref_luma;
+    }
+
+    return color;
+}
+
+// Emit one pl_overlay for the run of entry->parts starting at `start`.
+// Adapted from upstream to the fork's FIXED overlays[] array: the counter is
+// frame->num_overlays (update_overlays points frame->overlays at
+// state->overlays once, up front, and every fork emitter / OL_RECORD() /
+// commit / bail path uses frame->num_overlays), so there is no MP_TARRAY_GROW
+// here -- instead the bound is checked and an exhausted array drops the run.
+static bool add_run_overlay(struct priv *p, struct osd_state *state,
+                            struct pl_frame *frame, const struct osd_entry *entry,
+                            const struct sub_bitmaps *item,
+                            const struct pl_color_space *color, int start,
+                            enum pl_overlay_coords coords)
+{
+    if (frame->num_overlays >= MAX_OSD_OVERLAYS) {
+        if (!p->osd_overlays_exhausted) {
+            p->osd_overlays_exhausted = true;
+            MP_WARN(p, "OSD overlay slots exhausted; dropping overlay run.\n");
+        }
+        return false;
+    }
+    struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
+    *ol = (struct pl_overlay) {
+        .tex = entry->tex,
+        .parts = entry->parts + start,
+        .num_parts = entry->num_parts - start,
+        .color = *color,
+        .coords = coords,
+    };
+
+    switch (item->format) {
+    case SUBBITMAP_BGRA:
+        ol->mode = PL_OVERLAY_NORMAL;
+        ol->repr.alpha = PL_ALPHA_PREMULTIPLIED;
+        break;
+    case SUBBITMAP_LIBASS_GLYPHS:   // fallback singletons, same as LIBASS
+    case SUBBITMAP_LIBASS:
+        ol->mode = PL_OVERLAY_MONOCHROME;
+        ol->repr.alpha = PL_ALPHA_INDEPENDENT;
+        break;
+    }
+    return true;
+}
+
 // Build the overlay set for `frame` into one of g's ping-pong buffers.
 // `present` marks the two draw_frame (presentation) callers: only those
 // commit the build as the new "last complete" state and are subject to the
@@ -5808,25 +5963,57 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
         if (sub_guard_expired(p))
             goto bail;
 
+        // Overlays created per run below point into entry->parts; pre-grow so
+        // the appends (incl. stereo dupes) never reallocate under them.
+        MP_TARRAY_GROW(p, entry->parts, item->num_parts * div[0] * div[1]);
+
+        // First overlay slot this item owns; the blur/capped-composite blocks
+        // below retarget exactly the runs emitted for it.
+        int item_ol_first = frame->num_overlays;
         entry->num_parts = 0;
+        struct pl_color_space color = {0};
+        int start = -1;
         for (int i = 0; i < item->num_parts; i++) {
             const struct sub_bitmap *b = &item->parts[i];
             if (b->dw == 0 || b->dh == 0)
                 continue;
             if (item->format == SUBBITMAP_LIBASS_GLYPHS && b->libass.glyph_id)
                 continue;   // deferred runs are handled by compose_glyph_runs
-            uint32_t c = b->libass.color;
+            struct pl_color_space part_color = item->format == SUBBITMAP_BGRA
+                                    ? bgra_overlay_color(p, item, b, src, ref_luma)
+                                    : libass_overlay_color(p, item, src, ref_luma);
+            // Emit pl_overlay per each distinct colorspace run (upstream); if the
+            // fixed overlay array cannot take this run plus the final flush, fold
+            // the part into the current run instead of overflowing.
+            if (start >= 0 && !pl_color_space_equal(&color, &part_color) &&
+                frame->num_overlays + 2 <= MAX_OSD_OVERLAYS)
+            {
+                dup_stereo_parts(p, entry, start, res, div);
+                add_run_overlay(p, state, frame, entry, item, &color, start, coords);
+                start = -1;
+            }
+            if (start < 0) {
+                start = entry->num_parts;
+                color = part_color;
+            }
             struct pl_overlay_part part = {
                 .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
                 .dst = { b->x, b->y, b->x + b->dw, b->y + b->dh },
-                .color = {
-                    (c >> 24) / 255.0f,
-                    ((c >> 16) & 0xFF) / 255.0f,
-                    ((c >> 8) & 0xFF) / 255.0f,
-                    (255 - (c & 0xFF)) / 255.0f,
-                }
             };
+            if (item->format == SUBBITMAP_LIBASS ||
+                item->format == SUBBITMAP_LIBASS_GLYPHS)   // never for BGRA: union aliases bgra.*
+            {
+                uint32_t c = b->libass.color;
+                part.color[0] = (c >> 24) / 255.0f;
+                part.color[1] = ((c >> 16) & 0xFF) / 255.0f;
+                part.color[2] = ((c >> 8) & 0xFF) / 255.0f;
+                part.color[3] = (255 - (c & 0xFF)) / 255.0f;
+            }
             MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, part);
+        }
+        if (start >= 0) {
+            dup_stereo_parts(p, entry, start, res, div);
+            add_run_overlay(p, state, frame, entry, item, &color, start, coords);
         }
 
         pl_tex overlay_tex = entry->tex;
@@ -5896,62 +6083,12 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
         }
 #endif // HAVE_ASS_BLUR_DEFERRED
 
-        struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
-        *ol = (struct pl_overlay) {
-            .tex = overlay_tex,
-            .parts = entry->parts,
-            .num_parts = entry->num_parts,
-            .color = pl_color_space_srgb,
-            .coords = coords,
-        };
-
-        switch (item->format) {
-        case SUBBITMAP_BGRA:
-            ol->mode = PL_OVERLAY_NORMAL;
-            ol->repr.alpha = PL_ALPHA_PREMULTIPLIED;
-            // Infer bitmap colorspace from source
-            if (src) {
-                ol->color = src->params.color;
-                if (pl_color_transfer_is_hdr(ol->color.transfer)) {
-                    bool use_static = p->next_opts->image_subs_hdr_peak == -2;
-                    if (use_static || p->next_opts->image_subs_hdr_peak == -3) {
-                        float max;
-                        pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
-                            .color      = &ol->color,
-                            .metadata   = use_static ? PL_HDR_METADATA_HDR10 : PL_HDR_METADATA_ANY,
-                            .scaling    = PL_HDR_NITS,
-                            .out_max    = &max,
-                        ));
-                        ol->color.hdr = (struct pl_hdr_metadata) {
-                            .max_luma = max,
-                        };
-                    } else if (p->next_opts->image_subs_hdr_peak != -1) {
-                        ol->color.hdr = (struct pl_hdr_metadata) {
-                            .max_luma = p->next_opts->image_subs_hdr_peak,
-                        };
-                    }
-                } else if (ref_luma) {
-                    ol->color.hdr.max_luma = ref_luma;
-                }
-            }
-            break;
-        case SUBBITMAP_LIBASS_GLYPHS:   // the fallback singletons, same as LIBASS
-        case SUBBITMAP_LIBASS:
-            if (src && item->video_color_space && !pl_color_transfer_is_hdr(src->params.color.transfer))
-                ol->color = src->params.color;
-            if (src && pl_color_transfer_is_hdr(src->params.color.transfer) &&
-                p->next_opts->sub_hdr_peak)
-            {
-                ol->color.hdr = (struct pl_hdr_metadata) {
-                    .max_luma = p->next_opts->sub_hdr_peak,
-                };
-            } else if (ref_luma && !pl_color_transfer_is_hdr(ol->color.transfer)) {
-                ol->color.hdr.max_luma = ref_luma;
-            }
-            ol->mode = PL_OVERLAY_MONOCHROME;
-            ol->repr.alpha = PL_ALPHA_INDEPENDENT;
-            break;
-        }
+        // The runs for this item were emitted above against entry->tex; if the
+        // deferred blur ran, they must sample the blurred copy instead. (Their
+        // colorspace/mode is already set by bgra_overlay_color /
+        // libass_overlay_color inside add_run_overlay.)
+        for (int k = item_ol_first; k < frame->num_overlays; k++)
+            state->overlays[k].tex = overlay_tex;
 
         // Capped-resolution composite (see --sub-render-res-limit): the sub
         // overlay was rasterized at render_w x render_h but its parts are in
@@ -5971,12 +6108,17 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
             !(src && pl_color_transfer_is_hdr(frame->color.transfer)) &&
             p->osd_inter_fmt && p->osd_rr &&
             !(div[0] > 1 || div[1] > 1) &&
+            // A LIBASS item's run colour depends only on item+src, so it always
+            // yields exactly one run; require that so the single overlay this
+            // block rewrites really covers all of entry->parts.
+            frame->num_overlays == item_ol_first + 1 &&
             entry->num_parts > 0)
         {
             // WP-E3 checkpoint: before recording the capped-res composite
             // (a whole pl_render_image, the heaviest single call here).
             if (sub_guard_expired(p))
                 goto bail;
+            struct pl_overlay *ol = &state->overlays[item_ol_first];
             int rw = item->render_w, rh = item->render_h;
             int iw = (rw + 63) & ~63, ih = (rh + 63) & ~63;
             bool iok = pl_tex_recreate(p->gpu, &entry->inter_tex, &(struct pl_tex_params) {
@@ -6045,28 +6187,8 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
             }
         }
 
-        // Duplicate overlay parts for each eye in stereo 3D modes
-        if (div[0] > 1 || div[1] > 1) {
-            int orig_num = entry->num_parts;
-            for (int x = 0; x < div[0]; x++) {
-                for (int y = 0; y < div[1]; y++) {
-                    if (x == 0 && y == 0)
-                        continue;
-                    float off_x = res.w * x;
-                    float off_y = res.h * y;
-                    for (int i = 0; i < orig_num; i++) {
-                        struct pl_overlay_part duped = entry->parts[i];
-                        duped.dst.x0 += off_x;
-                        duped.dst.x1 += off_x;
-                        duped.dst.y0 += off_y;
-                        duped.dst.y1 += off_y;
-                        MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, duped);
-                    }
-                }
-            }
-            ol->parts = entry->parts;
-            ol->num_parts = entry->num_parts;
-        }
+        // (Stereo 3D eye duplication is done per run by dup_stereo_parts,
+        // before each add_run_overlay above.)
     }
 
     OL_RECORD();   // attribute the last item's overlays
@@ -6305,32 +6427,63 @@ static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
     return desc.num_planes;
 }
 
-static bool hwdec_reconfig(struct priv *p, struct ra_hwdec_mapper **mapper,
-                           struct timer_pool **timer, struct ra_hwdec *hwdec,
-                           const struct mp_image_params *par)
+static void slot_unmap(struct priv *p, struct hwdec_slot *s)
 {
-    if (*mapper) {
-        if (mp_image_params_static_equal(par, &(*mapper)->src_params)) {
-            (*mapper)->src_params.repr.dovi = par->repr.dovi;
-            (*mapper)->dst_params.repr.dovi = par->repr.dovi;
-            (*mapper)->src_params.color.hdr = par->color.hdr;
-            (*mapper)->dst_params.color.hdr = par->color.hdr;
+    mp_assert(!s->acquired);
+    if (!s->mapper)
+        return;
+    // For RAs not based on ra_pl the plane textures are wrappers we created.
+    if (!ra_pl_get(s->mapper->ra)) {
+        for (int n = 0; n < MP_ARRAY_SIZE(s->tex); n++)
+            pl_tex_destroy(p->gpu, &s->tex[n]);
+    }
+    memset(s->tex, 0, sizeof(s->tex));
+    ra_hwdec_mapper_unmap(s->mapper);
+    s->owner = NULL;
+}
+
+static bool slot_reconfig(struct priv *p, struct hwdec_slot *s,
+                          struct ra_hwdec *hwdec,
+                          const struct mp_image_params *par)
+{
+    if (s->mapper) {
+        if (mp_image_params_static_equal(par, &s->mapper->src_params)) {
+            s->mapper->src_params.repr.dovi = par->repr.dovi;
+            s->mapper->dst_params.repr.dovi = par->repr.dovi;
+            s->mapper->src_params.color.hdr = par->color.hdr;
+            s->mapper->dst_params.color.hdr = par->color.hdr;
             return true;
-        } else {
-            ra_hwdec_mapper_free(mapper);
-            timer_pool_destroy(*timer);
-            *timer = NULL;
         }
+        slot_unmap(p, s);
+        ra_hwdec_mapper_free(&s->mapper);
+        timer_pool_destroy(s->timer);
+        s->timer = NULL;
     }
 
-    *mapper = ra_hwdec_mapper_create(hwdec, par);
-    if (!*mapper) {
+    s->mapper = ra_hwdec_mapper_create(hwdec, par);
+    if (!s->mapper) {
         MP_ERR(p, "Initializing texture for hardware decoding failed.\n");
         return false;
     }
-    *timer = timer_pool_create(p->ra_ctx->ra);
+    s->timer = timer_pool_create(p->ra_ctx->ra);
 
     return true;
+}
+
+// The queue dropped this entry. Release the mapping if the entry owns it.
+static void slot_release_owner(struct priv *p, struct hwdec_slot *s,
+                               struct mp_image *owner)
+{
+    if (s->owner == owner)
+        slot_unmap(p, s);
+}
+
+static void slot_uninit(struct priv *p, struct hwdec_slot *s)
+{
+    slot_unmap(p, s);
+    ra_hwdec_mapper_free(&s->mapper);
+    timer_pool_destroy(s->timer);
+    s->timer = NULL;
 }
 
 // For RAs not based on ra_pl, this creates a new pl_tex wrapper.
@@ -6399,37 +6552,65 @@ static void setup_hwdec_plane_mapping(struct pl_frame *frame,
     }
 }
 
+static bool slot_acquire(struct priv *p, struct hwdec_slot *s,
+                         struct mp_image *owner, struct mp_image *mpi,
+                         struct pl_frame *frame)
+{
+    if (s->owner != owner) {
+        // With one frame per role acquired at a time the previous owner is
+        // not in use and can be evicted. Interlaced sources would break this
+        // (prev and next are acquired alongside the image), see hwdec_slot.
+        if (s->acquired) {
+            MP_ERR(p, "Hardware frame of this role is still in use.\n");
+            return false;
+        }
+        slot_unmap(p, s);
+
+        stats_time_start(p->stats, "hwdec-map");
+        timer_pool_start(s->timer);
+        int ret = ra_hwdec_mapper_map(s->mapper, mpi);
+        timer_pool_stop(s->timer);
+        stats_time_end(p->stats, "hwdec-map");
+        if (ret < 0) {
+            MP_ERR(p, "Mapping hardware decoded surface failed.\n");
+            return false;
+        }
+        s->perf = timer_pool_measure(s->timer);
+        s->owner = owner;
+    }
+
+    if (ra_hwdec_mapper_begin_access(s->mapper) < 0)
+        return false;
+    // Set before handing out textures so that the release libplacebo issues
+    // after a failed acquire ends the access again.
+    s->acquired = true;
+
+    for (int n = 0; n < frame->num_planes; n++) {
+        if (!s->tex[n])
+            s->tex[n] = hwdec_get_tex(p, s->mapper, n);
+        if (!s->tex[n])
+            return false;
+        frame->planes[n].texture = s->tex[n];
+    }
+
+    return true;
+}
+
+static void slot_release(struct hwdec_slot *s)
+{
+    if (!s->acquired)
+        return;
+    ra_hwdec_mapper_end_access(s->mapper);
+    s->acquired = false;
+}
+
 static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
     struct priv *p = fp->vo->priv;
-    if (!hwdec_reconfig(p, &p->hwdec_mapper, &p->hwdec_timer, fp->hwdec,
-                        &mpi->params))
-        return false;
-
-    stats_time_start(p->stats, "hwdec-map");
-    timer_pool_start(p->hwdec_timer);
-    if (ra_hwdec_mapper_map(p->hwdec_mapper, mpi) < 0) {
-        MP_ERR(p, "Mapping hardware decoded surface failed.\n");
-        timer_pool_stop(p->hwdec_timer);
-        stats_time_end(p->stats, "hwdec-map");
-        return false;
-    }
-
-    for (int n = 0; n < frame->num_planes; n++) {
-        if (!(frame->planes[n].texture = hwdec_get_tex(p, p->hwdec_mapper, n))) {
-            timer_pool_stop(p->hwdec_timer);
-            stats_time_end(p->stats, "hwdec-map");
-            return false;
-        }
-    }
-
-    timer_pool_stop(p->hwdec_timer);
-    p->hwdec_perf = timer_pool_measure(p->hwdec_timer);
-    stats_time_end(p->stats, "hwdec-map");
-
-    return true;
+    return slot_reconfig(p, &p->hwdec, fp->hwdec, &mpi->params) &&
+           slot_acquire(p, &p->hwdec, mpi, mpi, frame);
 }
 
 static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
@@ -6437,12 +6618,7 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
     struct priv *p = fp->vo->priv;
-    if (!ra_pl_get(p->hwdec_mapper->ra)) {
-        for (int n = 0; n < frame->num_planes; n++)
-            pl_tex_destroy(p->gpu, &frame->planes[n].texture);
-    }
-
-    ra_hwdec_mapper_unmap(p->hwdec_mapper);
+    slot_release(&p->hwdec);
 }
 
 #if PL_API_VER >= 367
@@ -6452,22 +6628,9 @@ static bool hwdec_acquire_el(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *el_mpi = bl_mpi->enhancement_layer;
     struct frame_priv *fp = bl_mpi->priv;
     struct priv *p = fp->vo->priv;
-    if (!hwdec_reconfig(p, &p->el_hwdec_mapper, &p->el_hwdec_timer,
-                        fp->el_hwdec, &el_mpi->params))
-        return false;
-
-    if (ra_hwdec_mapper_map(p->el_hwdec_mapper, el_mpi) < 0) {
-        MP_ERR(p, "Mapping enhancement-layer hwdec surface failed.\n");
-        return false;
-    }
-
-    for (int n = 0; n < frame->num_planes; n++) {
-        if (!(frame->planes[n].texture =
-                hwdec_get_tex(p, p->el_hwdec_mapper, n)))
-            return false;
-    }
-
-    return true;
+    // The EL image belongs to the BL queue entry, which therefore owns the slot.
+    return slot_reconfig(p, &p->el_hwdec, fp->el_hwdec, &el_mpi->params) &&
+           slot_acquire(p, &p->el_hwdec, bl_mpi, el_mpi, frame);
 }
 
 static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
@@ -6475,12 +6638,7 @@ static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *bl_mpi = frame->user_data;
     struct frame_priv *fp = bl_mpi->priv;
     struct priv *p = fp->vo->priv;
-    if (!ra_pl_get(p->el_hwdec_mapper->ra)) {
-        for (int n = 0; n < frame->num_planes; n++)
-            pl_tex_destroy(p->gpu, &frame->planes[n].texture);
-    }
-
-    ra_hwdec_mapper_unmap(p->el_hwdec_mapper);
+    slot_release(&p->el_hwdec);
 }
 #endif
 
@@ -6600,13 +6758,12 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         // only reconfig the mapper here (potentially creating it) to access
         // `dst_params`. In practice, though, this should not matter unless the
         // image format changes mid-stream.
-        if (!hwdec_reconfig(p, &p->hwdec_mapper, &p->hwdec_timer, fp->hwdec,
-                            &mpi->params)) {
+        if (!slot_reconfig(p, &p->hwdec, fp->hwdec, &mpi->params)) {
             talloc_free(mpi);
             return false;
         }
 
-        par = p->hwdec_mapper->dst_params;
+        par = p->hwdec.mapper->dst_params;
     }
 
     mp_image_params_guess_csp(&par);
@@ -6641,7 +6798,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         frame->release = hwdec_release;
         setup_hwdec_plane_mapping(frame, &desc);
     } else { // swdec
-        p->hwdec_perf.count = 0;
+        p->hwdec.perf.count = 0;
 
         if (!p->sw_upload_timer)
             p->sw_upload_timer = timer_pool_create(p->ra_ctx->ra);
@@ -6670,9 +6827,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         struct mp_image_params el_par = el->params;
         bool el_ok = true;
         if (fp->el_hwdec) {
-            if (hwdec_reconfig(p, &p->el_hwdec_mapper, &p->el_hwdec_timer,
-                               fp->el_hwdec, &el->params)) {
-                el_par = p->el_hwdec_mapper->dst_params;
+            if (slot_reconfig(p, &p->el_hwdec, fp->el_hwdec, &el->params)) {
+                el_par = p->el_hwdec.mapper->dst_params;
             } else {
                 fp->el_hwdec = NULL;
                 el_ok = false;
@@ -6748,6 +6904,8 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
         if (fp->el_tex[i])
             pl_tex_destroy(gpu, &fp->el_tex[i]);
     }
+    slot_release_owner(p, &p->hwdec, mpi);
+    slot_release_owner(p, &p->el_hwdec, mpi);
     talloc_free(mpi);
 }
 
@@ -7510,7 +7668,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     vo->target_params = &p->target_params;
 
     if (vo->params) {
-        // Augment metadata with peak detection max_pq_y / avg_pq_y
+        // Augment metadata with the peak detection results
         vo->has_peak_detect_values = pl_renderer_get_hdr_metadata(p->rr, &vo->params->color.hdr);
     }
     mp_mutex_unlock(&vo->params_mutex);
@@ -8159,7 +8317,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
 
     case VOCTRL_PERFORMANCE_DATA: {
         struct voctrl_performance_data *perf = data;
-        copy_frame_info_to_mp(&p->perf_fresh, &perf->fresh, &p->hwdec_perf, &p->sw_upload_perf);
+        copy_frame_info_to_mp(&p->perf_fresh, &perf->fresh, &p->hwdec.perf, &p->sw_upload_perf);
         copy_frame_info_to_mp(&p->perf_redraw, &perf->redraw, NULL, NULL);
         return true;
     }
@@ -8448,10 +8606,8 @@ static void uninit(struct vo *vo)
     timer_pool_destroy(p->sw_upload_timer);
 
     if (vo->hwdec_devs) {
-        ra_hwdec_mapper_free(&p->hwdec_mapper);
-        timer_pool_destroy(p->hwdec_timer);
-        ra_hwdec_mapper_free(&p->el_hwdec_mapper);
-        timer_pool_destroy(p->el_hwdec_timer);
+        slot_uninit(p, &p->hwdec);
+        slot_uninit(p, &p->el_hwdec);
         ra_hwdec_ctx_uninit(&p->hwdec_ctx);
         hwdec_devices_set_loader(vo->hwdec_devs, NULL, NULL);
         hwdec_devices_destroy(vo->hwdec_devs);

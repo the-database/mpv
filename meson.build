@@ -60,6 +60,7 @@ sources = files(
     'audio/chmap.c',
     'audio/chmap_avchannel.c',
     'audio/chmap_sel.c',
+    'audio/decode/ad_dsd.c',
     'audio/decode/ad_lavc.c',
     'audio/decode/ad_spdif.c',
     'audio/filter/af_drop.c',
@@ -170,6 +171,7 @@ sources = files(
     'player/client.c',
     'player/command.c',
     'player/configfiles.c',
+    'player/discnav.c',
     'player/external_files.c',
     'player/loadfile.c',
     'player/main.c',
@@ -692,11 +694,22 @@ if features['dvbin']
                      'stream/stream_dvb.c')
 endif
 
+dvda_opt = get_option('dvda').require(
+    get_option('gpl'),
+    error_message: 'the build is not GPL!',
+)
+dvdread = dependency('dvdread', version: '>= 7.1.1', required: dvda_opt)
+features += {'dvda': dvdread.found()}
+if features['dvda']
+    dependencies += dvdread
+    sources += files('stream/stream_dvda.c')
+endif
+
 dvdnav_opt = get_option('dvdnav').require(
     get_option('gpl'),
     error_message: 'the build is not GPL!',
 )
-dvdnav = dependency('dvdnav', version: '>= 4.2.0', required: dvdnav_opt)
+dvdnav = dependency('dvdnav', version: '>= 6.1.0', required: dvdnav_opt)
 features += {'dvdnav': dvdnav.found()}
 if features['dvdnav']
     dependencies += dvdnav
@@ -738,7 +751,7 @@ if features['libavdevice']
     dependencies += libavdevice
 endif
 
-libbluray = dependency('libbluray', version: '>= 0.5.0', required: get_option('libbluray'))
+libbluray = dependency('libbluray', version: '>= 1.0.2', required: get_option('libbluray'))
 features += {'libbluray': libbluray.found()}
 if features['libbluray']
     dependencies += libbluray
@@ -1746,7 +1759,7 @@ if rst2man.found()
           docutils_wrapper, rst2man,
           '--record-dependencies', '@DEPFILE@',
           '--strip-elements-with-class=contents',
-          '@INPUT@', '@OUTPUT@'],
+          '--output=@OUTPUT@', '@INPUT@'],
         depfile: 'mpv.1.dep',
         install: true,
         install_tag: 'man',

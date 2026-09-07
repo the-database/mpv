@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "player/core.h"
+#include "stream/stream.h"
 #include "osd.h"
 
 struct sh_stream;
@@ -27,6 +28,7 @@ enum sd_ctrl {
     // borrowed); the caller owns it and must hold it for as long as it can
     // serve those parts. See sub/packer.h.
     SD_CTRL_CLONE_ASS_PIN,
+    SD_CTRL_APPLY_DVDNAV,   // const struct stream_nav_state *
 };
 
 enum sd_text_type {
