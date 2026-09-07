@@ -200,7 +200,8 @@ void osd_free(struct osd_state *osd)
     if (!osd)
         return;
     osd_destroy_backend(osd);
-    talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->external2);
+    talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->image_overlay);
+    talloc_free(osd->objs[OSDTYPE_DISC_MENU]->image_overlay);
     mp_cond_destroy(&osd->ext_wakeup);
     mp_mutex_destroy(&osd->ext_lock);
     mp_mutex_destroy(&osd->lock);
@@ -332,12 +333,12 @@ void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
     mp_mutex_unlock(&osd->lock);
 }
 
-void osd_set_external2(struct osd_state *osd, struct sub_bitmaps *imgs)
+void osd_set_bitmaps(struct osd_state *osd, int type, struct sub_bitmaps *imgs)
 {
     mp_mutex_lock(&osd->lock);
-    struct osd_object *obj = osd->objs[OSDTYPE_EXTERNAL2];
-    talloc_free(obj->external2);
-    obj->external2 = sub_bitmaps_copy(NULL, imgs);
+    struct osd_object *obj = osd->objs[type];
+    talloc_free(obj->image_overlay);
+    obj->image_overlay = sub_bitmaps_copy(NULL, imgs);
     obj->vo_change_id += 1;
     osd->want_redraw_notification = true;
     mp_mutex_unlock(&osd->lock);
@@ -364,7 +365,8 @@ static void check_obj_resize(struct osd_state *osd, struct mp_osd_res res,
 void osd_resize(struct osd_state *osd, struct mp_osd_res res)
 {
     mp_mutex_lock(&osd->lock);
-    int types[] = {OSDTYPE_OSD, OSDTYPE_EXTERNAL, OSDTYPE_EXTERNAL2, -1};
+    int types[] = {OSDTYPE_OSD, OSDTYPE_EXTERNAL, OSDTYPE_EXTERNAL2,
+                   OSDTYPE_DISC_MENU, -1};
     for (int n = 0; types[n] >= 0; n++)
         check_obj_resize(osd, res, osd->objs[types[n]]);
     mp_mutex_unlock(&osd->lock);
@@ -404,8 +406,12 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
     // (they have --sub-render-res-limit with a proper capped-composite path).
     struct mp_osd_res render_res = osdres;
     int cap = osd->opts->osd_render_res_cap;
+    // EXTERNAL2/DISC_MENU are verbatim bitmap copies (overlay-add, disc menu
+    // highlights), never rendered at render_res -- rescaling their parts below
+    // would wrongly upscale them, so exclude both from the cap.
     bool capped = cap > 0 && osdres.h > cap && !obj->is_sub &&
-                  obj->type != OSDTYPE_EXTERNAL2 && !osd->opts->force_rgba_osd;
+                  obj->type != OSDTYPE_EXTERNAL2 &&
+                  obj->type != OSDTYPE_DISC_MENU && !osd->opts->force_rgba_osd;
     if (capped) {
         double s = (double) cap / osdres.h;
         render_res.w  = lrint(osdres.w  * s);
@@ -438,10 +444,11 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
     } else if (obj->type == OSDTYPE_SUB2) {
         if (obj->sub && sub_is_secondary_visible(obj->sub))
             res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts, draw_flags);
-    } else if (obj->type == OSDTYPE_EXTERNAL2) {
-        if (obj->external2 && obj->external2->format) {
-            res = sub_bitmaps_copy(NULL, obj->external2); // need to be owner
-            obj->external2->change_id = 0;
+    } else if (obj->type == OSDTYPE_EXTERNAL2 ||
+               obj->type == OSDTYPE_DISC_MENU) {
+        if (obj->image_overlay && obj->image_overlay->format) {
+            res = sub_bitmaps_copy(NULL, obj->image_overlay); // need to be owner
+            obj->image_overlay->change_id = 0;
         }
     } else if (obj->type == OSDTYPE_EXTERNAL) {
         // WP-H7 (defect 2): script overlays (stats page, OSC) are rendered
