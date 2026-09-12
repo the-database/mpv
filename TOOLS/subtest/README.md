@@ -320,7 +320,7 @@ python3 temporal_ab.py --mpv ../../build/mpv \
 
 # rig (Windows mpv.exe from WSL; /mnt/X paths auto-translated; outputs to
 # C: scratch, never Y:/SMB). Real GPU: keep the guard at its default.
-python3 temporal_ab.py --mpv /mnt/c/Users/<user>/8k-rig/mpv/mpv.exe \
+python3 temporal_ab.py --mpv /mnt/c/8k-rig/mpv/mpv.exe \
     --media "/mnt/y/Video/kobayashi/...ep07...mkv" --start 246.0 --frames 130 \
     --config-a .../mpv-cpu-baseline.conf --config-b .../mpv-acceptance.conf \
     --geometry 7680x4320 --out out_rig --tag unfazed_rig --runs 3

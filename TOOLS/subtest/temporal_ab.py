@@ -28,12 +28,12 @@ Usage (local, lavapipe):
       --geometry 7680x4320 --out out_t --tag unfazed --runs 3
 
 Rig (Windows mpv.exe from WSL; paths auto-translated /mnt/X/.. -> X:/..):
-  python3 temporal_ab.py --mpv /mnt/c/Users/<user>/8k-rig/mpv/mpv.exe \
+  python3 temporal_ab.py --mpv /mnt/c/8k-rig/mpv/mpv.exe \
       --media "/mnt/y/Video/kobayashi/....mkv" --start 246.0 --frames 122 \
       --config-a /mnt/y/Video/kobayashi/8k-acceptance-kit/mpv-cpu-baseline.conf \
       --config-b /mnt/y/Video/kobayashi/8k-acceptance-kit/mpv-acceptance.conf \
       --geometry 7680x4320 --out out_rig --tag unfazed_rig \
-      --win-scratch /mnt/c/Users/<user>/8k-rig/out
+      --win-scratch /mnt/c/8k-rig/out
   (rig runs open a real window on the desktop; keep them short/batched)
 
 Python 3.12, stdlib only. PNG decode + diff come from abdiff.py (same dir).
@@ -419,8 +419,10 @@ def main(argv=None) -> int:
     ap.add_argument("--vanish-pct", type=float, default=0.05,
                     help="flag VANISH when the A/B differing area exceeds "
                          "this %% of the frame")
-    ap.add_argument("--win-scratch", default="/mnt/c/Users/<user>/8k-rig/out",
-                    help="WSL-visible scratch for .exe runs (never SMB/Y:)")
+    ap.add_argument("--win-scratch",
+                    default=os.environ.get("SUBTEST_WIN_SCRATCH", "/mnt/c/8k-rig/out"),
+                    help="WSL-visible scratch for .exe runs (never SMB/Y:); "
+                         "defaults to $SUBTEST_WIN_SCRATCH when set")
     ap.add_argument("--keep-all", action="store_true",
                     help="keep matching PNGs too (default: deleted)")
     ap.add_argument("--diff-png", action="store_true", default=True)
