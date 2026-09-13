@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -65,7 +66,9 @@ cc = [args.cc]
 if Path(args.cc).stem == "zig":
     cc.append("cc")
 exe = out / ("stability.exe" if os.name == "nt" else "stability")
-process_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+process_flags = 0
+if sys.platform == "win32":
+    process_flags = subprocess.CREATE_NO_WINDOW
 build = subprocess.run(
     cc + ["-std=c11", "-O0", str(out / "stability.c"), "-o", str(exe)],
     capture_output=True,
