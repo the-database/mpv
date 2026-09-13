@@ -3323,10 +3323,11 @@ static void gc_prealloc_pools(struct priv *p)
         int wh = (int) MPMIN((4 * tiles + WORK_TEX_W - 1) / WORK_TEX_W, (int64_t) maxd);
         int64_t segs = tiles * RASTER_SEGS_PER_TILE;
         int eh = (int) MPMIN((2 * segs + EDGE_TEX_W - 1) / EDGE_TEX_W, (int64_t) maxd);
-        gc_ensure(gpu, &p->work_tex, ef, WORK_TEX_W, MPMAX(wh, 1),
-                  false, true, false, false, true);
-        gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, MPMAX(eh, 1),
-                  false, true, false, false, true);
+        if (!gc_ensure(gpu, &p->work_tex, ef, WORK_TEX_W, MPMAX(wh, 1),
+                       false, true, false, false, true) ||
+            !gc_ensure(gpu, &p->edge_tex, ef, EDGE_TEX_W, MPMAX(eh, 1),
+                       false, true, false, false, true))
+            return;
         // WP-H14 (item c1): floor the edge/work-list upload staging buffers to
         // the pool byte size so the wall-entry `.ptr` upload finds a buffer
         // ready instead of allocating a driver slab (the :3232 staging class).
@@ -3652,17 +3653,18 @@ static bool gc_staged_tex_upload(struct priv *p, pl_buf *stage, pl_tex tex,
     struct pl_tex_transfer_params tp = {
         .tex = tex, .rc = { .x1 = x1, .y1 = y1 }, .row_pitch = row_pitch,
     };
-    if (!(*stage) || (*stage)->params.size < bytes) {
+    if (p->gpu->limits.buf_transfer &&
+        (!(*stage) || (*stage)->params.size < bytes)) {
         size_t want = (bytes + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
         if (pl_buf_recreate(p->gpu, stage,
                             pl_buf_params(.size = want, .host_writable = true)))
             vo_alloc_bump(p, &p->cnt_staging_grow);
     }
-    if (*stage && (*stage)->params.size >= bytes) {
+    if (p->gpu->limits.buf_transfer && *stage && (*stage)->params.size >= bytes) {
         pl_buf_write(p->gpu, *stage, 0, src, bytes);
         tp.buf = *stage;
     } else {
-        tp.ptr = (void *) src;              // fallback: buffer alloc failed
+        tp.ptr = (void *) src;  // unsupported buffer transfers or allocation failure
     }
     return pl_tex_upload(p->gpu, &tp);
 }
@@ -3829,8 +3831,9 @@ static void gc_flush_misses(struct priv *p, struct gmiss *miss, int nmiss,
     if (p->glyph_stage_idx - p->stage_frame_base >= 3)
         p->cnt_staging_wrap++;
     pl_buf *ring = &p->glyph_stage[p->glyph_stage_idx++ % 3];
-    bool buf_ok = (*ring) && (*ring)->params.size >= miss_bytes;
-    if (!buf_ok) {
+    bool buf_ok = gpu->limits.buf_transfer &&
+                  (*ring) && (*ring)->params.size >= miss_bytes;
+    if (gpu->limits.buf_transfer && !buf_ok) {
         size_t want = (miss_bytes + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);
         buf_ok = pl_buf_recreate(gpu, ring,
                                  pl_buf_params(.size = want, .host_writable = true));
@@ -5921,17 +5924,17 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
             .row_pitch  = item->packed->stride[0],
         };
         // Upload the (large, per-frame) subtitle atlas via a streaming buffer:
-        // libplacebo guarantees buffer transfers are asynchronous even on
-        // backends without upload callbacks (e.g. d3d11), so this no longer
-        // blocks the VO thread the way a synchronous `ptr` upload does.
+        // use buffer transfers only when the backend supports them. D3D11
+        // requires the direct pointer path even if buffer allocation succeeds.
         size_t buf_size = (size_t) upload_params.row_pitch * item->packed_h;
         pl_buf *ring = &p->overlay_bufs[p->overlay_buf_idx++ % NUM_OVERLAY_BUFS];
         // Reuse the staging buffer whenever it's already big enough; only
         // (re)allocate on growth, rounded up, so it stops being reallocated as
         // the atlas grows frame-to-frame through a dense scene (that realloc was
         // the ~187ms VO-thread stall).
-        bool buf_ok = (*ring) && (*ring)->params.size >= buf_size;
-        if (!buf_ok) {
+        bool buf_ok = p->gpu->limits.buf_transfer &&
+                      (*ring) && (*ring)->params.size >= buf_size;
+        if (p->gpu->limits.buf_transfer && !buf_ok) {
             size_t want = (buf_size + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
             buf_ok = pl_buf_recreate(p->gpu, ring,
                                      pl_buf_params(.size = want, .host_writable = true));
@@ -5943,7 +5946,7 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
             upload_params.buf = *ring;
             ok = pl_tex_upload(p->gpu, &upload_params);
         } else {
-            // Fallback to a direct upload if the buffer can't be allocated.
+            // Direct upload for unsupported or unavailable staging buffers.
             upload_params.ptr = item->packed->planes[0];
             if (p->gpu->limits.callbacks) {
                 upload_params.callback = talloc_free;
@@ -7446,8 +7449,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     } else if (gms < 0) {
         if (frame->duration > 0) {
             gdl = (int64_t) frame->duration;
+        } else if (frame->display_synced && frame->ideal_frame_duration > 0) {
+            // Display-sync duration is in seconds and already speed-adjusted.
+            gdl = (int64_t) MP_TIME_S_TO_NS(frame->ideal_frame_duration);
         } else if (frame->approx_duration > 0) {
-            gdl = (int64_t) frame->approx_duration;
+            gdl = (int64_t) MP_TIME_S_TO_NS(frame->approx_duration);
         } else {
             gdl = INT64_C(42000000);
         }
