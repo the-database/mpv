@@ -2,6 +2,7 @@
 #define MP_SUB_AHEAD_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "osd.h"
 
@@ -44,6 +45,11 @@ void sub_ahead_enqueue(struct sub_ahead *a, struct demux_packet *pkt);
 // Also invalidates the stale-serve source: pre-seek content must never be
 // served after a seek.
 void sub_ahead_flush(struct sub_ahead *a);
+
+// Invalidate rendered frames and apply options to the private renderer on its
+// own thread, before decoding/rendering further work. Hard changes are followed
+// by the caller's normal reset/refeed of cached subtitle packets.
+void sub_ahead_update_opts(struct sub_ahead *a, uint64_t flags);
 
 // Snapshot the pts mapping the worker uses (raw video pts -> subtitle pts).
 // Bumps the gen + flushes (stale-delay entries must not be served).
