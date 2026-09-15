@@ -22,6 +22,10 @@ struct sd {
     struct mp_log *log;
     struct mp_subtitle_opts *opts;
     struct mp_subtitle_shared_opts *shared_opts;
+    // Render-ahead decoders use private option mirrors. Only their worker
+    // thread updates these caches after initialization.
+    struct m_config_cache *opts_cache;
+    struct m_config_cache *shared_opts_cache;
 
     const struct sd_functions *driver;
     void *priv;
