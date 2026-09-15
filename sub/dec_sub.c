@@ -184,6 +184,15 @@ static struct sd *init_decoder(struct dec_sub *sub, int ass_thread_override)
             .preload_ok = true,
         };
 
+        if (ass_thread_override) {
+            sd->opts_cache = m_config_cache_alloc(sd, sub->global,
+                                                  &mp_subtitle_sub_opts);
+            sd->shared_opts_cache = m_config_cache_alloc(sd, sub->global,
+                                                         &mp_subtitle_shared_sub_opts);
+            sd->opts = sd->opts_cache->opts;
+            sd->shared_opts = sd->shared_opts_cache->opts;
+        }
+
         if (sd->driver->init(sd) >= 0)
             return sd;
 
@@ -649,6 +658,7 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
         if (m_config_cache_update(sub->opts_cache))
             update_subtitle_speed(sub);
         m_config_cache_update(sub->shared_opts_cache);
+        sub_ahead_update_opts(sub->ahead, flags);
         ahead_update_timing(sub);   // delay/speed may have changed
         propagate = true;
         if (flags & UPDATE_SUB_HARD) {
