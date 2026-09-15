@@ -3892,18 +3892,22 @@ static void gc_flush_misses(struct priv *p, struct gmiss *miss, int nmiss,
 // (parts were split in emission order, so the two-overlay sequence preserves
 // libass's z-order exactly). Shared by the compose tail and the per-item
 // reuse fast path.
+static struct pl_color_space libass_overlay_color(struct priv *p,
+                                                  const struct sub_bitmaps *item,
+                                                  const struct mp_image *src,
+                                                  float ref_luma);
+
 static void emit_composed_overlays(struct priv *p, const struct sub_bitmaps *item,
                                    struct osd_entry *entry, struct pl_frame *frame,
                                    struct osd_state *state,
                                    enum pl_overlay_coords coords,
-                                   struct mp_image *src)
+                                   struct mp_image *src, float ref_luma)
 {
     struct pl_overlay col = {
         .mode = PL_OVERLAY_MONOCHROME, .coords = coords,
-        .color = pl_color_space_srgb, .repr.alpha = PL_ALPHA_INDEPENDENT,
+        .color = libass_overlay_color(p, item, src, ref_luma),
+        .repr.alpha = PL_ALPHA_INDEPENDENT,
     };
-    if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
-        col.color = src->params.color;
     // WP-H12: an all-spill compose has no result_tex content at all -- skip
     // the empty main overlay (its parts all live in the spill overlays).
     if (entry->num_run_parts) {
@@ -4038,7 +4042,7 @@ static bool gc_cov_same(const struct sub_bitmaps *item,
 static bool compose_glyph_runs(struct priv *p, const struct sub_bitmaps *item,
                                struct osd_entry *entry, struct pl_frame *frame,
                                struct osd_state *state, enum pl_overlay_coords coords,
-                               struct mp_image *src, double gs,
+                               struct mp_image *src, float ref_luma, double gs,
                                struct mp_osd_res res)
 {
     // WP-H6 (item 6): any (re)build invalidates the reusable compose until it
@@ -5042,7 +5046,7 @@ restart_alloc:
     }
     talloc_free(tmp);
 
-    emit_composed_overlays(p, item, entry, frame, state, coords, src);
+    emit_composed_overlays(p, item, entry, frame, state, coords, src, ref_luma);
 
     CP_MARK(CP_EMIT);
 
@@ -5827,7 +5831,7 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
                             p->trs[item->render_index].valid) ? 1 : 0);
             }
             if (reuse) {
-                emit_composed_overlays(p, item, entry, frame, state, coords, src);
+                emit_composed_overlays(p, item, entry, frame, state, coords, src, ref_luma);
                 p->cnt_compose_reuse++;
                 if (item->format == SUBBITMAP_LIBASS_OUTLINES)
                     continue;
@@ -5850,7 +5854,7 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
             double gs = item->render_w > 0 && subs->w > 0
                       ? (double) item->render_w / subs->w : 1.0;
             stats_time_start(p->stats, "sub-composite");
-            bool done = compose_glyph_runs(p, item, entry, frame, state, coords, src, gs, res);
+            bool done = compose_glyph_runs(p, item, entry, frame, state, coords, src, ref_luma, gs, res);
             stats_time_end(p->stats, "sub-composite");
             if (!done)
                 goto bail;
@@ -5864,7 +5868,7 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
             double gs = item->render_w > 0 && subs->w > 0
                       ? (double) item->render_w / subs->w : 1.0;
             stats_time_start(p->stats, "sub-composite");   // WP-A3: GPU per-glyph composite
-            bool done = compose_glyph_runs(p, item, entry, frame, state, coords, src, gs, res);
+            bool done = compose_glyph_runs(p, item, entry, frame, state, coords, src, ref_luma, gs, res);
             stats_time_end(p->stats, "sub-composite");
             if (!done)
                 goto bail;
@@ -6159,7 +6163,9 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
                     .repr = { .sys = PL_COLOR_SYSTEM_RGB,
                               .levels = PL_COLOR_LEVELS_FULL,
                               .alpha = PL_ALPHA_PREMULTIPLIED },
-                    .color = pl_color_space_srgb,
+                    // Compose in the subtitle's own color space; preserve its
+                    // luminance metadata for the final HDR/output conversion.
+                    .color = ol->color,
                     .crop = { 0, 0, rw, rh },
                     .overlays = &inter_ol,
                     .num_overlays = 1,
@@ -6186,7 +6192,6 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
                 ol->num_parts = 1;
                 ol->mode = PL_OVERLAY_NORMAL;
                 ol->repr.alpha = PL_ALPHA_PREMULTIPLIED;
-                ol->color = pl_color_space_srgb;
             }
         }
 

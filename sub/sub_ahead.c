@@ -95,6 +95,7 @@
 #include "demux/packet.h"
 #include "misc/mp_assert.h"
 #include "options/options.h"
+#include "options/m_config.h"
 #include "osd.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
@@ -228,6 +229,8 @@ struct sub_ahead {
     bool params_set;             // pending_params holds a real value to compare
     struct mp_image_params pending_params;
     bool reset_pending;
+    bool opts_pending;
+    uint64_t opts_flags;
 
     // change_id unification across worker hits (osd.c accumulates change_id).
     uint64_t served_change_id;
@@ -524,6 +527,20 @@ static MP_THREAD_VOID sub_ahead_thread(void *ptr)
             continue;
         }
 
+        if (a->opts_pending) {
+            uint64_t flags = a->opts_flags;
+            a->opts_pending = false;
+            a->opts_flags = 0;
+            mp_mutex_unlock(&a->lock);
+            if (a->worker_sd->opts_cache)
+                m_config_cache_update(a->worker_sd->opts_cache);
+            if (a->worker_sd->shared_opts_cache)
+                m_config_cache_update(a->worker_sd->shared_opts_cache);
+            a->worker_sd->driver->control(a->worker_sd, SD_CTRL_UPDATE_OPTS, &flags);
+            mp_mutex_lock(&a->lock);
+            continue;
+        }
+
         // Apply any pending video params on this thread (worker_sd is only ever
         // touched here).
         if (a->params_pending) {
@@ -806,6 +823,23 @@ void sub_ahead_flush(struct sub_ahead *a)
     a->newpkt_min_pts = INFINITY;
     mp_cond_signal(&a->wakeup);
     mp_cond_broadcast(&a->ring_added);  // don't leave a fetch waiting on stale gen
+    int nretire = 0;
+    struct ahead_payload **retired = retire_steal(a, &nretire);
+    mp_mutex_unlock(&a->lock);
+    retire_flush(retired, nretire);
+}
+
+void sub_ahead_update_opts(struct sub_ahead *a, uint64_t flags)
+{
+    if (!a)
+        return;
+    mp_mutex_lock(&a->lock);
+    a->opts_pending = true;
+    a->opts_flags |= flags;
+    ahead_clear(a);
+    a->gen++; // discard a render which was already running with old options
+    mp_cond_signal(&a->wakeup);
+    mp_cond_broadcast(&a->ring_added);
     int nretire = 0;
     struct ahead_payload **retired = retire_steal(a, &nretire);
     mp_mutex_unlock(&a->lock);
