@@ -35,6 +35,12 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
                             int preferred_osd_format, struct sub_bitmaps *out);
 
 #if HAVE_ASS_OUTLINE_DEFERRED
+struct AVBufferRef;
+// Borrow the producer's renderer owner until release_ass_pins(). Each frame
+// pin takes its own reference, including clones held by render-ahead consumers.
+void mp_sub_packer_set_ass_renderer_owner(struct mp_sub_packer *p,
+                                         struct AVBufferRef *owner);
+
 // SUBBITMAP_LIBASS_OUTLINES parts BORROW their coverage blobs from libass; the
 // packer holds a frame ref that keeps them alive only until its next changed
 // pack. A consumer that outlives that (the render-ahead ring) must take its own

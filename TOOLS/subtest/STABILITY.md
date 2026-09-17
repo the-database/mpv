@@ -80,3 +80,29 @@ logs and `results.json` are retained. Any failed check returns a nonzero exit.
 
 This is a focused correctness test, not a RIFE performance benchmark or coverage
 of every ASS effect, output API, subtitle format and display configuration.
+
+## ASS reinitialization with retained GPU outline frames
+
+`test_ass_toggle_lifetime.py` covers a lifetime that the single-event style test
+does not exercise reliably: an option change destroys the producing renderer
+while render-ahead frames still pin its glyph data. Image refs keep the glyph
+cache entries alive, but those entries still need the renderer's FreeType
+library and font lock when their final reference is released.
+
+```sh
+python TOOLS/subtest/test_ass_toggle_lifetime.py --mpv /path/to/mpv.exe --video black.mkv --out build/subtitle-toggle-lifetime
+```
+
+Use the original 20-second 640x360 black video generated above. The test creates
+its own ASS fixtures and runs six minimized D3D11 player processes: a single
+event control, 320 positioned overlapping events with GPU raster/composition
+and render-ahead enabled, the same dense fixture with either or both features
+disabled, and the failing combination with only one libass rendering thread.
+Each case requests 80 live force/no toggles and requires a clean exit. IPC,
+shutdown and crash waits are bounded; only test-owned processes are terminated.
+Logs, generated subtitles, exact exit codes and JSON results are retained.
+
+The existing live-options/color tests should also pass: keeping retired
+renderers alive must not prevent the new style from appearing. These synthetic
+tests do not establish compatibility with every subtitle script or replace a
+check of the original reported episode.
