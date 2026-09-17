@@ -21,6 +21,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <libavutil/buffer.h>
 
 #include "config.h"
 
@@ -49,6 +50,7 @@ struct mp_sub_packer {
     struct bitmap_packer *packer;
 #if HAVE_ASS_OUTLINE_DEFERRED
     struct mp_ass_pin *pin;   // frame refs backing the borrowed outline blobs
+    AVBufferRef *ass_renderer_owner; // borrowed from sd; pins take their own ref
 #endif
 };
 
@@ -58,8 +60,9 @@ struct mp_sub_packer {
 // because each blob is owned by a cached Bitmap which the emitting ASS_Image
 // already pins with a cache ref, so ONE frame ref on the list head keeps every
 // blob in that list alive -- libass honours the ref against LRU eviction
-// (cut_shard skips still-referenced items), cache flush and even renderer
-// teardown (destruction is deferred to the last dec_ref). Holding the ref is
+// (cut_shard skips still-referenced items) and cache flush. Renderer teardown
+// additionally needs renderer_owner: a surviving font still uses the renderer's
+// FreeType library and lock when its final cache ref is released. Holding refs is
 // strictly cheaper than the memcpy it replaces: the blobs are per-glyph cache
 // entries shared across frames, so the old copy re-duplicated mostly identical
 // data every single frame (measured 771 MB/frame at 8K, plus the same again in
@@ -72,6 +75,7 @@ struct mp_sub_packer {
 struct mp_ass_pin {
     ASS_Image **lists;
     int num_lists;
+    AVBufferRef *renderer_owner;
 };
 
 static void ass_pin_destroy(void *ptr)
@@ -79,14 +83,21 @@ static void ass_pin_destroy(void *ptr)
     struct mp_ass_pin *pin = ptr;
     for (int n = 0; n < pin->num_lists; n++)
         ass_frame_unref(pin->lists[n]);
+    // The last image unref can free a glyph/font. Keep its FreeType library
+    // and renderer locks alive until after that unref, even across a reinit.
+    av_buffer_unref(&pin->renderer_owner);
 }
 
 // Take frame refs on the given image lists. Free with talloc_free().
 static struct mp_ass_pin *ass_pin_new(void *ta_parent, ASS_Image **image_lists,
-                                      int num_image_lists)
+                                      int num_image_lists, AVBufferRef *owner)
 {
     struct mp_ass_pin *pin = talloc_zero(ta_parent, struct mp_ass_pin);
     talloc_set_destructor(pin, ass_pin_destroy);
+    if (owner) {
+        pin->renderer_owner = av_buffer_ref(owner);
+        MP_HANDLE_OOM(pin->renderer_owner);
+    }
     for (int n = 0; n < num_image_lists; n++) {
         if (!image_lists[n])
             continue;
@@ -101,7 +112,7 @@ static struct mp_ass_pin *ass_pin_new(void *ta_parent, ASS_Image **image_lists,
 // This MUST run before the ASS_Renderer that produced them is destroyed.
 // Dropping the last reference to a pinned glyph bitmap cascades through the
 // outline and glyph caches into the font cache, whose destructor calls
-// FT_Done_Face -- which needs the FT_Library, and therefore the ASS_Library,
+// FT_Done_Face -- which needs the renderer's FT_Library and font lock,
 // still alive. The packer is a talloc child of the sd, so without this it would
 // be freed after assobjects_destroy() and crash on shutdown.
 //
@@ -109,6 +120,7 @@ static struct mp_ass_pin *ass_pin_new(void *ta_parent, ASS_Image **image_lists,
 // released, so they must never be served again.
 void mp_sub_packer_release_ass_pins(struct mp_sub_packer *p)
 {
+    p->ass_renderer_owner = NULL;
     if (!p->pin)
         return;
     TA_FREEP(&p->pin);
@@ -123,7 +135,14 @@ struct mp_ass_pin *mp_sub_packer_clone_ass_pin(struct mp_sub_packer *p,
 {
     if (!p->pin || !p->pin->num_lists)
         return NULL;
-    return ass_pin_new(ta_parent, p->pin->lists, p->pin->num_lists);
+    return ass_pin_new(ta_parent, p->pin->lists, p->pin->num_lists,
+                      p->pin->renderer_owner);
+}
+
+void mp_sub_packer_set_ass_renderer_owner(struct mp_sub_packer *p,
+                                         AVBufferRef *owner)
+{
+    p->ass_renderer_owner = owner;
 }
 #endif
 
@@ -378,7 +397,8 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
         // refs, which replaced the per-part talloc_free of the blob copies.
         int64_t t_pf = sub_phase.on ? mp_time_ns() : 0;
         struct mp_ass_pin *old = p->pin;
-        p->pin = ass_pin_new(p, image_lists, num_image_lists);
+        p->pin = ass_pin_new(p, image_lists, num_image_lists,
+                            p->ass_renderer_owner);
         talloc_free(old);
         if (sub_phase.on)
             sub_phase.packfree_ns += mp_time_ns() - t_pf;
