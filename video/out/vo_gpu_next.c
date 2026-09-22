@@ -50,7 +50,6 @@
 #include "gpu/video.h"
 #include "gpu/video_shaders.h"
 #include "sub/osd.h"
-#include "sub/osd_state.h"
 #include "gpu_next/context.h"
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)

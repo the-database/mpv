@@ -26,6 +26,21 @@
 
 #include "options/m_option.h"
 
+// OSD object identifiers used by sub_bitmaps.render_index.
+enum mp_osdtype {
+    OSDTYPE_SUB,
+    OSDTYPE_SUB2, // IDs must be numerically successive
+
+    OSDTYPE_DISC_MENU,
+
+    OSDTYPE_OSD,
+
+    OSDTYPE_EXTERNAL,
+    OSDTYPE_EXTERNAL2,
+
+    OSDTYPE_COUNT
+};
+
 // NOTE: VOs must support at least SUBBITMAP_BGRA.
 enum sub_bitmap_format {
     SUBBITMAP_EMPTY = 0,// no bitmaps; always has num_parts==0
