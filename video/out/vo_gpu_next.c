@@ -50,6 +50,7 @@
 #include "gpu/video.h"
 #include "gpu/video_shaders.h"
 #include "sub/osd.h"
+#include "sub/osd_state.h"
 #include "gpu_next/context.h"
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
@@ -280,9 +281,9 @@ struct osd_guard {
     // granularity: each committed overlay records which OSD object
     // (render_index) it belongs to and the item's change_id at build time.
     // On a bail, SUB overlays are always served (stale subs, current rules);
-    // an OSD overlay is served only when its item is present now with the
-    // SAME change_id -- a churning OSD item (stats page, OSC) goes empty for
-    // that one frame instead of taking the still-valid subs down with it.
+    // Text/script OSD may reuse a still-visible item for one delayed build;
+    // requiring the same change_id would blank stats/OSC on each refresh
+    // that misses the deadline. Other overlay types require unchanged data.
     // build_* is filled during the build; committed into good_* only on a
     // complete build. bail_overlays is the compact serve list a bail builds
     // (it must not mutate the good state's own overlays array).
@@ -6260,11 +6261,11 @@ bail:
     //
     // WP-H6 (item 4): serving is per ITEM now. SUB overlays are always served
     // from a valid snapshot (subs at most one frame stale -- the historical
-    // guard contract). A non-sub (OSD/external) overlay is served only when
-    // its item is present in THIS frame's render with the SAME change_id: a
-    // churning stats page/OSC goes blank for the one bailed frame instead of
-    // invalidating the subs, and a stale OSD state is never presented over a
-    // newer one.
+    // guard contract). Text/script OSD also keeps its previous visible image
+    // across a refresh: dropping it on a changed change_id makes stats/OSC
+    // flicker under deadline pressure. The next build must complete, so the
+    // old image cannot be retained indefinitely. An absent item is still
+    // removed immediately; other overlay types require unchanged data.
     p->guard_fired = true;
     g->must_complete = true;
     frame->num_overlays = 0;
@@ -6282,16 +6283,17 @@ bail:
                 int ri = g->good_ol_rindex[i];
                 bool is_sub = ri == 0 || ri == 1;   // OSDTYPE_SUB / OSDTYPE_SUB2
                 if (!is_sub) {
-                    bool unchanged = false;
+                    bool reusable = false;
                     for (int k = 0; k < subs->num_items; k++) {
                         if (subs->items[k]->render_index == ri) {
-                            unchanged = subs->items[k]->change_id ==
-                                        g->good_ol_change[i];
+                            reusable = ri == OSDTYPE_OSD || ri == OSDTYPE_EXTERNAL ||
+                                       subs->items[k]->change_id ==
+                                           g->good_ol_change[i];
                             break;
                         }
                     }
-                    if (!unchanged)
-                        continue;   // item changed/vanished: empty this frame
+                    if (!reusable)
+                        continue;   // removed item or changed non-text overlay
                 } else {
                     served_subs++;
                 }
