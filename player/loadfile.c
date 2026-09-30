@@ -1281,6 +1281,9 @@ static MP_THREAD_VOID open_demux_thread(void *ctx)
     if (demux) {
         MP_VERBOSE(mpctx, "Opening done: %s\n", mpctx->open_url);
 
+        if (mpctx->open_probe_display_rate)
+            mp_probe_display_rates(demux, mpctx->open_url_flags);
+
         if (mpctx->open_for_prefetch && !demux->fully_read) {
             int num_streams = demux_get_num_stream(demux);
             for (int n = 0; n < num_streams; n++) {
@@ -1343,6 +1346,7 @@ static void start_open(struct MPContext *mpctx, char *url, int url_flags,
     mpctx->open_format = talloc_strdup(NULL, mpctx->opts->demuxer_name);
     mpctx->open_url_flags = url_flags;
     mpctx->open_for_prefetch = for_prefetch && mpctx->opts->demuxer_thread;
+    mpctx->open_probe_display_rate = mpctx->opts->vo->display_rate_match != 0;
     mpctx->demuxer_changed = false;
 
     if (mp_thread_create(&mpctx->open_thread, open_demux_thread, mpctx)) {
@@ -1811,6 +1815,7 @@ static void play_current_file(struct MPContext *mpctx)
     mpctx->filename = NULL;
     mpctx->shown_aframes = 0;
     mpctx->shown_vframes = 0;
+    mpctx->display_rate_initialized = false;
     mpctx->last_chapter_seek = -2;
     mpctx->last_chapter_flag = false;
     mpctx->last_chapter = -2;
@@ -2292,8 +2297,13 @@ void mp_play_files(struct MPContext *mpctx)
             new_entry = mpctx->playlist->current;
         }
 
-        if (!new_entry)
+        if (!new_entry) {
             mpctx->playlist->playlist_completed = true;
+            // An episode's EOF/decoder teardown is not the end of a playback
+            // session. Keep the matched mode while advancing to another file.
+            if (mpctx->video_out)
+                vo_control(mpctx->video_out, VOCTRL_RESTORE_DISPLAY_RATE, NULL);
+        }
 
         mpctx->playlist->current = new_entry;
         mpctx->playlist->current_was_replaced = false;
