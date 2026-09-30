@@ -1313,6 +1313,71 @@ Video
       frame, so if this is not done, there is some likeliness that the VO has
       to drop some frames if rendering the first frame takes longer than needed.
 
+``--display-rate-match=<no|yes|test>`` (Windows only)
+    Experimental automatic physical display refresh matching (default: ``no``).
+    Selects one refresh rate before playback and keeps it for the whole file,
+    including across seeks, locally steady sections and playback speed changes.
+    For local Matroska/libavformat files, scans video packet timestamps without
+    decoding before playback. A complete scan can establish CFR; a short steady
+    opening cannot establish that the rest of a file is CFR. The scan stops
+    between packets after five seconds or one million packets. Network inputs
+    are not scanned. Unavailable timestamps and incomplete scans use the highest
+    supported refresh rate for the whole playback.
+    This does not change video timestamps, interpolate frames, or alter
+    ``--video-sync``.
+
+    Confirmed CFR files select the lowest supported progressive refresh rate
+    that is an exact multiple of their cadence, adjusted for initial playback
+    speed and a filter's declared cadence multiplier. If none exists, a near multiple
+    (within 0.2%) is preferred, for example 24 Hz for 23.976 fps when fractional
+    modes are unavailable. Exact multiples always take priority over near ones.
+    A near match retains a small timing difference; this option does not enable
+    playback speed correction.
+
+    For completely scanned variable-rate files, retain the cadence runs and
+    their durations. Prefer the lowest exact common multiple, then a near
+    common multiple, of all the measured cadences. For example, mixed 23.976
+    and 29.97 fps sections prefer 119.88 Hz over 144 Hz when available. If no
+    common multiple exists, choose the mode with the lowest estimated squared
+    frame-hold timing error, weighted by each cadence's duration in the file.
+    Container timestamp rounding is accounted for. This can select a lower
+    refresh than the maximum, including on TVs limited to 60 Hz. It does not
+    guarantee perfect presentation of arbitrary VFR timestamps.
+
+    All choices preserve the current resolution, orientation and desktop bit
+    depth and use progressive modes. Fixed rates without an exact or near
+    match, and unverified files, retain the highest-supported-rate fallback.
+
+    Only the display containing the player is changed. Audio/video pause and a
+    notice appears at the top of the picture, with a half-second interval for it
+    to render before Windows applies the switch. This notice interval is skipped
+    if OSD is disabled. Audio/video then stay paused for
+    ``--display-rate-match-delay`` seconds after the switch succeeds, before
+    resuming automatically. The notice remains throughout both intervals. The
+    first frame can be displayed while startup is held. A manual pause
+    during this wait is preserved. No switching
+    occurs while minimized, paused, playing backward, or encoding. The matched
+    refresh is retained across consecutive playlist entries and file loops, so
+    episodes with matching cadence do not switch back to the desktop rate in
+    between. A different cadence can switch directly to its matching mode. The
+    original refresh is restored when the playlist finishes (including keeping
+    the last frame open), playback stops, video is disabled, the player exits
+    normally, or the option is disabled.
+    A subsequent external mode change is respected and stops automatic changes
+    for that playback. Forced process termination cannot guarantee restoration.
+
+    ``test`` logs decisions and asks Windows to validate the selected mode,
+    without applying it. It also operates in minimized windows for testing.
+
+``--display-rate-match-delay=<seconds>`` (Windows only)
+    Settling pause after a successful automatic display refresh switch (default:
+    3, range: 0 to 30). The delay starts when Windows finishes applying the mode.
+    A TV may need additional time to reacquire its signal; this is a timed wait,
+    not detection of when the panel shows a picture. Increase it for a slower TV.
+    Playback controls remain responsive, and a manual pause remains in effect
+    after the wait. Failed changes and test-mode decisions do not add a delay.
+    Setting 0 resumes as soon as the Windows call completes.
+
 ``--display-fps-override=<fps>``
     Set the display FPS used with the ``--video-sync=display-*`` modes. By
     default, a detected value is used. Keep in mind that setting an incorrect
