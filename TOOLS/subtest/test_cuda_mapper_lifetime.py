@@ -169,8 +169,8 @@ def main():
         if not match:
             raise RuntimeError(f"Cannot locate {name} in {SOURCE}")
         callbacks.append(match.group())
-    with tempfile.TemporaryDirectory(prefix="ajn-cuda-lifetime-") as temp:
-        temp = Path(temp)
+    with tempfile.TemporaryDirectory(prefix="ajn-cuda-lifetime-") as temp_dir:
+        temp = Path(temp_dir)
         cfile = temp / "mapper.c"
         exe = temp / "mapper-test.exe"
         cfile.write_text(PREAMBLE + "\n".join(callbacks) + TEST, encoding="utf-8")
