@@ -11,8 +11,12 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 
-from test_live_ass_options import ASS
+if sys.platform == "win32":
+    from test_live_ass_options import ASS
+
+assert sys.platform == "win32", "This D3D11 regression test requires Windows."
 
 
 def main():
