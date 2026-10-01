@@ -6,20 +6,6 @@
 #include "osd.h"
 #include "osdep/threads.h"
 
-enum mp_osdtype {
-    OSDTYPE_SUB,
-    OSDTYPE_SUB2, // IDs must be numerically successive
-
-    OSDTYPE_DISC_MENU,
-
-    OSDTYPE_OSD,
-
-    OSDTYPE_EXTERNAL,
-    OSDTYPE_EXTERNAL2,
-
-    OSDTYPE_COUNT
-};
-
 struct ass_state {
     struct mp_log *log;
     struct ass_track *track;

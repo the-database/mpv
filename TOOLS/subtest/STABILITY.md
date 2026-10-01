@@ -1,5 +1,27 @@
 # Subtitle correctness regressions
 
+## Statistics overlay under deadline pressure
+
+`test_osd_guard.py` checks the real D3D11 presentation path with GPU subtitles
+and render-ahead enabled. It toggles the built-in stats display, refreshes it
+frequently, then hides it. A 5 ms injected delay exceeds a 1 ms overlay budget.
+Both default OSD messages and persistent script overlays must retain their
+previous visible image during a missed deadline and disappear after being hidden.
+The test reads the VO's retained-overlay counts: screenshot commands rebuild
+overlays without a deadline and cannot detect this presentation-only failure.
+
+Generate an original 24/48 fps VFR source, then run against each player build:
+
+```sh
+ffmpeg -f lavfi -i color=black:s=640x360:r=96:d=7 -vf "select='if(lt(mod(t,2),1),not(mod(n,4)),not(mod(n,2)))'" -fps_mode vfr -c:v ffv1 vfr.mkv
+python TOOLS/subtest/test_osd_guard.py --mpv /path/to/mpv.exe --video vfr.mkv --out build/osd-guard
+```
+
+This Windows test requires Pillow through the shared ASS fixture module. It
+does not change the physical display refresh rate or establish whether a
+particular VFR file naturally misses deadlines at 23.976 Hz. Logs and results
+are retained in the output directory. Use a new output directory for each run.
+
 Run from the repository root:
 
 ```sh
