@@ -82,6 +82,8 @@ enum mp_voctrl {
 
     VOCTRL_UPDATE_WINDOW_TITLE,         // char*
     VOCTRL_UPDATE_PLAYBACK_STATE,       // struct voctrl_playback_state*
+    VOCTRL_MATCH_DISPLAY_RATE,          // struct mp_display_rate*: query/apply
+    VOCTRL_RESTORE_DISPLAY_RATE,
 
     VOCTRL_PERFORMANCE_DATA,            // struct voctrl_performance_data*
 

@@ -39,6 +39,7 @@
 #include "common/msg.h"
 #include "common/common.h"
 #include "vo.h"
+#include "display_rate.h"
 #include "win_state.h"
 #include "w32_common.h"
 #include "win32/displayconfig.h"
@@ -106,6 +107,12 @@ struct vo_w32_state {
     struct menu_ctx *menu_ctx;
 
     HMONITOR monitor; // Handle of the current screen
+    // A temporary refresh change belongs to this playback, not the registry.
+    wchar_t rate_device[CCHDEVICENAME];
+    DEVMODEW rate_original, rate_applied;
+    bool rate_owned, rate_blocked;
+    DWORD rate_test_hz;
+    bool rate_test_variable;
     char *color_profile; // Path of the current screen's color profile
 
     // Has the window seen a WM_DESTROY? If so, don't call DestroyWindow again.
@@ -714,6 +721,127 @@ static void force_update_display_info(struct vo_w32_state *w32)
 {
     w32->monitor = 0;
     update_display_info(w32);
+}
+
+static bool same_display_mode(const DEVMODEW *a, const DEVMODEW *b)
+{
+    return a->dmPelsWidth == b->dmPelsWidth && a->dmPelsHeight == b->dmPelsHeight &&
+           a->dmBitsPerPel == b->dmBitsPerPel &&
+           a->dmDisplayOrientation == b->dmDisplayOrientation &&
+           a->dmDisplayFlags == b->dmDisplayFlags &&
+           a->dmDisplayFrequency == b->dmDisplayFrequency;
+}
+
+static void restore_display_rate(struct vo_w32_state *w32)
+{
+    w32->rate_blocked = false;
+    w32->rate_test_hz = 0;
+    if (!w32->rate_owned)
+        return;
+    w32->rate_owned = false;
+    DEVMODEW current = { .dmSize = sizeof current };
+    // Do not undo a manual mode change made while the player was running.
+    if (!EnumDisplaySettingsW(w32->rate_device, ENUM_CURRENT_SETTINGS, &current) ||
+        !same_display_mode(&current, &w32->rate_applied))
+        return;
+    current.dmDisplayFrequency = w32->rate_original.dmDisplayFrequency;
+    current.dmFields = DM_DISPLAYFREQUENCY;
+    LONG result = ChangeDisplaySettingsExW(w32->rate_device, &current, NULL, 0, NULL);
+    if (result != DISP_CHANGE_SUCCESSFUL)
+        MP_WARN(w32, "Could not restore display refresh rate (Windows code %ld).\n", result);
+    else
+        MP_INFO(w32, "Restored original display refresh rate.\n");
+    force_update_display_info(w32);
+}
+
+static int match_display_rate(struct vo_w32_state *w32, struct mp_display_rate *rate)
+{
+    if (!w32->opts->display_rate_match || w32->rate_blocked ||
+        (w32->opts->display_rate_match == 1 &&
+         IsIconic(GetAncestor(w32->window, GA_ROOT))))
+        return VO_FALSE;
+
+    MONITORINFOEXW mi = { .cbSize = sizeof mi };
+    HMONITOR monitor = MonitorFromWindow(w32->window, MONITOR_DEFAULTTONEAREST);
+    DEVMODEW current = { .dmSize = sizeof current };
+    if (!GetMonitorInfoW(monitor, (MONITORINFO *)&mi) ||
+        !EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &current))
+        return VO_ERROR;
+    if (w32->rate_owned && wcscmp(w32->rate_device, mi.szDevice))
+        restore_display_rate(w32);
+    if (w32->rate_owned && !same_display_mode(&current, &w32->rate_applied)) {
+        w32->rate_owned = false;
+        w32->rate_blocked = true; // respect external changes for this playback
+        MP_INFO(w32, "Automatic refresh matching stopped after an external mode change.\n");
+        return VO_FALSE;
+    }
+
+    DEVMODEW best = current;
+    double score = -1;
+    for (DWORD n = 0;; n++) {
+        DEVMODEW mode = { .dmSize = sizeof mode };
+        if (!EnumDisplaySettingsW(mi.szDevice, n, &mode))
+            break;
+        if (mode.dmPelsWidth != current.dmPelsWidth ||
+            mode.dmPelsHeight != current.dmPelsHeight ||
+            mode.dmBitsPerPel != current.dmBitsPerPel ||
+            mode.dmDisplayOrientation != current.dmDisplayOrientation ||
+            (mode.dmDisplayFlags & DM_INTERLACED))
+            continue;
+        double s = mp_display_rate_score(*rate,
+                            mp_display_rate_from_gdi(mode.dmDisplayFrequency));
+        if (s > score) {
+            score = s;
+            best = mode;
+        }
+    }
+    if (score < 0)
+        return VO_FALSE;
+
+    // Change only refresh; enumerated modes must not move a secondary monitor
+    // or replace unrelated desktop settings with their enumeration defaults.
+    DWORD frequency = best.dmDisplayFrequency;
+    best = current;
+    best.dmDisplayFrequency = frequency;
+    best.dmFields = DM_DISPLAYFREQUENCY;
+
+    if (w32->opts->display_rate_match == 2) {
+        if (best.dmDisplayFrequency != w32->rate_test_hz ||
+            rate->variable != w32->rate_test_variable)
+        {
+            LONG result = ChangeDisplaySettingsExW(mi.szDevice, &best, NULL, CDS_TEST, NULL);
+            MP_INFO(w32, "[display-rate-test] %s %.3f fps -> %.3f Hz; Windows test=%ld; no change applied\n",
+                    rate->variable ? "VFR" : "CFR", rate->fps,
+                    mp_display_rate_from_gdi(best.dmDisplayFrequency), result);
+            w32->rate_test_hz = best.dmDisplayFrequency;
+            w32->rate_test_variable = rate->variable;
+        }
+        return VO_FALSE;
+    }
+    if (same_display_mode(&best, &current))
+        return VO_FALSE;
+    if (!rate->apply)
+        return VO_TRUE; // core pauses the audio/video clocks before applying
+
+    LONG result = ChangeDisplaySettingsExW(mi.szDevice, &best, NULL, CDS_TEST, NULL);
+    if (result == DISP_CHANGE_SUCCESSFUL)
+        result = ChangeDisplaySettingsExW(mi.szDevice, &best, NULL, 0, NULL);
+    if (result != DISP_CHANGE_SUCCESSFUL) {
+        w32->rate_blocked = true;
+        MP_WARN(w32, "Automatic refresh change failed (Windows code %ld).\n", result);
+        return VO_ERROR;
+    }
+    if (!w32->rate_owned) {
+        wcscpy(w32->rate_device, mi.szDevice);
+        w32->rate_original = current;
+    }
+    w32->rate_applied = best;
+    w32->rate_owned = true;
+    MP_INFO(w32, "Matched %s %.3f fps to %.3f Hz.\n",
+            rate->variable ? "VFR" : "CFR", rate->fps,
+            mp_display_rate_from_gdi(best.dmDisplayFrequency));
+    force_update_display_info(w32);
+    return VO_TRUE;
 }
 
 static void update_playback_state(struct vo_w32_state *w32)
@@ -2287,6 +2415,8 @@ static char **get_disp_names(struct vo_w32_state *w32)
 static bool gui_thread_control_supports(int request)
 {
     switch (request) {
+    case VOCTRL_MATCH_DISPLAY_RATE:
+    case VOCTRL_RESTORE_DISPLAY_RATE:
     case VOCTRL_VO_OPTS_CHANGED:
     case VOCTRL_GET_WINDOW_ID:
     case VOCTRL_GET_HIDPI_SCALE:
@@ -2314,6 +2444,11 @@ static bool gui_thread_control_supports(int request)
 static int gui_thread_control(struct vo_w32_state *w32, int request, void *arg)
 {
     switch (request) {
+    case VOCTRL_MATCH_DISPLAY_RATE:
+        return match_display_rate(w32, arg);
+    case VOCTRL_RESTORE_DISPLAY_RATE:
+        restore_display_rate(w32);
+        return VO_TRUE;
     case VOCTRL_VO_OPTS_CHANGED: {
         void *changed_option;
 
@@ -2322,7 +2457,9 @@ static int gui_thread_control(struct vo_w32_state *w32, int request, void *arg)
         {
             struct mp_vo_opts *vo_opts = w32->opts_cache->opts;
 
-            if (changed_option == &vo_opts->fullscreen) {
+            if (changed_option == &vo_opts->display_rate_match) {
+                restore_display_rate(w32);
+            } else if (changed_option == &vo_opts->fullscreen) {
                 update_fullscreen_state(w32);
             } else if (changed_option == &vo_opts->window_affinity) {
                 update_affinity(w32);
@@ -2553,6 +2690,7 @@ int vo_w32_control(struct vo *vo, int *events, int request, void *arg)
 static void do_terminate(void *ptr)
 {
     struct vo_w32_state *w32 = ptr;
+    restore_display_rate(w32);
     w32->terminate = true;
 
     if (!w32->destroyed)

@@ -41,6 +41,7 @@
 #include "filters/f_decoder_wrapper.h"
 #include "filters/f_enhancement_pair.h"
 #include "video/out/vo.h"
+#include "video/out/display_rate.h"
 
 #include "core.h"
 #include "command.h"
@@ -170,6 +171,16 @@ void uninit_video_chain(struct MPContext *mpctx)
         mpctx->video_status = STATUS_EOF;
 
         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
+    }
+    if (mpctx->display_rate_pending) {
+        talloc_free(mpctx->display_rate_pending);
+        mpctx->display_rate_pending = NULL;
+        mpctx->display_rate_initialized = false;
+    }
+    if (mpctx->display_rate_resume_time) {
+        mpctx->display_rate_resume_time = 0;
+        mpctx->osd_force_update = true;
+        update_internal_pause_state(mpctx);
     }
 }
 
@@ -1215,6 +1226,49 @@ void write_video(struct MPContext *mpctx)
         mp_mutex_lock(&vo->params_mutex);
         mp_image_params_update_dynamic(vo->params, p, vo->has_peak_detect_values);
         mp_mutex_unlock(&vo->params_mutex);
+    }
+
+    // Select once for the whole file. Neither a seek nor a locally fixed-rate
+    // stretch in VFR may trigger a display change during playback.
+    if (vo->opts->display_rate_match && !mpctx->paused && !vo_c->is_sparse &&
+        !mpctx->display_rate_initialized &&
+        mpctx->play_dir > 0 && !opts->untimed && !mpctx->encode_lavc_ctx &&
+        mpctx->next_frames[0]->pts != MP_NOPTS_VALUE)
+    {
+        mpctx->display_rate_initialized = true;
+        struct sh_stream *sh = track ? track->stream : NULL;
+        struct mp_display_rate rate = {.variable = true, .scale = opts->playback_speed};
+        if (sh) {
+            // Preserve a filter's declared cadence multiplier, e.g. RIFE.
+            if (sh->codec->fps > 0 && vo_c->filter->container_fps > 0)
+                rate.scale *= vo_c->filter->container_fps / sh->codec->fps;
+            rate.fps = sh->whole_file_fps * rate.scale;
+            rate.variable = !isfinite(rate.fps) || rate.fps <= 0;
+            rate.cadences = sh->display_cadences;
+            rate.num_cadences = sh->num_display_cadences;
+        }
+        MP_VERBOSE(mpctx, "Whole-file display refresh selection: %s, %.3f fps.\n",
+                   rate.variable ? "mixed/unknown" : "CFR", rate.fps);
+        if (vo_control(vo, VOCTRL_MATCH_DISPLAY_RATE, &rate) == VO_TRUE)
+        {
+            // Let the OSD render before the blocking Windows mode change.
+            // The playloop applies this request after the notice interval;
+            // both clocks remain held without changing the user's pause.
+            rate.apply = true;
+            mpctx->display_rate_pending = talloc_memdup(mpctx, &rate, sizeof(rate));
+            double preview = opts->video_osd && opts->osd_level >= 1 ? 0.5 : 0;
+            mpctx->display_rate_resume_time = mp_time_sec() + preview;
+            update_internal_pause_state(mpctx);
+            update_osd_msg(mpctx);
+            MP_VERBOSE(mpctx, "Pausing playback for display refresh change; "
+                       "notice interval %.3f seconds.\n", preview);
+            mp_set_timeout(mpctx, preview);
+            // Queue the first still frame so the matching message is visible
+            // while startup is held. Both clocks remain paused until the timer
+            // expires; an already-playing video keeps its current frame.
+            if (mpctx->video_status >= STATUS_READY)
+                return;
+        }
     }
 
     mpctx->time_frame -= get_relative_time(mpctx);

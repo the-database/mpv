@@ -156,6 +156,9 @@ static const m_option_t mp_vo_opt_list[] = {
     {"monitorpixelaspect", OPT_FLOAT(monitor_pixel_aspect),
         M_RANGE(1.0/32.0, 32.0)},
     {"fullscreen", OPT_BOOL(fullscreen)},
+    {"display-rate-match", OPT_CHOICE(display_rate_match,
+        {"no", 0}, {"yes", 1}, {"test", 2})},
+    {"display-rate-match-delay", OPT_DOUBLE(display_rate_match_delay), M_RANGE(0, 30)},
     {"fs", OPT_ALIAS("fullscreen")},
     {"input-cursor-passthrough", OPT_BOOL(cursor_passthrough)},
     {"native-keyrepeat", OPT_BOOL(native_keyrepeat)},
@@ -265,6 +268,7 @@ const struct m_sub_options vo_sub_opts = {
     .size = sizeof(struct mp_vo_opts),
     .defaults = &(const struct mp_vo_opts){
         .video_driver_list = NULL,
+        .display_rate_match_delay = 3.0,
         .drag_and_drop = -1,
         .monitor_pixel_aspect = 1.0,
         .screen_id = -1,

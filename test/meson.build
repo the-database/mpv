@@ -73,6 +73,10 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+display_rate = executable('display-rate', 'display_rate.c',
+                          include_directories: incdir, dependencies: libm)
+test('display-rate', display_rate)
+
 chmap_files = [
     'audio/chmap_avchannel.c',
     'audio/chmap_sel.c',
