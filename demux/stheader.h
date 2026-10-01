@@ -28,6 +28,7 @@
 struct MPOpts;
 struct demuxer;
 struct sh_stream;
+struct mp_display_cadence;
 
 // Container-level stream groups (e.g. AVStreamGroup from libavformat).
 // A group bundles multiple real streams that the user should normally see as
@@ -76,6 +77,15 @@ struct sh_stream {
     struct mp_tags *tags;
 
     bool missing_timestamps;
+
+    // Experimental display matching: positive only after a complete local-file
+    // packet scan establishes CFR. Zero means mixed or unverified cadence.
+    // Set by the opener before this stream is used by the playback thread.
+    double whole_file_fps;
+    // Complete scans also retain cadence runs for duration-weighted VFR
+    // selection. Stream-owned and read-only after the opener hands off.
+    struct mp_display_cadence *display_cadences;
+    int num_display_cadences;
 
     double seek_preroll;
 
