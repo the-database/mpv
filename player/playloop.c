@@ -48,6 +48,7 @@
 #include "stream/stream.h"
 #include "sub/dec_sub.h"
 #include "sub/osd.h"
+#include "video/out/display_rate.h"
 #include "video/out/vo.h"
 
 // Wait until mp_wakeup_core() is called, since the last time
@@ -158,7 +159,8 @@ void update_core_idle_state(struct MPContext *mpctx)
 
 bool get_internal_paused(struct MPContext *mpctx)
 {
-    return mpctx->opts->pause || mpctx->paused_for_cache;
+    return mpctx->opts->pause || mpctx->paused_for_cache ||
+           mpctx->display_rate_resume_time != 0;
 }
 
 // The value passed here is the new value for mpctx->opts->pause
@@ -201,6 +203,50 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
 void update_internal_pause_state(struct MPContext *mpctx)
 {
     set_pause_state(mpctx, mpctx->opts->pause);
+}
+
+static void handle_display_rate_pause(struct MPContext *mpctx)
+{
+    if (!mpctx->display_rate_resume_time)
+        return;
+
+    bool cancel = !mpctx->opts->vo->display_rate_match ||
+                  !mpctx->video_out || !mpctx->vo_chain || mpctx->stop_play;
+    double remaining = mpctx->display_rate_resume_time - mp_time_sec();
+    if (remaining > 0 && !cancel) {
+        // Keep processing commands, window events, and cache updates while
+        // the notice or settling timer runs.
+        mp_set_timeout(mpctx, remaining);
+        return;
+    }
+
+    if (mpctx->display_rate_pending) {
+        struct mp_display_rate rate = *mpctx->display_rate_pending;
+        talloc_free(mpctx->display_rate_pending);
+        mpctx->display_rate_pending = NULL;
+        if (cancel) {
+            mpctx->display_rate_initialized = false;
+        } else {
+            int result = vo_control(mpctx->video_out, VOCTRL_MATCH_DISPLAY_RATE,
+                                    &rate);
+            double delay = mpctx->opts->vo->display_rate_match_delay;
+            if (result == VO_TRUE && delay > 0) {
+                // The settling interval starts after Windows returns, not
+                // when the notice first appeared.
+                mpctx->display_rate_resume_time = mp_time_sec() + delay;
+                MP_VERBOSE(mpctx, "Display refresh changed; holding playback for %.3f seconds.\n",
+                           delay);
+                mp_set_timeout(mpctx, delay);
+                return;
+            }
+        }
+    }
+
+    mpctx->display_rate_resume_time = 0;
+    mpctx->osd_force_update = true;
+    MP_VERBOSE(mpctx, "Display refresh settling pause finished.\n");
+    // A user pause or cache pause still applies after our hold is released.
+    update_internal_pause_state(mpctx);
 }
 
 void update_screensaver_state(struct MPContext *mpctx)
@@ -1016,6 +1062,10 @@ static void handle_keep_open(struct MPContext *mpctx)
         (opts->keep_open == 2 ||
         (!playlist_get_next(mpctx->playlist, 1) && opts->loop_times == 1)))
     {
+        // Playback is ending on a retained last frame, not advancing. The VO
+        // remains alive, so its normal destruction will not restore the mode.
+        if (mpctx->video_out)
+            vo_control(mpctx->video_out, VOCTRL_RESTORE_DISPLAY_RATE, NULL);
         mpctx->stop_play = KEEP_PLAYING;
         if (mpctx->vo_chain) {
             if (!vo_has_frame(mpctx->video_out)) { // EOF not reached normally
@@ -1062,6 +1112,11 @@ int handle_force_window(struct MPContext *mpctx, bool force)
     // Don't interfere with real video playback
     if (mpctx->vo_chain && !stalled_video)
         return 0;
+
+    // Also release the video mode when switching to audio-only playback or
+    // disabling video while retaining a forced window. Not during file loading.
+    if (act && !mpctx->vo_chain && mpctx->video_out)
+        vo_control(mpctx->video_out, VOCTRL_RESTORE_DISPLAY_RATE, NULL);
 
     if (!mpctx->opts->force_vo) {
         if (act && !mpctx->vo_chain)
@@ -1302,6 +1357,8 @@ void run_playloop(struct MPContext *mpctx)
     handle_cursor_autohide(mpctx);
     handle_vo_events(mpctx);
     handle_command_updates(mpctx);
+
+    handle_display_rate_pause(mpctx);
 
     if (mpctx->lavfi && mp_filter_has_failed(mpctx->lavfi))
         mpctx->stop_play = AT_END_OF_FILE;
