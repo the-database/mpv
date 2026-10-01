@@ -53,6 +53,8 @@ struct cuda_mapper_priv {
     CUarray cu_array[4];
 
     CUcontext display_ctx;
+    CUevent copy_done;
+    bool copy_pending;
 
     void *ext[4];
 };
