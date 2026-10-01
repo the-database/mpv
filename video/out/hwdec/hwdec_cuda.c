@@ -192,6 +192,13 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     if (ret < 0)
         return ret;
 
+    if (!p_owner->do_full_sync) {
+        ret = CHECK_CU(cu->cuEventCreate(&p->copy_done,
+                        CU_EVENT_BLOCKING_SYNC | CU_EVENT_DISABLE_TIMING));
+        if (ret < 0)
+            goto error;
+    }
+
     for (int n = 0; n < desc.num_planes; n++) {
         if (!p_owner->ext_init(mapper, desc.planes[n], n)) {
             ret = -1;
@@ -216,6 +223,8 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
 
     // Don't bail if any CUDA calls fail. This is all best effort.
     CHECK_CU(cu->cuCtxPushCurrent(p->display_ctx));
+    if (p->copy_done)
+        CHECK_CU(cu->cuEventDestroy(p->copy_done));
     for (int n = 0; n < 4; n++) {
         p_owner->ext_uninit(mapper, n);
         ra_tex_free(mapper->ra, &mapper->tex[n]);
@@ -225,6 +234,21 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
 
 static void mapper_unmap(struct ra_hwdec_mapper *mapper)
 {
+    struct cuda_mapper_priv *p = mapper->priv;
+    struct cuda_hw_priv *p_owner = mapper->owner->priv;
+    CudaFunctions *cu = p_owner->cu;
+    CUcontext dummy;
+
+    if (!p->copy_pending)
+        return;
+
+    // ra_hwdec_mapper_unmap releases mapper->src after this callback. Keep
+    // the decoder surface alive until its asynchronous copy has completed,
+    // including when a seek discards the libplacebo frame queue.
+    CHECK_CU(cu->cuCtxPushCurrent(p->display_ctx));
+    CHECK_CU(cu->cuEventSynchronize(p->copy_done));
+    p->copy_pending = false;
+    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
 }
 
 static int mapper_map(struct ra_hwdec_mapper *mapper)
@@ -241,8 +265,10 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
 
     for (int n = 0; n < p->layout.num_planes; n++) {
         if (p_owner->ext_wait) {
-            if (!p_owner->ext_wait(mapper, n))
+            if (!p_owner->ext_wait(mapper, n)) {
+                ret = -1;
                 goto error;
+            }
         }
 
         CUDA_MEMCPY2D cpy = {
@@ -262,8 +288,10 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
             goto error;
 
         if (p_owner->ext_signal) {
-            if (!p_owner->ext_signal(mapper, n))
+            if (!p_owner->ext_signal(mapper, n)) {
+                ret = -1;
                 goto error;
+            }
         }
     }
     if (p_owner->do_full_sync)
@@ -272,9 +300,24 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // fall through
  error:
 
-    // Regardless of success or failure, we no longer need the source image,
-    // because this hwdec makes an explicit memcpy into the mapper textures
-    mp_image_unrefp(&mapper->src);
+    if (p->copy_done) {
+        // A queued memcpy still reads the decoder surface. Vulkan's external
+        // semaphore orders GPU access to the destination, but does not keep
+        // the source mp_image alive. Record even after a partial map failure
+        // so the unmap callback can safely release any queued copy's source.
+        int event_ret = CHECK_CU(cu->cuEventRecord(p->copy_done, 0));
+        if (event_ret < 0) {
+            // Without a completion event we must finish the submitted work
+            // before the failed map releases its source.
+            CHECK_CU(cu->cuStreamSynchronize(0));
+            ret = event_ret;
+        } else {
+            p->copy_pending = true;
+        }
+    } else {
+        // OpenGL already completed the copy with do_full_sync above.
+        mp_image_unrefp(&mapper->src);
+    }
 
     eret = CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     if (eret < 0)
