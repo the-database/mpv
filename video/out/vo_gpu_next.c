@@ -662,6 +662,7 @@ struct priv {
     double last_pts;
     bool is_interpolated;
     bool want_reset;
+    bool want_seek_reset;
     bool flush_cache;
     bool frame_pending;
     bool paused;
@@ -7156,6 +7157,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         params.distort_params = NULL;
     }
 
+    // Frames up to last_id were pushed before the seek. Redraws of them keep
+    // the queue as it is, the reset happens with the first new frame.
+    if (p->want_seek_reset && frame->num_frames && frame->frame_id > p->last_id) {
+        p->want_seek_reset = false;
+        p->want_reset = true;
+    }
+
     // pl_queue advances its internal virtual PTS and culls available frames
     // based on this value and the VPS/FPS ratio. Requesting a non-monotonic PTS
     // is an invalid use of pl_queue. Reset it if this happens in an attempt to
@@ -7166,7 +7174,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // already requested. Clamp the check to 0, as we don't have the previous
     // frame in vo_frame anyway.
     struct pl_source_frame vpts;
-    if (frame->current && !p->want_reset) {
+    if (frame->current && !p->want_reset && !p->want_seek_reset) {
         if (pl_queue_peek(p->queue, 0, &vpts) &&
             frame->current->pts + MPMAX(0, pts_offset) < vpts.pts)
         {
@@ -8311,7 +8319,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
 
     case VOCTRL_RESET:
         // Defer until the first new frame (unique ID) actually arrives
-        p->want_reset = true;
+        p->want_seek_reset = true;
         // WP-E3: VOCTRL_RESET is the canonical playback-discontinuity signal
         // to a VO -- vo.c delivers it on the VO thread on every seek/playback
         // restart, before the first post-seek draw_frame. Invalidating here
@@ -8320,6 +8328,9 @@ static int control(struct vo *vo, uint32_t request, void *data)
         // path is only a backstop behind this). The blend-subs snapshots
         // (frame_priv) need no invalidation: they die with their frames when
         // the queue is reset, and each is only ever served for its own frame.
+        // The overlay invalidation stays immediate even though the pl_queue
+        // reset above is deferred: redraws of pre-seek frames must not reuse
+        // a pre-seek overlay snapshot either.
         guard_invalidate(p);
         // WP-H10: arm the post-seek transient-demand probe (a few frames of
         // peeking the ring's pre-warmed seek target; see tr_reset_probe_run).
