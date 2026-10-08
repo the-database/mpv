@@ -593,8 +593,10 @@ static bool configure_aji(struct mp_filter *vf)
 
     p->aji_active = true;
     p->out_fmt = p->aji_fmt;
-    if (p->opts->output_444 && !p->is_d3d11) {
-        // Option forces full-resolution 4:4:4 even from a 4:2:0 source
+    if ((p->opts->output_444 || aji_format_is_444(p->aji_fmt)) &&
+        !p->is_d3d11) {
+        // Preserve 4:4:4 sources in full 16-bit output, including MSB input.
+        // The option forces full-resolution 4:4:4 even from a 4:2:0 source
         // (exceeds the reference pipeline, which always subsampled back to
         // 4:2:0). D3D11/DirectML stays 4:2:0 - DXGI has no planar 16-bit
         // 4:4:4 video format for the pool.
@@ -1446,6 +1448,8 @@ static void vf_animejanai_process(struct mp_filter *vf)
             p->aji_fmt = sw == AV_PIX_FMT_NV12 ? AJI_FMT_NV12 :
                          sw == AV_PIX_FMT_P010 ? AJI_FMT_P010 :
                          sw == AV_PIX_FMT_YUV444P16 ? AJI_FMT_YUV444P16 :
+                         sw == AV_PIX_FMT_YUV444P10MSB ? AJI_FMT_YUV444P10MSB :
+                         sw == AV_PIX_FMT_YUV444P12MSB ? AJI_FMT_YUV444P12MSB :
                          sw == AV_PIX_FMT_X2BGR10 ? AJI_FMT_RGB10A2 : 0;
             if (!p->aji_fmt) {
                 MP_ERR(vf, "Unsupported sw format %s for inference\n",
@@ -1455,8 +1459,8 @@ static void vf_animejanai_process(struct mp_filter *vf)
             }
             // 4:4:4 planar ingest is TensorRT/CUDA only (no planar 16-bit
             // 4:4:4 DXGI format); on D3D11 it arrives as x2bgr10 RGB instead.
-            if (p->is_d3d11 && p->aji_fmt == AJI_FMT_YUV444P16) {
-                MP_ERR(vf, "yuv444p16 input requires the TensorRT/CUDA backend\n");
+            if (p->is_d3d11 && aji_format_is_444(p->aji_fmt)) {
+                MP_ERR(vf, "planar 4:4:4 input requires the TensorRT/CUDA backend\n");
                 mp_filter_internal_mark_failed(vf);
                 return;
             }
@@ -1950,6 +1954,8 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_NV12));
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_P010));
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P16));
+    mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P10MSB));
+    mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P12MSB));
 #if HAVE_D3D11
     mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_NV12));
     mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_P010));
