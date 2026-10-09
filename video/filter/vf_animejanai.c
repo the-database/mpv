@@ -849,6 +849,7 @@ static bool ingest_window(struct mp_filter *vf, int rel)
     const int mat = map_matrix(&p->params);
     const int rng = map_range(&p->params);
     const int sit = map_siting(&p->params);
+    int staged = 0;
     for (int k = rel; k <= rel + p->temporal_r; k++) {
         const uint64_t seq = p->seq0 + k;
         if (seq < p->seq_next)
@@ -856,13 +857,36 @@ static bool ingest_window(struct mp_filter *vf, int rel)
         struct mp_image *f = mp_refqueue_get(p->queue, k);
         if (!f)
             break;
-        const aji_frame fin = {
+        aji_frame fin = {
             .width = f->w, .height = f->h, .format = p->aji_fmt,
             .matrix = mat, .range = rng, .siting = sit,
             .plane = {f->planes[0], f->planes[1], f->planes[2]},
             .stride = {f->stride[0], f->stride[1], f->stride[2]},
         };
-        if (p->api.ingest(p->aji, &fin, seq, p->stream) != AJI_OK)
+        void *stream = p->stream;
+#if HAVE_D3D11
+        if (p->is_d3d11) {
+            // Decoder surfaces aren't shareable: stage each frame like
+            // submit_frame does. Earlier frames' stages are retired by the
+            // previous emission's ticket wait; a stage reused within this
+            // call (start of stream: up to r+1 ingests) must first finish
+            // its previous ingest's D3D12 read.
+            if (staged && staged % p->d3d_stage_count == 0 &&
+                p->api.wait(p->aji, p->api.flush(p->aji, NULL)) != AJI_OK)
+                return false;
+            ID3D11Texture2D *stage = p->d3d_stage[p->d3d_stage_next];
+            p->d3d_stage_next = (p->d3d_stage_next + 1) % p->d3d_stage_count;
+            ID3D11DeviceContext_CopySubresourceRegion(p->d3d_ctx,
+                (ID3D11Resource *)stage, 0, 0, 0, 0,
+                (ID3D11Resource *)f->planes[0], (UINT)(intptr_t)f->planes[1],
+                NULL);
+            fin.plane[0] = stage;
+            fin.plane[1] = 0;
+            stream = NULL;
+            staged++;
+        }
+#endif
+        if (p->api.ingest(p->aji, &fin, seq, stream) != AJI_OK)
             return false;
         p->seq_next = seq + 1;
     }
@@ -902,10 +926,11 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
             .format = p->aji_fmt,
             .matrix = mat, .range = rng, .siting = sit,
         };
-        if (p->rife_first) {
+        if (p->rife_first || (p->temporal_r && rel >= 0)) {
             // rife-first frames (the downscaled source / interp temps) are
             // already shareable work-res textures; feed them to the shim
-            // directly, no decoder staging.
+            // directly, no decoder staging. Temporal chains stage in
+            // ingest_window instead.
             fin.plane[0] = in->planes[0];
             fin.plane[1] = in->planes[1];
         } else {
@@ -928,7 +953,13 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
             .matrix = mat, .range = rng, .siting = sit,
             .plane = {out->planes[0], out->planes[1]},
         };
-        ok = p->api.infer(p->aji, &fin, &fout, NULL) == AJI_OK;
+        if (p->temporal_r && rel >= 0) {
+            ok = ingest_window(vf, rel) &&
+                 p->api.infer_seq(p->aji, p->seq0 + rel, &fout,
+                                  NULL) == AJI_OK;
+        } else {
+            ok = p->api.infer(p->aji, &fin, &fout, NULL) == AJI_OK;
+        }
     } else
 #endif
     {
