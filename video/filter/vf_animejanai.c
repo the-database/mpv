@@ -171,6 +171,12 @@ struct aji_api {
     int (*infer_rife)(aji_ctx *c, const aji_frame *a, const aji_frame *b,
                       double t, const aji_frame *out, void *cu_stream);
     int (*poll)(aji_ctx *c);
+    int (*temporal_radius)(aji_ctx *c);
+    int (*ingest)(aji_ctx *c, const aji_frame *in, uint64_t seq,
+                  void *cu_stream);
+    int (*infer_seq)(aji_ctx *c, uint64_t seq, const aji_frame *out,
+                     void *cu_stream);
+    void (*temporal_reset)(aji_ctx *c);
     const char *(*current_log)(aji_ctx *c);
     const char *(*last_error)(aji_ctx *c);
     void (*destroy)(aji_ctx **c);
@@ -259,6 +265,13 @@ struct priv {
     struct mp_image *rife_prev; // last upscaled frame (left endpoint)
     struct mp_image *outq[8];
     int outq_n, outq_pos;
+    // Temporal (multi-frame) chains: the engine keeps the frame history and
+    // upscales frame N from N-r..N+r. Frames are numbered by refqueue
+    // position: the frame at relative position k is seq0 + k, and seq0
+    // advances with every frame the refqueue emits. seq_next is the next
+    // number not yet handed to the engine (frames are ingested in order).
+    int temporal_r;
+    uint64_t seq0, seq_next;
     // RIFE-first: interpolate the source pair, then upscale every emitted
     // frame. rife_prev then holds the previous work-res source frame; src_pool
     // supplies source-resolution shareable copies of the decoder frames (the
@@ -397,6 +410,9 @@ static void flush_frames(struct mp_filter *vf)
     // seek/reset so old work cannot contend with the post-seek chain.
     drain_backend(vf);
     mp_refqueue_flush(p->queue);
+    if (p->aji && p->temporal_r)
+        p->api.temporal_reset(p->aji);
+    p->seq0 = p->seq_next = 0;
     mp_image_unrefp(&p->rife_prev);
     for (int i = 0; i < p->outq_n; i++)
         mp_image_unrefp(&p->outq[p->outq_pos + i]);
@@ -495,6 +511,8 @@ static void release_device_state(struct mp_filter *vf)
     p->configured = false;
     p->rife_on = false;
     p->rife_first = false;
+    p->temporal_r = 0;
+    p->seq0 = p->seq_next = 0;
 }
 
 static void write_stats(struct mp_filter *vf)
@@ -516,12 +534,17 @@ static void write_stats(struct mp_filter *vf)
 // as do bypass and passthrough; active upscale chains run queue-depth
 // frames deep, with the refqueue's future-ref window supplying the
 // read-ahead (depth - 1 buffered future frames).
+//
+// Temporal chains also run synchronously: the refqueue already holds r future
+// frames for the model's window, and read-ahead on top of that would pin more
+// decoder surfaces than the hwdec pool's spare frames.
 static void update_depth(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
     int depth = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
-    p->depth = (p->aji_active && !p->rife_on) ? depth : 1;
-    mp_refqueue_set_refs(p->queue, 0, p->depth - 1);
+    p->depth = (p->aji_active && !p->rife_on && !p->temporal_r) ? depth : 1;
+    mp_refqueue_set_refs(p->queue, 0,
+                         p->temporal_r ? p->temporal_r : p->depth - 1);
 }
 
 // (Re)configure the shim for the current stream params and slot. Updates
@@ -549,6 +572,14 @@ static bool configure_aji(struct mp_filter *vf)
         return false;
     }
     write_stats(vf);
+
+    // configure dropped the engine's frame history; renumber from the
+    // current refqueue position
+    p->temporal_r = ret > 0 ? p->api.temporal_radius(p->aji) : 0;
+    p->seq0 = p->seq_next = 0;
+    if (p->temporal_r)
+        MP_VERBOSE(vf, "Temporal model: %d-frame window\n",
+                   2 * p->temporal_r + 1);
 
     int rn = 0, rd = 0;
     p->rife_on = false;
@@ -809,10 +840,41 @@ static struct mp_image *alloc_out(struct mp_filter *vf)
     return img;
 }
 
+// Hand the frames at relative positions rel..rel+r to the engine's history
+// (each frame once, in order). Missing futures (end of stream) are simply
+// not ingested; the engine clamps the window.
+static bool ingest_window(struct mp_filter *vf, int rel)
+{
+    struct priv *p = vf->priv;
+    const int mat = map_matrix(&p->params);
+    const int rng = map_range(&p->params);
+    const int sit = map_siting(&p->params);
+    for (int k = rel; k <= rel + p->temporal_r; k++) {
+        const uint64_t seq = p->seq0 + k;
+        if (seq < p->seq_next)
+            continue;
+        struct mp_image *f = mp_refqueue_get(p->queue, k);
+        if (!f)
+            break;
+        const aji_frame fin = {
+            .width = f->w, .height = f->h, .format = p->aji_fmt,
+            .matrix = mat, .range = rng, .siting = sit,
+            .plane = {f->planes[0], f->planes[1], f->planes[2]},
+            .stride = {f->stride[0], f->stride[1], f->stride[2]},
+        };
+        if (p->api.ingest(p->aji, &fin, seq, p->stream) != AJI_OK)
+            return false;
+        p->seq_next = seq + 1;
+    }
+    return true;
+}
+
 // Enqueue inference for `in` and append it to the in-flight ring without
 // waiting for the GPU. `in` stays alive (and the decoder surface pinned)
-// through the refqueue until emission waits the entry's ticket.
-static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
+// through the refqueue until emission waits the entry's ticket. rel is
+// `in`'s refqueue position (temporal chains read its neighbors), or -1 for
+// a frame that is not in the refqueue.
+static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
 {
     struct priv *p = vf->priv;
 
@@ -892,7 +954,13 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
             return false;
         }
         stream = p->stream;
-        ok = p->api.infer(p->aji, &fin, &fout, p->stream) == AJI_OK;
+        if (p->temporal_r && rel >= 0) {
+            ok = ingest_window(vf, rel) &&
+                 p->api.infer_seq(p->aji, p->seq0 + rel, &fout,
+                                  p->stream) == AJI_OK;
+        } else {
+            ok = p->api.infer(p->aji, &fin, &fout, p->stream) == AJI_OK;
+        }
     }
 
     uint64_t ticket = ok ? p->api.flush(p->aji, stream) : 0;
@@ -953,7 +1021,7 @@ static struct mp_image *render(struct mp_filter *vf)
     if (p->aji_active) {
         // Synchronous inference (RIFE chains, queue-depth=1, pipeline
         // fallback): submit and immediately wait.
-        if (!submit_frame(vf, in))
+        if (!submit_frame(vf, in, 0))
             return NULL;
         return pop_ring(vf);
     }
@@ -1306,7 +1374,7 @@ static struct mp_image *interp_source(struct mp_filter *vf,
 static struct mp_image *upscale_image(struct mp_filter *vf,
                                       struct mp_image *in)
 {
-    if (!submit_frame(vf, in))
+    if (!submit_frame(vf, in, -1))
         return NULL;
     return pop_ring(vf);
 }
@@ -1671,7 +1739,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
             struct mp_image *src = mp_refqueue_get(p->queue, rel);
             if (!src)
                 break;  // EOF tail or fewer futures buffered yet
-            if (!submit_frame(vf, src))
+            if (!submit_frame(vf, src, rel))
                 break;  // degrade; the current frame falls back below
         }
     }
@@ -1754,10 +1822,12 @@ static void vf_animejanai_process(struct mp_filter *vf)
         p->rife_prev = mp_image_new_ref(out);
         if (!emitted_cur)
             mp_image_unrefp(&out);  // endpoint only; rife_prev keeps it
+        p->seq0++;
         mp_refqueue_write_out_pin(p->queue, first);
         return;
     }
 
+    p->seq0++;
     mp_refqueue_write_out_pin(p->queue, out);
 }
 
@@ -1924,13 +1994,20 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         p->api.resize = aji_lib_sym(p->api.handle, "aji_resize");
         p->api.infer_rife = aji_lib_sym(p->api.handle, "aji_infer_rife");
         p->api.poll = aji_lib_sym(p->api.handle, "aji_poll");
+        p->api.temporal_radius =
+            aji_lib_sym(p->api.handle, "aji_temporal_radius");
+        p->api.ingest = aji_lib_sym(p->api.handle, "aji_ingest");
+        p->api.infer_seq = aji_lib_sym(p->api.handle, "aji_infer_seq");
+        p->api.temporal_reset =
+            aji_lib_sym(p->api.handle, "aji_temporal_reset");
         p->api.current_log = aji_lib_sym(p->api.handle, "aji_current_log");
         p->api.last_error = aji_lib_sym(p->api.handle, "aji_last_error");
         p->api.destroy = aji_lib_sym(p->api.handle, "aji_destroy");
         if (!p->api.create || !p->api.set_slot || !p->api.configure ||
             !p->api.infer || !p->api.flush || !p->api.done || !p->api.wait ||
             !p->api.rife_factor || !p->api.infer_rife ||
-            !p->api.poll ||
+            !p->api.poll || !p->api.temporal_radius || !p->api.ingest ||
+            !p->api.infer_seq || !p->api.temporal_reset ||
             !p->api.current_log || !p->api.last_error || !p->api.destroy) {
             MP_ERR(f, "Inference shim '%s' is missing aji_* symbols "
                       "(ABI version mismatch?)\n", lib);
