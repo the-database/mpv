@@ -849,7 +849,9 @@ static bool ingest_window(struct mp_filter *vf, int rel)
     const int mat = map_matrix(&p->params);
     const int rng = map_range(&p->params);
     const int sit = map_siting(&p->params);
+#if HAVE_D3D11
     int staged = 0;
+#endif
     for (int k = rel; k <= rel + p->temporal_r; k++) {
         const uint64_t seq = p->seq0 + k;
         if (seq < p->seq_next)
@@ -1547,8 +1549,10 @@ static void vf_animejanai_process(struct mp_filter *vf)
             p->aji_fmt = sw == AV_PIX_FMT_NV12 ? AJI_FMT_NV12 :
                          sw == AV_PIX_FMT_P010 ? AJI_FMT_P010 :
                          sw == AV_PIX_FMT_YUV444P16 ? AJI_FMT_YUV444P16 :
+#ifdef AV_PIX_FMT_YUV444P10MSB
                          sw == AV_PIX_FMT_YUV444P10MSB ? AJI_FMT_YUV444P10MSB :
                          sw == AV_PIX_FMT_YUV444P12MSB ? AJI_FMT_YUV444P12MSB :
+#endif
                          sw == AV_PIX_FMT_X2BGR10 ? AJI_FMT_RGB10A2 : 0;
             if (!p->aji_fmt) {
                 MP_ERR(vf, "Unsupported sw format %s for inference\n",
@@ -2062,8 +2066,12 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_NV12));
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_P010));
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P16));
+#ifdef AV_PIX_FMT_YUV444P10MSB
+    // NVDEC's MSB-aligned 4:4:4 output; older FFmpeg (e.g. the Linux bundle's
+    // n7.1) has neither the formats nor a decoder that produces them
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P10MSB));
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P12MSB));
+#endif
 #if HAVE_D3D11
     mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_NV12));
     mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_P010));
