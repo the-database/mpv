@@ -1315,8 +1315,10 @@ Video
 
 ``--display-rate-match=<no|yes|test>`` (Windows only)
     Experimental automatic physical display refresh matching (default: ``no``).
-    Selects one refresh rate before playback and keeps it for the whole file,
-    including across seeks, locally steady sections and playback speed changes.
+    Selects a refresh rate from measured video timestamps. CFR files and
+    irregular VFR files keep one rate for the whole file, including across
+    seeks and playback speed changes. Files consisting entirely of long CFR
+    sections can match each section instead.
     For local Matroska/libavformat files, scans video packet timestamps without
     decoding before playback. A complete scan can establish CFR; a short steady
     opening cannot establish that the rest of a file is CFR. The scan stops
@@ -1334,7 +1336,16 @@ Video
     A near match retains a small timing difference; this option does not enable
     playback speed correction.
 
-    For completely scanned variable-rate files, retain the cadence runs and
+    If a complete scan finds multiple CFR sections, each at least 30 seconds
+    long, match the section about to play using the same CFR priority. For
+    example, a 29.97 fps opening followed by a 23.976 fps episode uses 60 Hz
+    then 23.976 Hz on a display offering 23.976/24/47.952/48/60 Hz. A seek or
+    saved resume position selects the destination section; seeking within the
+    same section does not trigger another change. Container FPS and VFR labels
+    do not override the measured cadence. If any run is shorter than 30 seconds,
+    keep one whole-file VFR choice instead of following local fluctuations.
+
+    For other completely scanned variable-rate files, retain the cadence runs and
     their durations. Prefer the lowest exact common multiple, then a near
     common multiple, of all the measured cadences. For example, mixed 23.976
     and 29.97 fps sections prefer 119.88 Hz over 144 Hz when available. If no

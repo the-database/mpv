@@ -82,8 +82,9 @@ struct sh_stream {
     // packet scan establishes CFR. Zero means mixed or unverified cadence.
     // Set by the opener before this stream is used by the playback thread.
     double whole_file_fps;
-    // Complete scans also retain cadence runs for duration-weighted VFR
-    // selection. Stream-owned and read-only after the opener hands off.
+    // Complete scans retain cadence runs and their start timestamps for CFR
+    // sections or duration-weighted VFR selection. Stream-owned and read-only
+    // after the opener hands off.
     struct mp_display_cadence *display_cadences;
     int num_display_cadences;
 
