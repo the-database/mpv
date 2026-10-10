@@ -7,6 +7,7 @@
 #include <stdlib.h>
 
 struct mp_display_cadence {
+    double start_pts;
     double interval;
     int frames;
 };
@@ -60,6 +61,7 @@ static inline int mp_display_rate_analyze(double *pts, int count,
         if (next_low > next_high) {
             int frames = i - 1 - start;
             cadences[runs++] = (struct mp_display_cadence){
+                .start_pts = pts[start],
                 .interval = (pts[i - 1] - pts[start]) / frames,
                 .frames = frames,
             };
@@ -72,10 +74,31 @@ static inline int mp_display_rate_analyze(double *pts, int count,
         high = next_high;
     }
     cadences[runs++] = (struct mp_display_cadence){
+        .start_pts = pts[start],
         .interval = (pts[count - 1] - pts[start]) / (count - 1 - start),
         .frames = count - 1 - start,
     };
     return runs;
+}
+
+// Only switch within a file if its complete scan consists entirely of long
+// CFR sections. Short/irregular runs anywhere keep the whole-file VFR policy;
+// a locally steady stretch alone must never cause refresh-rate hunting.
+// pts uses the same (unrebased) timestamp domain as the scanned packets.
+// Return -1 for the whole-file policy, otherwise the section containing pts.
+static inline int mp_display_rate_section(const struct mp_display_cadence *cadences,
+                                          int count, double pts)
+{
+    if (count < 2 || !isfinite(pts))
+        return -1;
+    int section = 0;
+    for (int i = 0; i < count; i++) {
+        if (cadences[i].interval * cadences[i].frames < 30)
+            return -1;
+        if (pts >= cadences[i].start_pts)
+            section = i;
+    }
+    return section;
 }
 
 // For measured VFR, prefer a mode fitting every run, then minimize the

@@ -395,7 +395,8 @@ typedef struct MPContext {
     // The newest frame is at index 0.
     struct frame_info *past_frames;
     int num_past_frames;
-    bool display_rate_initialized; // one choice per file, also across seeks
+    bool display_rate_initialized;
+    int display_rate_section; // -1: whole-file policy, otherwise a CFR section
 
     double last_idle_tick;
     double next_cache_update;
