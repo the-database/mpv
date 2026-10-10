@@ -110,7 +110,23 @@ int main(void) {
     run(true, false, false, 0, 3);
     run(true, false, false, VO_TRUE, 0);
     run(false, false, false, VO_TRUE, 3);
-    puts("Refresh notice scheduling: 6 cases passed");
+    // Seeking during the notice cancels the stale section's request and
+    // permits selection at the destination, preserving a manual pause.
+    for (int manual = 0; manual < 2; manual++) {
+        struct vo_opts vo_opts = {1, 3};
+        struct MPOpts opts = {&vo_opts, manual, true, 1};
+        struct vo vo = {&vo_opts};
+        struct MPContext m = {.opts = &opts, .video_out = &vo, .vo_chain = &vo,
+                              .display_rate_initialized = true, .video_status = STATUS_READY};
+        active = &m; now = 100; applies = 0;
+        start_notice(&m);
+        reset_pending(&m);
+        handle_display_rate_pause(&m);
+        assert(!m.display_rate_pending && !m.display_rate_resume_time);
+        assert(!m.display_rate_initialized && m.osd_force_update);
+        assert(m.paused == manual && applies == 0);
+    }
+    puts("Refresh notice scheduling: 8 cases passed");
 }
 """
 
@@ -125,7 +141,11 @@ def main():
                       r" == VO_TRUE\).*?^        \}", video, re.M | re.S)
     tick = re.search(r"^static void handle_display_rate_pause\([^\n]*\)\n\{.*?^\}",
                      loop, re.M | re.S)
-    if not start or not tick:
+    reset = re.search(r"^void reset_video_state\([^\n]*\)\n\{.*?^\}",
+                      video, re.M | re.S)
+    cancel = re.search(r"    if \(mpctx->display_rate_pending\).*?^    \}",
+                       reset.group() if reset else "", re.M | re.S)
+    if not start or not tick or not cancel:
         raise RuntimeError("Cannot locate refresh-notice scheduling code")
     wrapper = """
 static void start_notice(struct MPContext *mpctx) {
@@ -133,6 +153,8 @@ static void start_notice(struct MPContext *mpctx) {
     struct vo *vo = mpctx->video_out;
     struct mp_display_rate rate = {.fps = 24};
 """ + start.group() + "\n}\n"
+    wrapper += ("static void reset_pending(struct MPContext *mpctx) {\n" +
+                cancel.group() + "\n}\n")
     with tempfile.TemporaryDirectory(prefix="ajn-refresh-notice-") as temp:
         cfile = Path(temp) / "notice.c"
         exe = Path(temp) / "notice-test.exe"
