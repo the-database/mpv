@@ -68,7 +68,7 @@ void mp_probe_display_rates(struct demuxer *demux, int stream_flags)
     bool complete = false;
     int total = 0;
     while (!demux_cancel_test(probe) && mp_time_sec() < deadline && total < 1000000) {
-        struct demux_packet *pkt = demux_read_any_packet(probe);
+        struct demux_packet *pkt = demux_read_any_packet(probe, NULL);
         if (!pkt) {
             complete = !demux_read_interrupted(probe);
             break;
