@@ -24,7 +24,7 @@ mkdir -p "$DEPS" "$PREFIX" "$OUT"
 
 WAYLAND_TAG=1.23.1; WAYLAND_PROTOCOLS_TAG=1.41
 FFNVCODEC_TAG=n13.0.19.0; FFMPEG_TAG=n9.0.2; SHADERC_TAG=v2024.0
-VULKAN_TAG=vulkan-sdk-1.3.296.0  # jammy ships 1.3.204; mpv needs vulkan >= 1.3.238
+VULKAN_TAG=vulkan-sdk-1.4.363.0  # jammy ships 1.3.204; mpv needs vulkan >= 1.4.309
 say(){ echo -e "\n========== $* =========="; }
 clone(){ [ -d "$2" ] || git clone --depth 1 -b "$3" "$1" "$2"; }
 
