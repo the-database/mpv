@@ -108,6 +108,13 @@ struct osd_entry {
 // pl_buf_write block). Sized well above the in-flight depth.
 #define NUM_OVERLAY_BUFS 16
 
+// Edge/work-list upload staging ring for the GPU glyph rasterizer (see
+// gc_staged_tex_upload). Slot 0 is floored to the pool's worst-frame byte size,
+// the others to 1/RASTER_STAGE_EXTRA_DIV of it (a full floor is ~166 MB per
+// slot at 8K).
+#define RASTER_STAGE_RING      3
+#define RASTER_STAGE_EXTRA_DIV 4
+
 // WP-E: glyph atlas is split into GC_SEGMENTS horizontal eviction segments. When
 // the active packing region can't fit a glyph, the packer advances (ring-style)
 // into the next segment and evicts ONLY that segment's stale entries (epoch bump)
@@ -631,10 +638,10 @@ struct priv {
     // being uploaded (only used when built with HAVE_ASS_OUTLINE_DEFERRED).
     pl_tex edge_tex;                         // rgba32f segment pool (2 texels/seg)
     float *ebuf; int ebuf_cap;               // CPU segment scratch (in float units)
-    pl_buf edge_stage;                       // WP-H14 (c1): edge upload staging (was a per-call slab)
+    pl_buf edge_stage[RASTER_STAGE_RING];    // WP-H14 (c1): edge upload staging ring (was a per-call slab)
     pl_tex work_tex;                         // batched raster: one 16x16 tile per workgroup
     float *wbuf; int wbuf_cap;               // CPU work-list scratch (in float units)
-    pl_buf work_stage;                       // WP-H14 (c1): work-list upload staging (was a per-call slab)
+    pl_buf work_stage[RASTER_STAGE_RING];    // WP-H14 (c1): work-list upload staging ring
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -3333,14 +3340,19 @@ static void gc_prealloc_pools(struct priv *p)
         // the pool byte size so the wall-entry `.ptr` upload finds a buffer
         // ready instead of allocating a driver slab (the :3232 staging class).
         // Monotonic (only grows); re-floored on every reconfig like the pools.
+        // Slot 0 takes the full floor (the wall-entry frame); the other ring
+        // slots only need to cover a frame while slot 0 is still in flight.
         size_t esz = (size_t) EDGE_TEX_W * p->edge_tex->params.h * 4 * sizeof(float);
         size_t wsz = (size_t) WORK_TEX_W * p->work_tex->params.h * 4 * sizeof(float);
-        if (!p->edge_stage || p->edge_stage->params.size < esz)
-            pl_buf_recreate(gpu, &p->edge_stage,
-                            pl_buf_params(.size = esz, .host_writable = true));
-        if (!p->work_stage || p->work_stage->params.size < wsz)
-            pl_buf_recreate(gpu, &p->work_stage,
-                            pl_buf_params(.size = wsz, .host_writable = true));
+        for (int i = 0; i < RASTER_STAGE_RING; i++) {
+            size_t div = i ? RASTER_STAGE_EXTRA_DIV : 1;
+            if (!p->edge_stage[i] || p->edge_stage[i]->params.size < esz / div)
+                pl_buf_recreate(gpu, &p->edge_stage[i],
+                                pl_buf_params(.size = esz / div, .host_writable = true));
+            if (!p->work_stage[i] || p->work_stage[i]->params.size < wsz / div)
+                pl_buf_recreate(gpu, &p->work_stage[i],
+                                pl_buf_params(.size = wsz / div, .host_writable = true));
+        }
     }
 #endif
 }
@@ -3643,10 +3655,26 @@ static int gc_work_cap_tiles(struct priv *p)
 // (slow!)") -- round-7 measured two such slabs (~110 MB edge + ~33 MB work-
 // list) INSIDE the ep09 wall-entry builds, the vo_gpu_next.c:3232 staging class
 // the WP-H12 prealloc policy did not cover (9-10 drops at the linear entry).
-// The staging buffer is preallocated to the pool's worst-frame byte size at
-// warm-up (gc_prealloc_pools) and reused; a real over-floor frame still grows
-// it once (counted as staging-grow), never a per-call slab.
-static bool gc_staged_tex_upload(struct priv *p, pl_buf *stage, pl_tex tex,
+// The staging buffers are preallocated at warm-up (gc_prealloc_pools) and
+// reused; a real over-floor frame still grows one once (counted as
+// staging-grow), never a per-call slab.
+//
+// `ring` is a RASTER_STAGE_RING-deep ring, and the write always goes to a slot
+// the GPU is done with: pl_buf_write on a busy host-mapped buffer blocks until
+// its pending work completes. Under vsync-paced presentation
+// (--video-sync=display-*) the swapchain queue is kept full, so the previous
+// frame's upload completes only after that frame's image is acquired -- ~one
+// vsync. A single reused buffer parked every raster frame there (moving signs
+// at 8K, display-resample @ 23.976 Hz: sub-composite p50 40.5 ms vs 8.3 ms with
+// --video-sync=audio, so the present guard fired and the signs juddered; the
+// acceptance runs used video-sync=audio and llvmpipe, so neither showed it).
+//
+// Slot choice never does worse than the single buffer did: an idle slot that
+// fits is used without waiting; otherwise a busy slot that fits is waited on
+// (the old behavior, counted as staging-wrap); and only when no slot fits is
+// slot 0 grown, exactly as before -- the smaller slots are never grown, so the
+// ring adds no VO-thread allocations.
+static bool gc_staged_tex_upload(struct priv *p, pl_buf *ring, pl_tex tex,
                                  int x1, int y1, size_t row_pitch,
                                  const void *src)
 {
@@ -3654,6 +3682,26 @@ static bool gc_staged_tex_upload(struct priv *p, pl_buf *stage, pl_tex tex,
     struct pl_tex_transfer_params tp = {
         .tex = tex, .rc = { .x1 = x1, .y1 = y1 }, .row_pitch = row_pitch,
     };
+    pl_buf *stage = &ring[0];
+    if (p->gpu->limits.buf_transfer) {
+        pl_buf *busy_fit = NULL;
+        bool found = false;
+        for (int i = 0; i < RASTER_STAGE_RING; i++) {
+            if (!ring[i] || ring[i]->params.size < bytes)
+                continue;
+            if (!pl_buf_poll(p->gpu, ring[i], 0)) {
+                stage = &ring[i];
+                found = true;
+                break;
+            }
+            if (!busy_fit)
+                busy_fit = &ring[i];
+        }
+        if (!found && busy_fit) {
+            stage = busy_fit;
+            p->cnt_staging_wrap++;
+        }
+    }
     if (p->gpu->limits.buf_transfer &&
         (!(*stage) || (*stage)->params.size < bytes)) {
         size_t want = (bytes + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
@@ -3690,7 +3738,7 @@ static bool gc_flush_edges_range(struct priv *p, int seg0, int seg1)
     if (!ef || !gc_ensure_pool(p, &p->edge_tex, ef, EDGE_TEX_W, eh, false, true,
                                false, false, true, "edge_tex"))
         return false;
-    gc_staged_tex_upload(p, &p->edge_stage, p->edge_tex, EDGE_TEX_W, eh,
+    gc_staged_tex_upload(p, p->edge_stage, p->edge_tex, EDGE_TEX_W, eh,
                          (size_t) EDGE_TEX_W * 4 * sizeof(float),
                          p->ebuf + (size_t) seg0 * SEG_EXPORT_W);
     return true;
@@ -3778,7 +3826,7 @@ static void gc_flush_raster(struct priv *p, struct rjob *rjobs, int nrjobs,
         if (gc_ensure_pool(p, &p->work_tex, pl_find_named_fmt(gpu, "rgba32f"),
                            WORK_TEX_W, wh, false, true, false, false, true,
                            "work_tex")) {
-            gc_staged_tex_upload(p, &p->work_stage, p->work_tex, WORK_TEX_W, wh,
+            gc_staged_tex_upload(p, p->work_stage, p->work_tex, WORK_TEX_W, wh,
                                  (size_t) WORK_TEX_W * 4 * sizeof(float), p->wbuf);
             gc_raster_batch(p, ntiles, dst);
             p->cnt_raster_dispatches++;
@@ -8617,8 +8665,10 @@ static void uninit(struct vo *vo)
     p->n_trans_chain = 0;
     pl_tex_destroy(p->gpu, &p->edge_tex);
     pl_tex_destroy(p->gpu, &p->work_tex);
-    pl_buf_destroy(p->gpu, &p->edge_stage);   // WP-H14 (c1)
-    pl_buf_destroy(p->gpu, &p->work_stage);   // WP-H14 (c1)
+    for (int i = 0; i < RASTER_STAGE_RING; i++) {   // WP-H14 (c1)
+        pl_buf_destroy(p->gpu, &p->edge_stage[i]);
+        pl_buf_destroy(p->gpu, &p->work_stage[i]);
+    }
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
