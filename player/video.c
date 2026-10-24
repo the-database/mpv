@@ -126,6 +126,17 @@ void reset_video_state(struct MPContext *mpctx)
     mpctx->display_sync_active = 0;
 
     mpctx->video_status = mpctx->vo_chain ? STATUS_SYNCING : STATUS_EOF;
+
+    if (mpctx->display_rate_pending) {
+        // A seek can leave the section whose mode change was announced.
+        // Re-evaluate the first frame at the destination before changing modes.
+        talloc_free(mpctx->display_rate_pending);
+        mpctx->display_rate_pending = NULL;
+        mpctx->display_rate_initialized = false;
+        mpctx->display_rate_resume_time = 0;
+        mpctx->osd_force_update = true;
+        update_internal_pause_state(mpctx);
+    }
 }
 
 void uninit_video_out(struct MPContext *mpctx)
@@ -163,6 +174,7 @@ static void vo_chain_uninit(struct vo_chain *vo_c)
 
 void uninit_video_chain(struct MPContext *mpctx)
 {
+    mpctx->display_rate_initialized = false;
     if (mpctx->vo_chain) {
         reset_video_state(mpctx);
         vo_chain_uninit(mpctx->vo_chain);
@@ -1228,27 +1240,38 @@ void write_video(struct MPContext *mpctx)
         mp_mutex_unlock(&vo->params_mutex);
     }
 
-    // Select once for the whole file. Neither a seek nor a locally fixed-rate
-    // stretch in VFR may trigger a display change during playback.
+    // Irregular VFR keeps one whole-file choice. Files consisting entirely of
+    // long CFR sections may match each section, including when seeking into it.
+    struct sh_stream *sh = track ? track->stream : NULL;
+    int section = -1;
+    if (vo->opts->display_rate_match && sh) {
+        double pts = mpctx->next_frames[0]->pts;
+        if (pts != MP_NOPTS_VALUE && opts->rebase_start_time)
+            pts += track->demuxer->start_time;
+        section = mp_display_rate_section(sh->display_cadences,
+                                          sh->num_display_cadences, pts);
+    }
     if (vo->opts->display_rate_match && !mpctx->paused && !vo_c->is_sparse &&
-        !mpctx->display_rate_initialized &&
+        (!mpctx->display_rate_initialized || mpctx->display_rate_section != section) &&
         mpctx->play_dir > 0 && !opts->untimed && !mpctx->encode_lavc_ctx &&
         mpctx->next_frames[0]->pts != MP_NOPTS_VALUE)
     {
         mpctx->display_rate_initialized = true;
-        struct sh_stream *sh = track ? track->stream : NULL;
+        mpctx->display_rate_section = section;
         struct mp_display_rate rate = {.variable = true, .scale = opts->playback_speed};
         if (sh) {
             // Preserve a filter's declared cadence multiplier, e.g. RIFE.
             if (sh->codec->fps > 0 && vo_c->filter->container_fps > 0)
                 rate.scale *= vo_c->filter->container_fps / sh->codec->fps;
-            rate.fps = sh->whole_file_fps * rate.scale;
+            double fps = section >= 0 ? 1 / sh->display_cadences[section].interval
+                                      : sh->whole_file_fps;
+            rate.fps = fps * rate.scale;
             rate.variable = !isfinite(rate.fps) || rate.fps <= 0;
             rate.cadences = sh->display_cadences;
             rate.num_cadences = sh->num_display_cadences;
         }
-        MP_VERBOSE(mpctx, "Whole-file display refresh selection: %s, %.3f fps.\n",
-                   rate.variable ? "mixed/unknown" : "CFR", rate.fps);
+        MP_VERBOSE(mpctx, "Display refresh selection: %s, %.3f fps (section %d).\n",
+                   rate.variable ? "mixed/unknown" : "CFR", rate.fps, section);
         if (vo_control(vo, VOCTRL_MATCH_DISPLAY_RATE, &rate) == VO_TRUE)
         {
             // Let the OSD render before the blocking Windows mode change.
