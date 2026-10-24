@@ -101,6 +101,7 @@ struct osd_entry {
     // WP-J3: the used extent of result_tex for that compose -- the region a
     // cross-state reuse has to copy out of the sibling entry.
     int built_used_w, built_used_h;
+    int change_id;            // item change_id uploaded into tex (0 = none)
 };
 
 // Ring of streaming upload buffers cycled across uploads, so a buffer is never
@@ -673,6 +674,8 @@ struct priv {
     bool flush_cache;
     bool frame_pending;
     bool paused;
+    int last_ref_white;
+    int last_srgb_power22;
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -5955,13 +5958,22 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
         int prev_h = entry->tex ? entry->tex->params.h : -1;
         int new_w = MPMAX(want_w, entry->tex ? entry->tex->params.w : 0);
         int new_h = MPMAX(want_h, entry->tex ? entry->tex->params.h : 0);
-        bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
-            .format = tex_fmt,
-            .w = new_w,
-            .h = new_h,
-            .host_writable = true,
-            .sampleable = true,
-        });
+        // pl_tex_recreate() invalidates the texture even when it keeps it, so
+        // only call it when the size or format has to change; the change_id
+        // cache below relies on the contents surviving.
+        bool ok = true;
+        if (!entry->tex || new_w != prev_w || new_h != prev_h ||
+            entry->tex->params.format != tex_fmt)
+        {
+            entry->change_id = 0;
+            ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
+                .format = tex_fmt,
+                .w = new_w,
+                .h = new_h,
+                .host_writable = true,
+                .sampleable = true,
+            });
+        }
         if (!ok) {
             MP_ERR(vo, "Failed recreating OSD texture!\n");
             break;
@@ -5970,6 +5982,10 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
         // so this fires on first alloc and on each grow, not every frame.
         if (new_w != prev_w || new_h != prev_h)
             vo_alloc_bump(p, &p->cnt_tex_realloc);
+        // Unchanged since the last upload into this texture: skip it (the
+        // OSD would otherwise be re-uploaded on every redraw).
+        if (entry->change_id == item->change_id)
+            goto uploaded;
         stats_time_start(p->stats, "sub-upload");   // WP-A3: overlay atlas upload
         struct pl_tex_transfer_params upload_params = {
             .tex        = entry->tex,
@@ -6011,8 +6027,11 @@ static bool update_overlays(struct vo *vo, struct mp_osd_res res,
         if (!ok) {
             MP_ERR(vo, "Failed uploading OSD texture!\n");
             talloc_free(upload_params.priv);
+            entry->change_id = 0;
             break;
         }
+        entry->change_id = item->change_id;
+    uploaded:;
 
         // WP-E3 checkpoint: the atlas upload is recorded (async, targets only
         // this build buffer's entry->tex); the parts build below is next.
@@ -7348,6 +7367,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         // sets target_trc to PQ, but the hint(source) is SDR, we want to fill
         // in SDR luminance values instead of the default PQ range.
         struct pl_color_space source_csp = *source;
+        bool min_luma_known = hint.hdr.min_luma > 0;
         pl_color_space_infer_map(&source_csp, &hint);
         // Always prefer target luminance and transfer for inverse tone mapping
         if (pl_color_transfer_is_hdr(target->transfer) && opts->tone_map.inverse) {
@@ -7367,6 +7387,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             hint.hdr.max_luma = opts->target_peak;
         if (target_ref_luma && use_ref_luma(&hint, &target_csp))
             hint.hdr.max_luma = target_ref_luma;
+        // The SDR black point was inferred from the peak known before the
+        // overrides above, keep the assumed contrast relative to the final
+        // peak instead of the one it was inferred from.
+        if (!min_luma_known && !pl_color_transfer_is_hdr(hint.transfer))
+            hint.hdr.min_luma = hint.hdr.max_luma / PL_COLOR_SDR_CONTRAST;
         // Always set maxCLL, display uses this metadata and we shouldn't let it
         // fallback to default value.
         if (!hint.hdr.max_cll)
@@ -9242,6 +9267,13 @@ AV_NOWARN_DEPRECATED(
 
     MP_DBG(p, "Render options updated, flushing renderer cache.\n");
     p->flush_cache = p->paused || !p->next_opts->inter_preserve;
+
+    // These options are baked into mapped frames. Reset the queue to map the
+    // queued frames again.
+    p->want_reset = p->want_reset || p->last_ref_white != opts->hdr_reference_white;
+    p->want_reset = p->want_reset || ((p->last_srgb_power22 ^ opts->treat_srgb_as_power22) & 1);
+    p->last_ref_white = opts->hdr_reference_white;
+    p->last_srgb_power22 = opts->treat_srgb_as_power22;
 }
 
 const struct vo_driver video_out_gpu_next = {

@@ -107,13 +107,13 @@ class AppHub: NSObject {
     func open(urls: [URL]) {
         let files = urls.map {
             if $0.isFileURL { return $0.path }
-            var path = $0.absoluteString
+            let path = $0.absoluteString
             return path.removingPercentEncoding ?? path
         }.sorted { (strL: String, strR: String) -> Bool in
             return strL.localizedStandardCompare(strR) == .orderedAscending
         }
         log.verbose("\(openEvents > 0 ? "Appending" : "Opening") dropped files: \(files)")
-        input.open(files: files, append: openEvents > 0)
+        input.handleDnd(files: files, append: openEvents > 0)
         openEvents += 1
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.openEvents -= 1 }
     }
