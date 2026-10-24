@@ -116,6 +116,19 @@ struct osd_entry {
 #define RASTER_STAGE_RING      3
 #define RASTER_STAGE_EXTRA_DIV 4
 
+// osd_combine_gather glyph lists. They used to be a uniform array, i.e. the
+// pass's UBO. libplacebo asks for host-visible memory for it, so with
+// resizable BAR it is mapped and every pl_buf_write memcpys into it -- after
+// waiting until the GPU is done with the previous dispatch of the same pass.
+// That dispatch sits behind the previous frame's render on the queue, so with
+// a full swapchain queue (video-sync=display-*) the first gather of every
+// frame waited one vsync inside sub-composite (measured 40.5 ms p50 at
+// 8K/23.976 Hz), which tripped the present guard on moving signs. Instead each
+// dispatch's list is copied into a persistently mapped storage buffer at a
+// fresh offset, so nothing is written that the GPU may still read.
+#define GATHER_RING_MAX 8
+#define GATHER_SLOT_VEC4 16384             // 256 KiB per ring slot
+
 // WP-E: glyph atlas is split into GC_SEGMENTS horizontal eviction segments. When
 // the active packing region can't fit a glyph, the packer advances (ring-style)
 // into the next segment and evicts ONLY that segment's stale entries (epoch bump)
@@ -643,6 +656,10 @@ struct priv {
     pl_tex work_tex;                         // batched raster: one 16x16 tile per workgroup
     float *wbuf; int wbuf_cap;               // CPU work-list scratch (in float units)
     pl_buf work_stage[RASTER_STAGE_RING];    // WP-H14 (c1): work-list upload staging ring
+    pl_buf gather_ring[GATHER_RING_MAX];     // gather glyph lists (see gather_stage)
+    int gather_nring, gather_cur, gather_off; // gather_off in vec4 units
+    bool gather_ssbo_off;                    // SSBO path unavailable
+    bool gather_grow_failed;                 // stop adding ring slots
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -801,6 +818,9 @@ struct priv {
     // one frame (a 4th use would rebind a buffer whose upload may still be in
     // flight; pl_buf_write blocks on busy buffers). Info; 0 in outline mode.
     int64_t cnt_staging_wrap, stat_staging_wrap;
+    // Gather dispatches that fell back to the uniform-array glyph list because
+    // no gather_ring slot was idle (that path can block on the GPU). Info.
+    int64_t cnt_gather_ubo, stat_gather_ubo;
     unsigned stage_frame_base;               // glyph_stage_idx at frame start
     // WP-H1b: glyphs uploaded/rasterized into the atlas by the idle pre-fill
     // (i.e. atlas-fill work moved OFF the frame that first shows them).
@@ -1350,6 +1370,74 @@ static const char *const osd_combine_gather_body =
     "}\n"
     "imageStore(acc, g, vec4(a, 0.0, 0.0, 0.0));\n";
 
+// Same as osd_combine_gather_body, reading the list at gl[base] in a storage
+// buffer instead of a uniform array.
+static const char *const osd_combine_gather_ssbo_body =
+    "ivec2 g = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (g.x >= bw || g.y >= bh) return;\n"
+    "float a = imageLoad(acc, g).r;\n"
+    "for (int k = 0; k < nglyph; k++) {\n"
+    "    vec4 A = gl[base+2*k], B = gl[base+2*k+1];\n"
+    "    int dx=int(A.x), dy=int(A.y);\n"
+    "    if (g.x >= dx && g.y >= dy && g.x < dx+int(A.z) && g.y < dy+int(A.w)) {\n"
+    "        ivec2 s = ivec2(int(B.x)+g.x-dx, int(B.y)+g.y-dy);\n"
+    "        a += B.z > 0.5 ? texelFetch(tatlas, s, 0).r : texelFetch(atlas, s, 0).r;\n"
+    "    }\n"
+    "}\n"
+    "imageStore(acc, g, vec4(a, 0.0, 0.0, 0.0));\n";
+
+static bool gather_slot_create(struct priv *p, pl_buf *buf)
+{
+    size_t size = (size_t) GATHER_SLOT_VEC4 * 4 * sizeof(float);
+    if (size > p->gpu->limits.max_ssbo_size)
+        return false;
+    *buf = pl_buf_create(p->gpu, pl_buf_params(.size = size, .storable = true,
+                                               .host_mapped = true));
+    if (*buf && !(*buf)->data)
+        pl_buf_destroy(p->gpu, buf);
+    return *buf;
+}
+
+// Reserve nvec vec4s for one gather dispatch. Returns the slot and sets *base
+// (in vec4 units), or NULL when no slot is free (the caller then uses the
+// uniform array). Offsets within a slot only grow, so the reserved range has
+// never been read by a submitted dispatch; a slot is only restarted from 0
+// once the GPU is done with it.
+static pl_buf gather_stage(struct priv *p, int nvec, int *base)
+{
+    if (p->gather_ssbo_off)
+        return NULL;
+    if (p->gather_nring && p->gather_off + nvec <= GATHER_SLOT_VEC4)
+        goto take;
+    for (int i = 1; i <= p->gather_nring; i++) {
+        int s = (p->gather_cur + i) % p->gather_nring;
+        if (!pl_buf_poll(p->gpu, p->gather_ring[s], 0)) {
+            p->gather_cur = s;
+            p->gather_off = 0;
+            goto take;
+        }
+    }
+    if (p->gather_nring < GATHER_RING_MAX && !p->gather_grow_failed) {
+        if (gather_slot_create(p, &p->gather_ring[p->gather_nring])) {
+            p->gather_cur = p->gather_nring++;
+            p->gather_off = 0;
+            goto take;
+        }
+        p->gather_grow_failed = true;
+        if (!p->gather_nring) {
+            MP_VERBOSE(p, "No gather storage buffer, using a uniform array.\n");
+            p->gather_ssbo_off = true;
+        }
+    }
+    p->cnt_gather_ubo++;
+    return NULL;
+
+take:
+    *base = p->gather_off;
+    p->gather_off += nvec;
+    return p->gather_ring[p->gather_cur];
+}
+
 // gl holds nglyph (<= GATHER_MAXG) entries of 2 vec4 each: [dx,dy,w,h][sax,say,
 // atlas,_]; the caller must pass a full GATHER_MAXG-sized array (unused tail is
 // never read by the shader). atlas != 0 selects tatlas -- WP-H10: ONE chain
@@ -1376,17 +1464,32 @@ static void osd_combine_gather(struct priv *p, pl_tex acc, const float *gl,
         { .desc = { .name="tatlas", .type=PL_DESC_SAMPLED_TEX, .binding=2 },
           .binding = { .object=tatlas } },
     };
+    int base = 0;
+    pl_buf glbuf = gather_stage(p, 2 * nglyph, &base);
     struct pl_var glvar = pl_var_vec4("gl");
-    glvar.dim_a = 2 * GATHER_MAXG;
+    glvar.dim_a = glbuf ? GATHER_SLOT_VEC4 : 2 * GATHER_MAXG;
+    struct pl_buffer_var glbv = { .var = glvar, .layout = pl_std430_layout(0, &glvar) };
+    struct pl_shader_desc descs4[] = {
+        descs[0], descs[1], descs[2],
+        { .desc = { .name="glbuf", .type=PL_DESC_BUF_STORAGE, .binding=3,
+                    .access=PL_DESC_ACCESS_READONLY },
+          .binding = { .object=glbuf }, .buffer_vars = &glbv, .num_buffer_vars = 1 },
+    };
     struct pl_shader_var vars[] = {
         { .var = pl_var_int("bw"), .data=&bw }, { .var = pl_var_int("bh"), .data=&bh },
         { .var = pl_var_int("nglyph"), .data=&nglyph },
         { .var = glvar, .data = gl },
     };
+    if (glbuf) {
+        memcpy((float *) glbuf->data + 4 * (size_t) base, gl,
+               (size_t) nglyph * 8 * sizeof(float));
+        vars[3] = (struct pl_shader_var) { .var = pl_var_int("base"), .data=&base };
+    }
     struct pl_custom_shader cs = {
         .compute = true, .compute_group_size = {16, 16},
-        .descriptors = descs, .num_descriptors = 3,
-        .variables = vars, .num_variables = 4, .body = osd_combine_gather_body,
+        .descriptors = glbuf ? descs4 : descs, .num_descriptors = glbuf ? 4 : 3,
+        .variables = vars, .num_variables = 4,
+        .body = glbuf ? osd_combine_gather_ssbo_body : osd_combine_gather_body,
     };
     if (pl_shader_custom(sh, &cs))
         pl_dispatch_compute(p->osd_dp, pl_dispatch_compute_params(
@@ -3443,6 +3546,9 @@ static void gc_warmup(struct priv *p)
         // WP-H5b: precompile the batched gather-combine variant (one dummy glyph).
         if (p->glyph_atlas) {
             float gl[8 * GATHER_MAXG] = {0};
+            while (p->gather_nring < 3 &&
+                   gather_slot_create(p, &p->gather_ring[p->gather_nring]))
+                p->gather_nring++;
             osd_combine_gather(p, p->run_acc, gl, 1, D, D, NULL);       (*n)++;
         }
     }
@@ -7734,6 +7840,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "trans-share",               p->cnt_trans_share,         &p->stat_trans_share);
     emit_counter(vo, "compose-reuse",             p->cnt_compose_reuse,       &p->stat_compose_reuse);
     emit_counter(vo, "staging-wrap",              p->cnt_staging_wrap,        &p->stat_staging_wrap);
+    emit_counter(vo, "gather-ubo",                p->cnt_gather_ubo,          &p->stat_gather_ubo);
     if (want_slow) {
         int64_t gpu_ns = 0;
         for (int i = 0; i < p->perf_fresh.count; i++)
@@ -8694,6 +8801,9 @@ static void uninit(struct vo *vo)
         pl_buf_destroy(p->gpu, &p->edge_stage[i]);
         pl_buf_destroy(p->gpu, &p->work_stage[i]);
     }
+    for (int i = 0; i < GATHER_RING_MAX; i++)
+        pl_buf_destroy(p->gpu, &p->gather_ring[i]);
+    p->gather_nring = p->gather_off = 0;
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
