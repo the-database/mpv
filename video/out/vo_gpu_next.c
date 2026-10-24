@@ -109,25 +109,37 @@ struct osd_entry {
 // pl_buf_write block). Sized well above the in-flight depth.
 #define NUM_OVERLAY_BUFS 16
 
-// Edge/work-list upload staging ring for the GPU glyph rasterizer (see
-// gc_staged_tex_upload). Slot 0 is floored to the pool's worst-frame byte size,
-// the others to 1/RASTER_STAGE_EXTRA_DIV of it (a full floor is ~166 MB per
-// slot at 8K).
-#define RASTER_STAGE_RING      3
+// Edge/work-list upload staging for the GPU glyph rasterizer (see
+// gc_staged_tex_upload): a stream ring with slots of 1/RASTER_STAGE_EXTRA_DIV
+// of the pool's worst-frame byte size, plus one buffer floored to the full size
+// (~166 MB at 8K) for the rare upload that does not fit a slot.
+#define RASTER_STAGE_RING      1
 #define RASTER_STAGE_EXTRA_DIV 4
 
-// osd_combine_gather glyph lists. They used to be a uniform array, i.e. the
-// pass's UBO. libplacebo asks for host-visible memory for it, so with
-// resizable BAR it is mapped and every pl_buf_write memcpys into it -- after
-// waiting until the GPU is done with the previous dispatch of the same pass.
-// That dispatch sits behind the previous frame's render on the queue, so with
-// a full swapchain queue (video-sync=display-*) the first gather of every
-// frame waited one vsync inside sub-composite (measured 40.5 ms p50 at
-// 8K/23.976 Hz), which tripped the present guard on moving signs. Instead each
-// dispatch's list is copied into a persistently mapped storage buffer at a
-// fresh offset, so nothing is written that the GPU may still read.
-#define GATHER_RING_MAX 8
-#define GATHER_SLOT_VEC4 16384             // 256 KiB per ring slot
+// Stream rings: per-frame data the CPU hands to the GPU (gather glyph lists,
+// raster edge/work-list uploads) used to be written with pl_buf_write into a
+// buffer the GPU had just used. With resizable BAR such buffers are mapped, so
+// that write is a memcpy that first waits until the GPU is done with the
+// buffer. Under vsync-paced presentation (video-sync=display-*) the swapchain
+// queue is full and the previous frame's work only runs after its image is
+// acquired, so the wait was a whole vsync inside sub-composite (40.5 ms p50 at
+// 8K/23.976 Hz) and the present guard showed stale signs on moving text.
+// Instead, data is copied into persistently mapped buffers at a monotonically
+// increasing offset: a range is never written after a submitted command could
+// read it, and a slot restarts from 0 only once the GPU is done with it, so
+// nothing waits. When every slot is busy a new one is added (up to
+// STREAM_RING_MAX), and only past that does the caller fall back.
+#define STREAM_RING_MAX 8
+#define GATHER_SLOT_VEC4 16384             // 256 KiB gather ring slots
+
+struct stream_ring {
+    pl_buf slot[STREAM_RING_MAX];
+    int num, cur;
+    size_t off;                // next free byte in slot[cur]
+    size_t slot_size;
+    bool storable;
+    bool grow_failed;          // stop adding slots
+};
 
 // WP-E: glyph atlas is split into GC_SEGMENTS horizontal eviction segments. When
 // the active packing region can't fit a glyph, the packer advances (ring-style)
@@ -656,10 +668,8 @@ struct priv {
     pl_tex work_tex;                         // batched raster: one 16x16 tile per workgroup
     float *wbuf; int wbuf_cap;               // CPU work-list scratch (in float units)
     pl_buf work_stage[RASTER_STAGE_RING];    // WP-H14 (c1): work-list upload staging ring
-    pl_buf gather_ring[GATHER_RING_MAX];     // gather glyph lists (see gather_stage)
-    int gather_nring, gather_cur, gather_off; // gather_off in vec4 units
-    bool gather_ssbo_off;                    // SSBO path unavailable
-    bool gather_grow_failed;                 // stop adding ring slots
+    struct stream_ring raster_stream;        // edge/work-list uploads (gc_staged_tex_upload)
+    struct stream_ring gather_stream;        // gather glyph lists (osd_combine_gather)
 
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
@@ -818,9 +828,11 @@ struct priv {
     // one frame (a 4th use would rebind a buffer whose upload may still be in
     // flight; pl_buf_write blocks on busy buffers). Info; 0 in outline mode.
     int64_t cnt_staging_wrap, stat_staging_wrap;
-    // Gather dispatches that fell back to the uniform-array glyph list because
-    // no gather_ring slot was idle (that path can block on the GPU). Info.
+    // Stream-ring reservations that found no free slot, so the caller fell
+    // back to a path that can wait on the GPU (gather: uniform-array glyph
+    // list; raster: the floored staging buffer). Info.
     int64_t cnt_gather_ubo, stat_gather_ubo;
+    int64_t cnt_stream_full, stat_stream_full;
     unsigned stage_frame_base;               // glyph_stage_idx at frame start
     // WP-H1b: glyphs uploaded/rasterized into the atlas by the idle pre-fill
     // (i.e. atlas-fill work moved OFF the frame that first shows them).
@@ -1386,56 +1398,77 @@ static const char *const osd_combine_gather_ssbo_body =
     "}\n"
     "imageStore(acc, g, vec4(a, 0.0, 0.0, 0.0));\n";
 
-static bool gather_slot_create(struct priv *p, pl_buf *buf)
+static bool stream_slot_add(struct priv *p, struct stream_ring *r)
 {
-    size_t size = (size_t) GATHER_SLOT_VEC4 * 4 * sizeof(float);
-    if (size > p->gpu->limits.max_ssbo_size)
+    if (r->num == STREAM_RING_MAX || r->grow_failed || !r->slot_size)
         return false;
-    *buf = pl_buf_create(p->gpu, pl_buf_params(.size = size, .storable = true,
+    if (r->storable && r->slot_size > p->gpu->limits.max_ssbo_size)
+        return false;
+    pl_buf *buf = &r->slot[r->num];
+    *buf = pl_buf_create(p->gpu, pl_buf_params(.size = r->slot_size,
+                                               .storable = r->storable,
                                                .host_mapped = true));
     if (*buf && !(*buf)->data)
         pl_buf_destroy(p->gpu, buf);
-    return *buf;
+    if (!*buf) {
+        r->grow_failed = true;
+        return false;
+    }
+    r->cur = r->num++;
+    r->off = 0;
+    return true;
 }
 
-// Reserve nvec vec4s for one gather dispatch. Returns the slot and sets *base
-// (in vec4 units), or NULL when no slot is free (the caller then uses the
-// uniform array). Offsets within a slot only grow, so the reserved range has
-// never been read by a submitted dispatch; a slot is only restarted from 0
-// once the GPU is done with it.
-static pl_buf gather_stage(struct priv *p, int nvec, int *base)
+// Reserve `bytes` (offset aligned to `align`) in a slot of `r`. Returns the
+// slot and sets *off, or NULL when no slot is free; the caller then uses its
+// fallback path. See STREAM_RING_MAX for why this never waits.
+static pl_buf stream_reserve(struct priv *p, struct stream_ring *r,
+                             size_t bytes, size_t align, size_t *off)
 {
-    if (p->gather_ssbo_off)
+    if (bytes > r->slot_size)
         return NULL;
-    if (p->gather_nring && p->gather_off + nvec <= GATHER_SLOT_VEC4)
+    size_t o = MP_ALIGN_UP(r->off, align);
+    if (r->num && o + bytes <= r->slot_size)
         goto take;
-    for (int i = 1; i <= p->gather_nring; i++) {
-        int s = (p->gather_cur + i) % p->gather_nring;
-        if (!pl_buf_poll(p->gpu, p->gather_ring[s], 0)) {
-            p->gather_cur = s;
-            p->gather_off = 0;
+    for (int i = 1; i <= r->num; i++) {
+        int k = (r->cur + i) % r->num;
+        if (!pl_buf_poll(p->gpu, r->slot[k], 0)) {
+            r->cur = k;
+            o = 0;
             goto take;
         }
     }
-    if (p->gather_nring < GATHER_RING_MAX && !p->gather_grow_failed) {
-        if (gather_slot_create(p, &p->gather_ring[p->gather_nring])) {
-            p->gather_cur = p->gather_nring++;
-            p->gather_off = 0;
-            goto take;
-        }
-        p->gather_grow_failed = true;
-        if (!p->gather_nring) {
-            MP_VERBOSE(p, "No gather storage buffer, using a uniform array.\n");
-            p->gather_ssbo_off = true;
-        }
+    if (!stream_slot_add(p, r)) {
+        p->cnt_stream_full++;
+        return NULL;
     }
-    p->cnt_gather_ubo++;
-    return NULL;
+    o = 0;
 
 take:
-    *base = p->gather_off;
-    p->gather_off += nvec;
-    return p->gather_ring[p->gather_cur];
+    *off = o;
+    r->off = o + bytes;
+    return r->slot[r->cur];
+}
+
+// (Re)size `r` to `slot_size` and pre-create `n` slots, so playback normally
+// never allocates. Slots in flight are freed by libplacebo once idle.
+static void stream_ring_prealloc(struct priv *p, struct stream_ring *r,
+                                 size_t slot_size, bool storable, int n)
+{
+    if (r->slot_size != slot_size || r->storable != storable) {
+        for (int i = 0; i < r->num; i++)
+            pl_buf_destroy(p->gpu, &r->slot[i]);
+        *r = (struct stream_ring) { .slot_size = slot_size, .storable = storable };
+    }
+    while (r->num < n && stream_slot_add(p, r))
+        ;
+}
+
+static void stream_ring_destroy(struct priv *p, struct stream_ring *r)
+{
+    for (int i = 0; i < r->num; i++)
+        pl_buf_destroy(p->gpu, &r->slot[i]);
+    *r = (struct stream_ring) {0};
 }
 
 // gl holds nglyph (<= GATHER_MAXG) entries of 2 vec4 each: [dx,dy,w,h][sax,say,
@@ -1464,8 +1497,12 @@ static void osd_combine_gather(struct priv *p, pl_tex acc, const float *gl,
         { .desc = { .name="tatlas", .type=PL_DESC_SAMPLED_TEX, .binding=2 },
           .binding = { .object=tatlas } },
     };
-    int base = 0;
-    pl_buf glbuf = gather_stage(p, 2 * nglyph, &base);
+    size_t gloff = 0;
+    pl_buf glbuf = stream_reserve(p, &p->gather_stream,
+                                  (size_t) nglyph * 8 * sizeof(float), 16, &gloff);
+    if (!glbuf)
+        p->cnt_gather_ubo++;
+    int base = gloff / 16;   // in vec4 units
     struct pl_var glvar = pl_var_vec4("gl");
     glvar.dim_a = glbuf ? GATHER_SLOT_VEC4 : 2 * GATHER_MAXG;
     struct pl_buffer_var glbv = { .var = glvar, .layout = pl_std430_layout(0, &glvar) };
@@ -3446,19 +3483,21 @@ static void gc_prealloc_pools(struct priv *p)
         // the pool byte size so the wall-entry `.ptr` upload finds a buffer
         // ready instead of allocating a driver slab (the :3232 staging class).
         // Monotonic (only grows); re-floored on every reconfig like the pools.
-        // Slot 0 takes the full floor (the wall-entry frame); the other ring
-        // slots only need to cover a frame while slot 0 is still in flight.
+        // These full-size buffers only take the uploads too big for a
+        // raster_stream slot (the wall-entry frame); see gc_staged_tex_upload.
         size_t esz = (size_t) EDGE_TEX_W * p->edge_tex->params.h * 4 * sizeof(float);
         size_t wsz = (size_t) WORK_TEX_W * p->work_tex->params.h * 4 * sizeof(float);
         for (int i = 0; i < RASTER_STAGE_RING; i++) {
-            size_t div = i ? RASTER_STAGE_EXTRA_DIV : 1;
-            if (!p->edge_stage[i] || p->edge_stage[i]->params.size < esz / div)
+            if (!p->edge_stage[i] || p->edge_stage[i]->params.size < esz)
                 pl_buf_recreate(gpu, &p->edge_stage[i],
-                                pl_buf_params(.size = esz / div, .host_writable = true));
-            if (!p->work_stage[i] || p->work_stage[i]->params.size < wsz / div)
+                                pl_buf_params(.size = esz, .host_writable = true));
+            if (!p->work_stage[i] || p->work_stage[i]->params.size < wsz)
                 pl_buf_recreate(gpu, &p->work_stage[i],
-                                pl_buf_params(.size = wsz / div, .host_writable = true));
+                                pl_buf_params(.size = wsz, .host_writable = true));
         }
+        size_t ssz = MPMAX(esz, wsz) / RASTER_STAGE_EXTRA_DIV;
+        stream_ring_prealloc(p, &p->raster_stream,
+                             MPMAX(MP_ALIGN_UP(ssz, (size_t) 4 << 20), (size_t) 4 << 20), false, 3);
     }
 #endif
 }
@@ -3546,9 +3585,8 @@ static void gc_warmup(struct priv *p)
         // WP-H5b: precompile the batched gather-combine variant (one dummy glyph).
         if (p->glyph_atlas) {
             float gl[8 * GATHER_MAXG] = {0};
-            while (p->gather_nring < 3 &&
-                   gather_slot_create(p, &p->gather_ring[p->gather_nring]))
-                p->gather_nring++;
+            stream_ring_prealloc(p, &p->gather_stream,
+                                 (size_t) GATHER_SLOT_VEC4 * 4 * sizeof(float), true, 3);
             osd_combine_gather(p, p->run_acc, gl, 1, D, D, NULL);       (*n)++;
         }
     }
@@ -3768,21 +3806,10 @@ static int gc_work_cap_tiles(struct priv *p)
 // reused; a real over-floor frame still grows one once (counted as
 // staging-grow), never a per-call slab.
 //
-// `ring` is a RASTER_STAGE_RING-deep ring, and the write always goes to a slot
-// the GPU is done with: pl_buf_write on a busy host-mapped buffer blocks until
-// its pending work completes. Under vsync-paced presentation
-// (--video-sync=display-*) the swapchain queue is kept full, so the previous
-// frame's upload completes only after that frame's image is acquired -- ~one
-// vsync. A single reused buffer parked every raster frame there (moving signs
-// at 8K, display-resample @ 23.976 Hz: sub-composite p50 40.5 ms vs 8.3 ms with
-// --video-sync=audio, so the present guard fired and the signs juddered; the
-// acceptance runs used video-sync=audio and llvmpipe, so neither showed it).
-//
-// Slot choice never does worse than the single buffer did: an idle slot that
-// fits is used without waiting; otherwise a busy slot that fits is waited on
-// (the old behavior, counted as staging-wrap); and only when no slot fits is
-// slot 0 grown, exactly as before -- the smaller slots are never grown, so the
-// ring adds no VO-thread allocations.
+// Uploads go through p->raster_stream (see STREAM_RING_MAX), which never waits
+// on the GPU. Only an upload larger than a stream slot, or one made while every
+// slot is busy, uses `ring` -- a pl_buf_write into a buffer the GPU may still be
+// reading, which waits for it (counted as staging-wrap when it is busy).
 static bool gc_staged_tex_upload(struct priv *p, pl_buf *ring, pl_tex tex,
                                  int x1, int y1, size_t row_pitch,
                                  const void *src)
@@ -3791,6 +3818,16 @@ static bool gc_staged_tex_upload(struct priv *p, pl_buf *ring, pl_tex tex,
     struct pl_tex_transfer_params tp = {
         .tex = tex, .rc = { .x1 = x1, .y1 = y1 }, .row_pitch = row_pitch,
     };
+    if (p->gpu->limits.buf_transfer) {
+        size_t off;
+        pl_buf sbuf = stream_reserve(p, &p->raster_stream, bytes, 256, &off);
+        if (sbuf) {
+            memcpy((uint8_t *) sbuf->data + off, src, bytes);
+            tp.buf = sbuf;
+            tp.buf_offset = off;
+            return pl_tex_upload(p->gpu, &tp);
+        }
+    }
     pl_buf *stage = &ring[0];
     if (p->gpu->limits.buf_transfer) {
         pl_buf *busy_fit = NULL;
@@ -7841,6 +7878,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     emit_counter(vo, "compose-reuse",             p->cnt_compose_reuse,       &p->stat_compose_reuse);
     emit_counter(vo, "staging-wrap",              p->cnt_staging_wrap,        &p->stat_staging_wrap);
     emit_counter(vo, "gather-ubo",                p->cnt_gather_ubo,          &p->stat_gather_ubo);
+    emit_counter(vo, "stream-full",               p->cnt_stream_full,         &p->stat_stream_full);
     if (want_slow) {
         int64_t gpu_ns = 0;
         for (int i = 0; i < p->perf_fresh.count; i++)
@@ -8801,9 +8839,8 @@ static void uninit(struct vo *vo)
         pl_buf_destroy(p->gpu, &p->edge_stage[i]);
         pl_buf_destroy(p->gpu, &p->work_stage[i]);
     }
-    for (int i = 0; i < GATHER_RING_MAX; i++)
-        pl_buf_destroy(p->gpu, &p->gather_ring[i]);
-    p->gather_nring = p->gather_off = 0;
+    stream_ring_destroy(p, &p->gather_stream);
+    stream_ring_destroy(p, &p->raster_stream);
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
