@@ -214,6 +214,8 @@ struct demuxer_params {
     bool *matroska_was_valid;
     struct timeline *timeline;
     bool disable_timeline;
+    // Private cadence scan: Matroska may emit timestamp-only packets.
+    bool probe_timestamps;
     bstr init_fragment;
     bool skip_lavf_probing;
     bool stream_record; // if true, enable stream recording if option is set

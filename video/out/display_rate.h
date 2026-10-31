@@ -136,8 +136,8 @@ static inline double mp_display_rate_vfr_score(struct mp_display_rate rate,
 }
 
 // Prefer the lowest exact multiple for CFR, then a near multiple. Measured
-// VFR uses its whole-file profile; unverified inputs retain the highest-rate
-// fallback. Exact matches always win over near ones.
+// VFR uses its whole-file profile. Without verified timing, leave the display
+// unchanged. Exact matches always win over near ones.
 static inline double mp_display_rate_score(struct mp_display_rate rate, double hz)
 {
     if (!(hz > 1) || (!rate.variable && !(rate.fps > 0)))
@@ -146,7 +146,7 @@ static inline double mp_display_rate_score(struct mp_display_rate rate, double h
         isfinite(rate.scale) && rate.scale > 0)
         return mp_display_rate_vfr_score(rate, hz);
     if (rate.variable)
-        return hz;
+        return -1;
     double multiple = round(hz / rate.fps);
     if (!rate.variable && multiple >= 1) {
         double error = fabs(hz / (rate.fps * multiple) - 1);
