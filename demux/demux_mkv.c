@@ -180,7 +180,7 @@ typedef struct mkv_index {
 
 struct block_info {
     uint64_t duration;
-    bool simple, keyframe, duration_known;
+    bool simple, keyframe, duration_known, timestamps_only;
     int64_t timecode, discardpadding;
     mkv_track_t *track;
     // Actual packet data.
@@ -192,6 +192,7 @@ struct block_info {
 
 typedef struct mkv_demuxer {
     struct demux_mkv_opts *opts;
+    bool probe_timestamps;
 
     int64_t segment_start, segment_end;
 
@@ -2615,6 +2616,10 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
     probe_x264_garbage(demuxer);
     probe_if_image(demuxer);
 
+    // Opening probes inspect real codec data. Only subsequent reads for the
+    // private display-cadence scan can omit it.
+    mkv_d->probe_timestamps = demuxer->params &&
+                             demuxer->params->probe_timestamps;
     return 0;
 }
 
@@ -2689,6 +2694,12 @@ static int demux_mkv_read_block_lacing(struct block_info *block, int type,
         uint32_t size = lace_size[i];
         if (stream_tell(s) + size > endpos || size > (1 << 30))
             goto error;
+        if (block->timestamps_only) {
+            if (!stream_seek_skip(s, stream_tell(s) + size))
+                goto error;
+            block->num_laces++;
+            continue;
+        }
         int pad = MPMAX(AV_INPUT_BUFFER_PADDING_SIZE, AV_LZO_INPUT_PADDING);
         AVBufferRef *buf = av_buffer_alloc(size + pad);
         if (!buf)
@@ -3079,13 +3090,6 @@ static int read_block(demuxer_t *demuxer, int64_t end, struct block_info *block)
 
     block->filepos = stream_tell(s);
 
-    int lace_type = (header_flags >> 1) & 0x03;
-    if (demux_mkv_read_block_lacing(block, lace_type, s, endpos))
-        goto exit;
-
-    if (block->simple)
-        block->keyframe = header_flags & 0x80;
-    block->timecode = time * mkv_d->tc_scale + mkv_d->cluster_tc;
     for (int i = 0; i < mkv_d->num_tracks; i++) {
         if (mkv_d->tracks[i]->tnum == num) {
             block->track = mkv_d->tracks[i];
@@ -3096,7 +3100,26 @@ static int read_block(demuxer_t *demuxer, int64_t end, struct block_info *block)
         res = 0;
         goto exit;
     }
+    if (mkv_d->probe_timestamps) {
+        mkv_track_t *track = block->track;
+        if (!demux_stream_is_selected(track->stream)) {
+            res = 0;
+            goto exit;
+        }
+        // These tracks already carry one presentation timestamp per lace.
+        // Tracks requiring payload parsing or DTS reconstruction use the
+        // existing demux path, as do Dolby Vision's virtual split streams.
+        block->timestamps_only = track->stream->type == STREAM_VIDEO &&
+                                 !track->parse && !track->block_dts &&
+                                 !track->dovi_split;
+    }
+    int lace_type = (header_flags >> 1) & 0x03;
+    if (demux_mkv_read_block_lacing(block, lace_type, s, endpos))
+        goto exit;
 
+    if (block->simple)
+        block->keyframe = header_flags & 0x80;
+    block->timecode = time * mkv_d->tc_scale + mkv_d->cluster_tc;
     if (stream_tell(s) != endpos)
         goto exit;
 
@@ -3176,6 +3199,20 @@ static int handle_block(demuxer_t *demuxer, struct block_info *block_info)
             AVBufferRef *data = block_info->laces[i];
             demux_packet_t *dp = NULL;
 
+            if (block_info->timestamps_only) {
+                // The packet queue drops empty packets. This private probe
+                // consumes only timestamps; the placeholder is never decoded.
+                dp = new_demux_packet(demuxer->packet_pool, 1);
+                if (!dp)
+                    break;
+                dp->buffer[0] = 0;
+                dp->pos = filepos;
+                if (i == 0 || track->default_duration)
+                    dp->pts = current_pts + i * track->default_duration;
+                dp->keyframe = keyframe;
+                add_packet(demuxer, stream, dp);
+                continue;
+            }
             bstr block = {data->data, data->size};
             bstr nblock = demux_mkv_decode(demuxer->log, track, block, 1);
             if (!nblock.len)

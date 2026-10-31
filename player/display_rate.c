@@ -34,20 +34,27 @@ void mp_probe_display_rates(struct demuxer *demux, int stream_flags)
     if (!videos)
         return;
 
-    // Limit additional startup work. An incomplete scan is never called CFR:
-    // playback will use a single higher refresh instead of guessing and then
-    // changing it mid-episode. Cancellation uses the normal opener cancel tree.
-    double deadline = mp_time_sec() + 5;
+    // Limit additional startup work. An incomplete scan is never called CFR
+    // and must not force a different refresh without verified timing.
+    // Cancellation uses the normal opener cancel tree.
+    double started = mp_time_sec();
+    double deadline = started + 5;
     struct demuxer_params params = {
         .force_format = (char *)demux->desc->name,
         .stream_flags = stream_flags,
         .disable_timeline = true,
+        .probe_timestamps = strcmp(demux->desc->name, "mkv") == 0,
         // is_top_level=false disables the packet cache, even with cache=yes.
     };
     struct demuxer *probe = demux_open_url(demux->filename, &params,
                                           demux->cancel, demux->global);
     if (!probe)
         return;
+    if (params.probe_timestamps) {
+        // Headers are tiny. The playback-sized read/skip buffer otherwise
+        // reads most compressed frame payloads even when seeking past them.
+        probe->stream->requested_buffer_size = STREAM_BUFFER_SIZE * 2;
+    }
 
     struct samples {
         double *pts;
@@ -107,8 +114,10 @@ void mp_probe_display_rates(struct demuxer *demux, int stream_flags)
             }
         }
     } else {
-        MP_VERBOSE(demux, "Display refresh scan incomplete; keeping a higher refresh for this file.\n");
+        MP_VERBOSE(demux, "Display refresh scan incomplete; leaving display refresh unchanged.\n");
     }
+    MP_VERBOSE(demux, "Display refresh scan took %.3f seconds.\n",
+               mp_time_sec() - started);
     talloc_free(samples);
     demux_cancel_and_free(probe);
 }
