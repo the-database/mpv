@@ -116,6 +116,20 @@ test('json', json)
 linked_list = executable('linked-list', files('linked_list.c'), include_directories: incdir)
 test('linked-list', linked_list)
 
+ajn_sample_shared = executable('ajn-sample-shared', files('ajn_sample_shared.c'), include_directories: incdir)
+test('ajn-sample-shared', ajn_sample_shared)
+
+if win32
+    ajn_sample_lifetime = executable('ajn-sample-lifetime', files('ajn_sample_lifetime.c'), include_directories: incdir)
+    test('ajn-sample-lifetime', ajn_sample_lifetime)
+    if features['cuda-hwaccel']
+        ajn_scene = executable('ajn-scene', 'ajn_scene.c', include_directories: incdir,
+            objects: libmpv.extract_objects('video/filter/ajn_scene.c', 'video/mp_image_pool.c'),
+            dependencies: [libavutil, libswscale, zimg, libplacebo], link_with: [img_utils, test_utils])
+        test('ajn-scene', ajn_scene)
+    endif
+endif
+
 timer = executable('timer', files('timer.c'), include_directories: incdir, link_with: test_utils)
 test('timer', timer)
 
@@ -175,7 +189,7 @@ if get_option('libmpv')
     endif
 
     exe = executable('libmpv-encode', 'libmpv_encode.c',
-                     include_directories: incdir, dependencies: libmpv_dep)
+                     include_directories: incdir, dependencies: [libmpv_dep, libavformat, libavcodec, libavutil])
     test('libmpv-encode', exe, suite: 'libmpv')
 
     mpvlib = libmpv

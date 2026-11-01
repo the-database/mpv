@@ -76,6 +76,7 @@
 #include "video/mp_image_pool.h"
 
 #include "aji.h"
+#include "ajn_scene.h"
 
 #ifdef _WIN32
 #define AJI_DEFAULT_LIB "aji.dll"
@@ -148,6 +149,7 @@ struct opts {
     bool skip_seek_pre_target;
     bool output_444;
     int queue_depth;
+    int stream_mode; // 0 ordinary, 1 cached-only stream, 2 prepare, 3 check
 };
 
 #define MAX_DEPTH 4
@@ -170,6 +172,9 @@ struct aji_api {
                   void *cu_stream);          // optional; pre-RIFE downscale
     int (*infer_rife)(aji_ctx *c, const aji_frame *a, const aji_frame *b,
                       double t, const aji_frame *out, void *cu_stream);
+    int (*rife_scene_supported)(aji_ctx *c);
+    int (*infer_rife_with_scene)(aji_ctx *c, const aji_frame *a, const aji_frame *b,
+                      double t, const aji_frame *out, void *cu_stream, int scene);
     int (*poll)(aji_ctx *c);
     int (*temporal_radius)(aji_ctx *c);
     int (*ingest)(aji_ctx *c, const aji_frame *in, uint64_t seq,
@@ -259,6 +264,8 @@ struct priv {
     // With fractional factors some source frames are never emitted and
     // only serve as interpolation endpoints.
     bool rife_on;
+    struct ajn_scene *scene;
+    int scene_decision;
     int rife_num, rife_den;     // reduced output multiplier num/den
     int rife_acc;               // next grid point's offset into the
                                 // current pair, in 1/num units (0, num]
@@ -402,6 +409,8 @@ static void drain_backend(struct mp_filter *vf)
 static void flush_frames(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
+    ajn_scene_reset(p->scene);
+    p->scene_decision = -1;
     // GPU reads of the queued input frames must finish before the
     // refqueue drops them
     clear_ring(vf);
@@ -550,6 +559,20 @@ static void update_depth(struct mp_filter *vf)
 // (Re)configure the shim for the current stream params and slot. Updates
 // out_params (and thus the output pool geometry). May block on first-play
 // engine builds, like the legacy pipeline.
+// Versioned, path-free signal for the trusted libmpv host. Never forward raw
+// inference logs to addons. Preparation/check modes produce no video frames.
+#define AJN_STREAM_VERSION 1
+static void stream_status(struct mp_filter *vf, const char *state)
+{
+    struct priv *p = vf->priv;
+    if (!p->opts->stream_mode)
+        return;
+    MP_INFO(vf, "AJN_STREAM_V1 %s %s %d %d %d %d %d %d %.6f\n", state,
+            p->is_d3d11 ? "DirectML" : "TensorRT", p->cur_slot,
+            p->params.w, p->params.h, p->out_params.w, p->out_params.h,
+            p->rife_on ? 1 : 0, p->fps * (p->rife_on ? (double)p->rife_num / p->rife_den : 1));
+}
+
 static bool configure_aji(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
@@ -568,18 +591,31 @@ static bool configure_aji(struct mp_filter *vf)
     int ret = p->api.configure(p->aji, p->params.w, p->params.h, p->fps,
                                &ow, &oh);
     if (ret < 0) {
+        const char *error = p->api.last_error(p->aji);
+        stream_status(vf, strstr(error, "AJN_ENGINE_MISSING") ? "engineMissing" :
+                          strstr(error, "AJN_ENGINE_INCOMPATIBLE") ? "engineIncompatible" : "failed");
         MP_ERR(vf, "configure failed: %s\n", p->api.last_error(p->aji));
         return false;
     }
     write_stats(vf);
 
-    // configure dropped the engine's frame history; renumber from the
-    // current refqueue position
+    // Every configure resets the engine's history, including asynchronous
+    // preparation. Clear the caller's sequence state before any early return.
     p->temporal_r = ret > 0 ? p->api.temporal_radius(p->aji) : 0;
     p->seq0 = p->seq_next = 0;
     if (p->temporal_r)
         MP_VERBOSE(vf, "Temporal model: %d-frame window\n",
                    2 * p->temporal_r + 1);
+
+    const char *details = p->api.current_log(p->aji);
+    if (p->opts->stream_mode && strstr(details, "Engine build FAILED")) {
+        stream_status(vf, "preparationFailed");
+        return false;
+    }
+    if (p->opts->stream_mode && strstr(details, "Building TensorRT engine")) {
+        stream_status(vf, "building");
+        return true; // Only preparation can reach here on the matching backend.
+    }
 
     int rn = 0, rd = 0;
     p->rife_on = false;
@@ -619,7 +655,23 @@ static bool configure_aji(struct mp_filter *vf)
         // to the input geometry above).
         p->out_fmt = p->aji_fmt;
         update_depth(vf);
+        stream_status(vf, p->rife_on ? "active" : "bypass");
         return true;  // no scaling chain; rife (if any) still applies
+    }
+
+    // The upscale engine can be ready while a RIFE-first engine is still
+    // building. Its input resize has already been hoisted out of the chain,
+    // but we cannot enter the RIFE-first path until RIFE is active. Keep
+    // passing through source frames until poll() reconfigures the ready pair.
+    if (!p->rife_on && p->api.pre_resize) {
+        int ww = 0, wh = 0;
+        if (p->api.pre_resize(p->aji, &ww, &wh)) {
+            p->out_fmt = p->aji_fmt;
+            update_depth(vf);
+            MP_VERBOSE(vf, "Pre-RIFE downscale waiting for RIFE engine\n");
+            stream_status(vf, "building");
+            return true;
+        }
     }
 
     p->aji_active = true;
@@ -682,7 +734,8 @@ static bool configure_aji(struct mp_filter *vf)
     }
     update_depth(vf);
     MP_VERBOSE(vf, "Configured slot %d: %dx%d -> %dx%d (depth %d)\n",
-               p->cur_slot, p->params.w, p->params.h, ow, oh, p->depth);
+                p->cur_slot, p->params.w, p->params.h, ow, oh, p->depth);
+    stream_status(vf, "active");
     return true;
 }
 
@@ -1115,6 +1168,26 @@ done:
     return out;
 }
 
+// Evaluate once per original pair, independent of the interpolation factor.
+// This optional bridge may download reduced-analysis input; ordinary playback
+// without a detector retains the existing GPU-only path.
+static int scene_pair(struct mp_filter *vf, struct mp_image *a, struct mp_image *b)
+{
+    struct priv *p = vf->priv;
+    if (!ajn_scene_active(p->scene)) return -1;
+    bool supported = p->api.infer_rife_with_scene && p->api.rife_scene_supported &&
+        p->api.rife_scene_supported(p->aji);
+    if (supported && !p->is_d3d11) {
+        if (!order_after_decode(vf) ||
+            CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0) return -1;
+        CUcontext dummy;
+        bool ready = CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
+        CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
+        if (!ready) return -1;
+    }
+    return ajn_scene_decide(p->scene, a, b, supported);
+}
+
 // Interpolate between two upscaled frames at time point t. Returns the
 // interpolated image, a new ref of `a` on a scene change (the reference
 // pipeline substitutes the left frame), or NULL on error. pts is left for
@@ -1154,7 +1227,9 @@ static struct mp_image *render_interp(struct mp_filter *vf,
         talloc_free(out);
         return NULL;
     }
-    int ret = p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
+    int ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
+        ? p->api.infer_rife_with_scene(p->aji, &fa, &fb, t, &fout, p->stream, p->scene_decision)
+        : p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
         talloc_free(out);
         return mp_image_new_ref(a);
@@ -1382,7 +1457,9 @@ static struct mp_image *interp_source(struct mp_filter *vf,
         fout.stride[i] = out->stride[i];
     }
 
-    int ret = p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
+    int ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
+        ? p->api.infer_rife_with_scene(p->aji, &fa, &fb, t, &fout, p->stream, p->scene_decision)
+        : p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
         talloc_free(out);
         return mp_image_new_ref(a);
@@ -1526,7 +1603,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 .trtexec_env = env,
                 .slot = p->pending_slot,
                 .rife_model_dir = p->path.rife_model_dir,
-                .async_build = 1,
+                .async_build = p->opts->stream_mode == 1 || p->opts->stream_mode == 3 ? 2 : 1,
                 .engine_path = p->path.engine,
                 .max_width = p->params.w,
                 .max_height = p->params.h,
@@ -1652,6 +1729,11 @@ static void vf_animejanai_process(struct mp_filter *vf)
         }
     }
 
+    // A preparation/check host polls the filter while it retains its first
+    // input. No frame can escape before engines have been checked/prepared.
+    if (p->opts->stream_mode >= 2 && p->configured)
+        return;
+
     // Extra RIFE outputs first: they go straight to the out pin without
     // consuming input (the refqueue isn't touched while any are pending,
     // which also keeps EOF behind them).
@@ -1704,6 +1786,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
         bool failed = false;
         if (p->rife_prev && p->rife_prev->pts != MP_NOPTS_VALUE &&
             src->pts != MP_NOPTS_VALUE && src->pts > p->rife_prev->pts) {
+            p->scene_decision = scene_pair(vf, p->rife_prev, cur_src);
             while (p->rife_acc <= p->rife_num && n < 8) {
                 struct mp_image *frame;
                 double pts;
@@ -1799,6 +1882,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
         bool emitted_cur = true;
         if (p->rife_prev && p->rife_prev->pts != MP_NOPTS_VALUE &&
             out->pts != MP_NOPTS_VALUE && out->pts > p->rife_prev->pts) {
+            p->scene_decision = scene_pair(vf, p->rife_prev, out);
             // Emit the output-grid points due within this input pair:
             // offsets acc, acc+den, ... (in 1/num units) while <= num.
             // An offset of exactly num is the right source frame itself;
@@ -1872,6 +1956,15 @@ static bool vf_animejanai_command(struct mp_filter *vf,
     struct priv *p = vf->priv;
     if (cmd->type != MP_FILTER_COMMAND_TEXT || !cmd->cmd)
         return false;
+    if (strcmp(cmd->cmd, "scene-map") == 0 && cmd->arg) {
+        if (!*cmd->arg) {
+            ajn_scene_destroy(p->scene); p->scene = NULL;
+            p->scene_decision = -1;
+            return true;
+        }
+        if (!p->scene) p->scene = ajn_scene_create(vf->log);
+        return ajn_scene_connect(p->scene, cmd->arg);
+    }
     if (strcmp(cmd->cmd, "poll") == 0) {
         // No-op wakeup: while playback is paused no frames flow, so
         // process() (and with it the background-build completion poll)
@@ -1901,6 +1994,8 @@ static void uninit(struct mp_filter *vf)
     struct priv *p = vf->priv;
 
     flush_frames(vf);
+    ajn_scene_destroy(p->scene);
+    p->scene = NULL;
     talloc_free(p->queue);
     if (p->aji)
         p->api.destroy(&p->aji);
@@ -1971,6 +2066,7 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
 
     struct priv *p = f->priv;
     p->opts = talloc_steal(p, options);
+    f->failure_is_fatal = p->opts->stream_mode != 0;
     p->queue = mp_refqueue_alloc(f);
     p->cur_slot = p->pending_slot = p->opts->slot;
 
@@ -2028,6 +2124,8 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         p->api.pre_resize = aji_lib_sym(p->api.handle, "aji_pre_resize");
         p->api.resize = aji_lib_sym(p->api.handle, "aji_resize");
         p->api.infer_rife = aji_lib_sym(p->api.handle, "aji_infer_rife");
+        p->api.rife_scene_supported = aji_lib_sym(p->api.handle, "aji_rife_scene_supported");
+        p->api.infer_rife_with_scene = aji_lib_sym(p->api.handle, "aji_infer_rife_with_scene");
         p->api.poll = aji_lib_sym(p->api.handle, "aji_poll");
         p->api.temporal_radius =
             aji_lib_sym(p->api.handle, "aji_temporal_radius");
@@ -2036,6 +2134,13 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         p->api.temporal_reset =
             aji_lib_sym(p->api.handle, "aji_temporal_reset");
         p->api.current_log = aji_lib_sym(p->api.handle, "aji_current_log");
+        if (p->opts->stream_mode) {
+            int (*version)(void) = aji_lib_sym(p->api.handle, "aji_stream_policy_version");
+            if (!version || version() != AJN_STREAM_VERSION) {
+                MP_ERR(f, "AJN_STREAM_POLICY_UNAVAILABLE\n");
+                goto fail;
+            }
+        }
         p->api.last_error = aji_lib_sym(p->api.handle, "aji_last_error");
         p->api.destroy = aji_lib_sym(p->api.handle, "aji_destroy");
         if (!p->api.create || !p->api.set_slot || !p->api.configure ||
@@ -2103,6 +2208,7 @@ static const m_option_t vf_opts_fields[] = {
     {"skip-seek-pre-target", OPT_BOOL(skip_seek_pre_target)},
     {"output-444", OPT_BOOL(output_444)},
     {"queue-depth", OPT_INT(queue_depth), M_RANGE(1, MAX_DEPTH)},
+    {"stream-mode", OPT_CHOICE(stream_mode, {"normal", 0}, {"required", 1}, {"prepare", 2}, {"check", 3})},
     {0}
 };
 

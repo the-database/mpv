@@ -50,6 +50,18 @@ You can encode files from one format/codec to another using this facility.
     Specifies the output video codec. See ``--ovc=help`` for a full list of
     supported codecs.
 
+``--ovc-hwframes``
+    Allow the encoder to import supported hardware frames directly from the
+    upstream decoder/filter pool (default: no). Both the hardware container
+    and its surface format must be accepted by the selected encoder. This
+    avoids a download to system memory for supported paths such as D3D11
+    NV12 into NVENC. Unsupported input may still require conversion.
+
+    Hardware frames do not support the software subtitle compositor. Use
+    ``--sid=no`` with this option when encoding an uncomposited video stream.
+    Normal encoding retains software composition by default. Hardware codec,
+    device and surface-format restrictions still apply.
+
 ``--ovcopts=<options>``
     Specifies the output video codec options for libavcodec.
     See --ovcopts=help for a full list of supported options.
