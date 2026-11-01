@@ -79,6 +79,9 @@ sources = files(
     'audio/out/buffer.c',
 
     ## Core
+    'common/ajn_probe.c',
+    'common/ajn_mux.c',
+    'common/ajn_subtitles.c',
     'common/av_common.c',
     'common/av_log.c',
     'common/codecs.c',
@@ -1438,6 +1441,10 @@ features += {'cuda-hwaccel': cuda_hwaccel.allowed()}
 if features['cuda-hwaccel']
     sources += files('video/filter/vf_animejanai.c',
                      'video/out/hwdec/hwdec_cuda.c')
+    if win32
+        sources += files('video/filter/ajn_scene.c', 'video/filter/ajn_sample_cuda.c')
+        subdir('video/filter/mvtools')
+    endif
 endif
 
 cuda_interop = get_option('cuda-interop').require(
@@ -1468,7 +1475,9 @@ d3d_hwaccel = get_option('d3d-hwaccel').require(
 features += {'d3d-hwaccel': d3d_hwaccel.allowed()}
 if features['d3d-hwaccel']
     sources += files('video/d3d.c',
-                     'video/filter/vf_d3d11vpp.c')
+                     'video/filter/vf_d3d11vpp.c',
+                     'video/filter/ajn_sample_gpu.c',
+                     'video/filter/vf_ajn_sample.c')
 endif
 
 amf = cc.has_header('AMF/core/Factory.h', required:

@@ -138,6 +138,9 @@ typedef struct aji_frame {
     ptrdiff_t stride[3];      /* bytes */
 } aji_frame;
 
+/* Additive policy capability. async_build=2 checks cached engines without
+ * starting a builder or deleting incompatible engines. Query before use. */
+AJI_EXPORT int aji_stream_policy_version(void);
 AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params);
 
 /* Select the slot used by the next aji_configure() (conf mode). */
@@ -241,6 +244,18 @@ AJI_EXPORT int aji_poll(aji_ctx *c);
 AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                               const aji_frame *b, double t,
                               const aji_frame *out, void *cu_stream);
+
+/* Optional additive ABI for an isolated scene detector. No existing entry
+ * point or structure changes. Query support on the configured dispatcher:
+ * older backend libraries can still be used for ordinary interpolation.
+ * scene: -1 = built-in detector, 0 = continuous pair, 1 = cut (AJI_SCENE).
+ * The caller owns pair identity, timeouts and fallback. A continuous decision
+ * explicitly replaces the built-in decision, rather than adding another veto.
+ * All normal frame validation, GPU completion and output ownership still apply. */
+AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c);
+AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
+                              const aji_frame *b, double t,
+                              const aji_frame *out, void *cu_stream, int scene);
 
 /* Temporal (multi-frame) models. A chain model whose input takes T = 2r+1
  * frames (oldest first, the frame to upscale in the middle) is a temporal
