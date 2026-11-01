@@ -1137,7 +1137,7 @@ static void PadReferenceFrame(uint8_t * VS_RESTRICT refFrame8, ptrdiff_t refPitc
 
 /******************************************************************************
  *                                                                             *
- *  MVPlane : manages a single plane, allowing padding and refinin             *
+ *  MVPlane : manages a single plane, allowing padding and refining            *
  *                                                                             *
  ******************************************************************************/
 

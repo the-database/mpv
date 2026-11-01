@@ -9,7 +9,7 @@
 
 #define X264_CPU_CMOV            0x0000001
 #define X264_CPU_MMX             0x0000002
-#define X264_CPU_MMX2            0x0000004  /* MMX2 aka MMXEXT aka ISSE */
+#define X264_CPU_MMX2            0x0000004  /* MMX2 aka MMXEXT */
 #define X264_CPU_MMXEXT          X264_CPU_MMX2
 #define X264_CPU_SSE             0x0000008
 #define X264_CPU_SSE2            0x0000010

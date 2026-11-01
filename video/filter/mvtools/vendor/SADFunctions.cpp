@@ -784,7 +784,7 @@ static const std::unordered_map<uint32_t, SADFunction> satd_functions = {
 SADFunction selectSATDFunction(unsigned width, unsigned height, unsigned bits, int opt, unsigned cpu) {
     SADFunction satd = satd_functions.at(KEY(width, height, bits, Scalar));
 
-#if defined(MVTOOLS_X86) 
+#if defined(MVTOOLS_X86)
     if (opt) {
         try {
             satd = satd_functions.at(KEY(width, height, bits, MMX));

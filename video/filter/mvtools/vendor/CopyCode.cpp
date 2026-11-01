@@ -72,4 +72,3 @@ COPYFunction selectCopyFunction(unsigned width, unsigned height, unsigned bits) 
 
 #undef COPY
 #undef KEY
-
