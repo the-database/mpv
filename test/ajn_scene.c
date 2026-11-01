@@ -15,11 +15,15 @@ struct responder {
     HANDLE ready, reply;
     int decision;
     bool wrong_id;
+    HANDLE received;
+    DWORD delay_ms;
 };
 static DWORD WINAPI respond(void *opaque)
 {
     struct responder *r = opaque;
     mp_require(WaitForSingleObject(r->ready, 3000) == WAIT_OBJECT_0);
+    if (r->received) SetEvent(r->received);
+    Sleep(r->delay_ms);
     while (InterlockedCompareExchange((volatile LONG *)&r->h->lock, 1, 0))
         SwitchToThread();
     // Samples must be the previous/current original frame, in that order.
@@ -30,6 +34,41 @@ static DWORD WINAPI respond(void *opaque)
     InterlockedExchange((volatile LONG *)&r->h->lock, 0);
     SetEvent(r->reply);
     return 0;
+}
+
+static void wait_value(volatile int32_t *value, int expected)
+{
+    ULONGLONG deadline = GetTickCount64() + 3000;
+    while (InterlockedCompareExchange((volatile LONG *)value, 0, 0) != expected) {
+        mp_require(GetTickCount64() < deadline);
+        Sleep(1);
+    }
+}
+
+static int await_decision(struct ajn_scene *s, struct mp_image *a,
+                          struct mp_image *b, int expected)
+{
+    ULONGLONG deadline = GetTickCount64() + 3000;
+    int decision;
+    do {
+        decision = ajn_scene_decide(s, a, b, true);
+        if (decision == expected) return decision;
+        mp_require(GetTickCount64() < deadline);
+        Sleep(1);
+    } while (true);
+}
+
+static void submit(struct ajn_scene *s, struct ajn_scene_shared *h,
+                   struct mp_image *a, struct mp_image *b)
+{
+    ajn_scene_reset(s);
+    h->status = 0;
+    ULONGLONG deadline = GetTickCount64() + 3000;
+    while (!InterlockedCompareExchange((volatile LONG *)&h->status, 0, 0)) {
+        ajn_scene_submit(s, a, b); // A contended try-lock may skip submission.
+        mp_require(GetTickCount64() < deadline);
+        Sleep(1);
+    }
 }
 int main(void)
 {
@@ -65,14 +104,38 @@ int main(void)
         memset(b->planes[0] + y * b->stride[0], 255, 16);
     }
     for (int decision = -1; decision <= 1; decision++) {
-        struct responder r = {h, ready, reply, decision, false};
+        struct responder r = {.h = h, .ready = ready, .reply = reply,
+                              .decision = decision};
         HANDLE thread = CreateThread(NULL, 0, respond, &r, 0, NULL);
         mp_require(thread);
-        assert_int_equal(ajn_scene_decide(s, a, b, true), decision);
+        submit(s, h, a, b);
         mp_require(WaitForSingleObject(thread, 3000) == WAIT_OBJECT_0);
         CloseHandle(thread);
-        assert_int_equal(h->accepted, decision + 2);
+        wait_value(&h->status, 2);
+        assert_int_equal(await_decision(s, a, b, decision), decision);
+        assert_int_equal(h->accepted, decision + 1);
     }
+    // A responder taking nearly its whole budget must never pace playback.
+    HANDLE received = CreateEventA(NULL, FALSE, FALSE, NULL);
+    struct responder slow = {.h = h, .ready = ready, .reply = reply,
+                             .decision = 1, .received = received, .delay_ms = 95};
+    HANDLE slow_thread = CreateThread(NULL, 0, respond, &slow, 0, NULL);
+    mp_require(received && slow_thread);
+    submit(s, h, a, b);
+    mp_require(WaitForSingleObject(received, 3000) == WAIT_OBJECT_0);
+    ULONGLONG began = GetTickCount64();
+    assert_int_equal(ajn_scene_decide(s, a, b, true), -1);
+    mp_require(GetTickCount64() - began < 50);
+    mp_require(WaitForSingleObject(slow_thread, 3000) == WAIT_OBJECT_0);
+    CloseHandle(slow_thread); CloseHandle(received);
+    // Scheduling can put a 95 ms response beyond the 100 ms deadline.
+    // Either outcome is allowed; the property under test is no player wait.
+    ULONGLONG slow_deadline = GetTickCount64() + 3000;
+    while (InterlockedCompareExchange((volatile LONG *)&h->status, 0, 0) == 1) {
+        mp_require(GetTickCount64() < slow_deadline);
+        Sleep(1);
+    }
+    h->timeouts = h->consecutive_timeouts = 0;
     int64_t epoch = h->epoch;
     h->lock = 1; // Reset must also invalidate a request during host readback.
     ajn_scene_reset(s);
@@ -81,17 +144,26 @@ int main(void)
     assert_int_equal(ajn_scene_decide(s, a, b, false), -1);
     assert_int_equal(h->status, 5);
     b->params.color.transfer = PL_COLOR_TRC_PQ;
+    submit(s, h, a, b);
+    wait_value(&h->status, 4);
     assert_int_equal(ajn_scene_decide(s, a, b, true), -1);
     assert_int_equal(h->status, 4);
     b->params.color.transfer = PL_COLOR_TRC_BT_1886;
-    struct responder wrong = {h, ready, reply, 1, true};
+    struct responder wrong = {.h = h, .ready = ready, .reply = reply,
+                              .decision = 1, .wrong_id = true};
     HANDLE thread = CreateThread(NULL, 0, respond, &wrong, 0, NULL);
+    submit(s, h, a, b);
     assert_int_equal(ajn_scene_decide(s, a, b, true), -1);
     mp_require(WaitForSingleObject(thread, 3000) == WAIT_OBJECT_0);
     CloseHandle(thread);
+    wait_value(&h->timeouts, 1);
     assert_int_equal(h->timeouts, 1);
     h->budget_ms = 5;
+    submit(s, h, a, b);
+    wait_value(&h->timeouts, 2);
     assert_int_equal(ajn_scene_decide(s, a, b, true), -1);
+    submit(s, h, a, b);
+    wait_value(&h->timeouts, 3);
     assert_int_equal(ajn_scene_decide(s, a, b, true), -1);
     mp_require(h->timeouts == 3 && h->status == 6 && !ajn_scene_active(s));
     assert_int_equal(ajn_scene_decide(s, a, b, true), -1);
@@ -112,12 +184,14 @@ int main(void)
     }
     h->algorithm = 1; h->thscd1 = 240; h->thscd2 = 130;
     h->enabled = 1; h->generation++; h->lease_until_ms = GetTickCount64() + 10000;
-    assert_int_equal(ajn_scene_decide(s, a, b, true), 1);
-    mp_require(h->status == 2 && h->total_blocks == 64 && h->changed_blocks == 64 && h->cut_pairs == 1);
+    int cuts = h->cut_pairs;
+    submit(s, h, a, b);
+    assert_int_equal(await_decision(s, a, b, 1), 1);
+    mp_require(h->status == 2 && h->total_blocks == 64 && h->changed_blocks == 64 && h->cut_pairs == cuts + 1);
     mp_require(GetModuleHandleW(L"ajn-mvtools.dll"));
     for (int y = 0; y < 64; y++) memset(b->planes[0] + y * b->stride[0], 16, 64);
-    ajn_scene_reset(s);
-    assert_int_equal(ajn_scene_decide(s, a, b, true), 0);
+    submit(s, h, a, b);
+    assert_int_equal(await_decision(s, a, b, 0), 0);
     talloc_free(a); talloc_free(b);
     a = mp_image_alloc(IMGFMT_NV12, 64, 64);
     b = mp_image_alloc(IMGFMT_NV12, 64, 64);
@@ -132,14 +206,19 @@ int main(void)
         memset(a->planes[1] + y * a->stride[1], 64, 64);
         memset(b->planes[1] + y * b->stride[1], 192, 64);
     }
-    ajn_scene_reset(s);
-    assert_int_equal(ajn_scene_decide(s, a, b, true), 1);
+    submit(s, h, a, b);
+    assert_int_equal(await_decision(s, a, b, 1), 1);
     mp_require(h->source_bits == 8 && h->block_sad_threshold == 360);
-    mp_require(ajn_scene_connect(s, ""));
-    mp_require(!GetModuleHandleW(L"ajn-mvtools.dll"));
+    began = GetTickCount64();
     ajn_scene_destroy(s);
+    mp_require(GetTickCount64() - began < 50);
+    ULONGLONG deadline = GetTickCount64() + 3000;
+    while (GetModuleHandleW(L"ajn-mvtools.dll")) {
+        mp_require(GetTickCount64() < deadline);
+        Sleep(1);
+    }
     talloc_free(a); talloc_free(b);
     UnmapViewOfFile(h); CloseHandle(mapping); CloseHandle(ready); CloseHandle(reply);
-    puts("scene bridge: decision overrides, samples, reset, HDR fallback, stale reply, bounded timeouts and revocation passed");
+    puts("scene bridge: asynchronous decisions, no wait on a slow responder, samples, reset, fallback and revocation passed");
     return 0;
 }
