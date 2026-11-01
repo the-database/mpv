@@ -62,8 +62,13 @@ static void submit(struct ajn_scene *s, struct ajn_scene_shared *h,
                    struct mp_image *a, struct mp_image *b)
 {
     ajn_scene_reset(s);
-    h->status = 0;
     ULONGLONG deadline = GetTickCount64() + 3000;
+    while (InterlockedCompareExchange((volatile LONG *)&h->lock, 1, 0)) {
+        mp_require(GetTickCount64() < deadline);
+        Sleep(1);
+    }
+    h->status = 0;
+    InterlockedExchange((volatile LONG *)&h->lock, 0);
     while (!InterlockedCompareExchange((volatile LONG *)&h->status, 0, 0)) {
         ajn_scene_submit(s, a, b); // A contended try-lock may skip submission.
         mp_require(GetTickCount64() < deadline);
@@ -173,6 +178,7 @@ int main(void)
     h->lease_until_ms = GetTickCount64() + 3000; h->enabled = 0;
     mp_require(!ajn_scene_active(s));
     mp_require(!GetModuleHandleW(L"ajn-mvtools.dll"));
+#if HAVE_GPL
     talloc_free(a); talloc_free(b);
     a = mp_image_alloc(IMGFMT_Y8, 64, 64);
     b = mp_image_alloc(IMGFMT_Y8, 64, 64);
@@ -209,6 +215,7 @@ int main(void)
     submit(s, h, a, b);
     assert_int_equal(await_decision(s, a, b, 1), 1);
     mp_require(h->source_bits == 8 && h->block_sad_threshold == 360);
+#endif
     began = GetTickCount64();
     ajn_scene_destroy(s);
     mp_require(GetTickCount64() - began < 50);
