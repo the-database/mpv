@@ -20,6 +20,8 @@ are reused, with predictors cleared for each pair to preserve fresh Analyse
 semantics. No VapourSynth runtime is loaded or distributed. `detector.cpp`
 supplies the frame adapter and thresholds.
 
+Comment spelling and whitespace are normalized for the host repository's lint checks; these edits do not change the detector algorithm.
+
 The optional `ajn_mvtools_analyze_enhanced` export is AJN's scene classifier,
 not part of upstream MVTools or the old `sc_mode=2` algorithm. `enhanced.h`
 measures changed-region and motion-aligned appearance; temporal motion energy

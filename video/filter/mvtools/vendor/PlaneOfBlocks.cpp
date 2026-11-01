@@ -828,7 +828,7 @@ static void pobPseudoEPZSearch(PlaneOfBlocks *pob) {
         pob->srcLuma = pob->LUMA(pob->pSrc[0], pob->nSrcPitch[0]);
 
     // We treat zero alone
-    // Do we bias zero with not taking into account distorsion ?
+    // Do we bias zero with not taking into account distortion ?
     pob->bestMV.x = pob->zeroMVfieldShifted.x;
     pob->bestMV.y = pob->zeroMVfieldShifted.y;
     const uint8_t *zeroMVBlocks[3] = {
@@ -1291,7 +1291,7 @@ void doPobRecalculateMVs(PlaneOfBlocks *pob, const FakeGroupOfPlanes *fgop, MVFr
             VECTOR vectorOld; // interpolated or nearest
 
             if (smooth == 1) { // interpolate
-                VECTOR vectorOld1 = fgopGetBlock(fgop, 0, blkxold1 + blkyold1 * nBlkXold)->vector; // 4 old nearest vectors (may coinside)
+                VECTOR vectorOld1 = fgopGetBlock(fgop, 0, blkxold1 + blkyold1 * nBlkXold)->vector; // 4 old nearest vectors (may coincide)
                 VECTOR vectorOld2 = fgopGetBlock(fgop, 0, blkxold2 + blkyold1 * nBlkXold)->vector;
                 VECTOR vectorOld3 = fgopGetBlock(fgop, 0, blkxold1 + blkyold2 * nBlkXold)->vector;
                 VECTOR vectorOld4 = fgopGetBlock(fgop, 0, blkxold2 + blkyold2 * nBlkXold)->vector;

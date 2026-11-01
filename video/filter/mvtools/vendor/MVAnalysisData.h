@@ -1,6 +1,6 @@
 // Define the BlockData class
 
-// I borrowed a lot of code from XviD's sources here, so I thank all the developpers
+// I borrowed a lot of code from XviD's sources here, so I thank all the developers
 // of this wonderful codec
 
 // See legal notice in Copying.txt for more information

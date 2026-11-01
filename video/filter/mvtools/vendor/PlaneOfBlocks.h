@@ -86,7 +86,7 @@ typedef struct PlaneOfBlocks {
 
     int nDxMin; /* minimum x coordinate for the vector */
     int nDyMin; /* minimum y coordinate for the vector */
-    int nDxMax; /* maximum x corrdinate for the vector */
+    int nDxMax; /* maximum x coordinate for the vector */
     int nDyMax; /* maximum y coordinate for the vector */
 
     int x[3];       /* absolute x coordinate of the origin of the block in the reference frame */
@@ -99,7 +99,7 @@ typedef struct PlaneOfBlocks {
     /* search parameters */
 
     SearchType searchType; /* search type used */
-    int nSearchParam;      /* additionnal parameter for this search */
+    int nSearchParam;      /* additional parameter for this search */
     int64_t nLambda;       /* vector cost factor */
     int64_t LSAD;          // SAD limit for lambda using - Fizick
     int penaltyNew;        // cost penalty factor for new candidates
