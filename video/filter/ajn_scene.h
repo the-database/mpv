@@ -11,6 +11,7 @@ bool ajn_scene_connect(struct ajn_scene *s, const char *name);
 bool ajn_scene_active(struct ajn_scene *s);
 void ajn_scene_reset(struct ajn_scene *s);
 void ajn_scene_destroy(struct ajn_scene *s);
+void ajn_scene_submit(struct ajn_scene *s, struct mp_image *a, struct mp_image *b);
 int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
                      bool supported);
 #else
@@ -19,6 +20,7 @@ static inline bool ajn_scene_connect(struct ajn_scene *s, const char *n) { retur
 static inline bool ajn_scene_active(struct ajn_scene *s) { return false; }
 static inline void ajn_scene_reset(struct ajn_scene *s) { }
 static inline void ajn_scene_destroy(struct ajn_scene *s) { }
+static inline void ajn_scene_submit(struct ajn_scene *s, struct mp_image *a, struct mp_image *b) { }
 static inline int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a,
     struct mp_image *b, bool supported) { return -1; }
 #endif

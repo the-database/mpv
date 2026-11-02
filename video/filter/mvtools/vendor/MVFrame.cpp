@@ -445,7 +445,7 @@ static void RB2FilteredVertical(uint8_t * VS_RESTRICT pDst8, const uint8_t * VS_
                                 ptrdiff_t nSrcPitch, int nWidth, int nHeight, int opt) {
     (void)opt;
 
-    /* int nWidthMMX = (nWidth/4)*4; */
+    /* [[maybe_unused]] int nWidthMMX = (nWidth/4)*4; */
 
     PixelType *pDst = (PixelType *)pDst8;
     PixelType *pSrc = (PixelType *)pSrc8;
@@ -477,7 +477,7 @@ template <typename PixelType>
 static void RB2FilteredHorizontalInplace(uint8_t * VS_RESTRICT pSrc8, ptrdiff_t nSrcPitch, int nWidth, int nHeight, int opt) {
     (void)opt;
 
-    /* int nWidthMMX = 1 + ((nWidth-2)/4)*4; */
+    /* [[maybe_unused]] int nWidthMMX = 1 + ((nWidth-2)/4)*4; */
 
     PixelType *pSrc = (PixelType *)pSrc8;
 
@@ -519,7 +519,7 @@ static void RB2BilinearFilteredVertical(uint8_t * VS_RESTRICT pDst8, const uint8
     nDstPitch /= sizeof(PixelType);
     nSrcPitch /= sizeof(PixelType);
 
-    int nWidthMMX = (nWidth / 8) * 8;
+    [[maybe_unused]] int nWidthMMX = (nWidth / 8) * 8;
 
     for (int y = 0; y < 1 && y < nHeight; y++) {
         for (int x = 0; x < nWidth; x++)
@@ -561,7 +561,7 @@ static void RB2BilinearFilteredHorizontalInplace(uint8_t *VS_RESTRICT pSrc8, ptr
 
     nSrcPitch /= sizeof(PixelType);
 
-    int nWidthMMX = 1 + ((nWidth - 2) / 8) * 8;
+    [[maybe_unused]] int nWidthMMX = 1 + ((nWidth - 2) / 8) * 8;
 
     for (int y = 0; y < nHeight; y++) {
         int x = 0;
@@ -609,7 +609,7 @@ static void RB2QuadraticVertical(uint8_t *VS_RESTRICT pDst8, const uint8_t *VS_R
     nDstPitch /= sizeof(PixelType);
     nSrcPitch /= sizeof(PixelType);
 
-    int nWidthMMX = (nWidth / 8) * 8;
+    [[maybe_unused]] int nWidthMMX = (nWidth / 8) * 8;
 
     for (int y = 0; y < 1 && y < nHeight; y++) {
         for (int x = 0; x < nWidth; x++)
@@ -664,7 +664,7 @@ static void RB2QuadraticHorizontalInplace(uint8_t *VS_RESTRICT pSrc8, ptrdiff_t 
 
     nSrcPitch /= sizeof(PixelType);
 
-    int nWidthMMX = 1 + ((nWidth - 2) / 8) * 8;
+    [[maybe_unused]] int nWidthMMX = 1 + ((nWidth - 2) / 8) * 8;
 
     for (int y = 0; y < nHeight; y++) {
         int x = 0;
@@ -726,7 +726,7 @@ static void RB2CubicVertical(uint8_t * VS_RESTRICT pDst8, const uint8_t * VS_RES
     nDstPitch /= sizeof(PixelType);
     nSrcPitch /= sizeof(PixelType);
 
-    int nWidthMMX = (nWidth / 8) * 8;
+    [[maybe_unused]] int nWidthMMX = (nWidth / 8) * 8;
     for (int y = 0; y < 1 && y < nHeight; y++) {
         for (int x = 0; x < nWidth; x++)
             pDst[x] = (pSrc[x] + pSrc[x + nSrcPitch] + 1) / 2;
@@ -781,7 +781,7 @@ static void RB2CubicHorizontalInplace(uint8_t * VS_RESTRICT pSrc8, ptrdiff_t nSr
 
     nSrcPitch /= sizeof(PixelType);
 
-    int nWidthMMX = 1 + ((nWidth - 2) / 8) * 8;
+    [[maybe_unused]] int nWidthMMX = 1 + ((nWidth - 2) / 8) * 8;
     for (int y = 0; y < nHeight; y++) {
         int x = 0;
         int pSrcw0 = (pSrc[x * 2] + pSrc[x * 2 + 1] + 1) / 2; /* store temporary */

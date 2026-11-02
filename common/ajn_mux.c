@@ -15,7 +15,11 @@ struct output {
     int (*close)(void *, int64_t);
 };
 struct output_file { struct output *owner; int64_t handle; };
+#if LIBAVFORMAT_VERSION_MAJOR < 61
+static int write_packet(void *opaque, uint8_t *data, int size)
+#else
 static int write_packet(void *opaque, const uint8_t *data, int size)
+#endif
 {
     struct output_file *file = opaque;
     return file->owner->write(file->owner->opaque, file->handle, data, size);
@@ -94,7 +98,10 @@ MPV_EXPORT int mpv_ajn_mux_v1(void *opaque,
     if (input->nb_streams < 1 || input->nb_streams > 4) { result = AVERROR(EINVAL); goto done; }
     bool mkv = !strcmp(container, "matroska"), mp4 = !strcmp(container, "fragmentedMp4");
     const char *muxer = segmented ? (mkv ? "segment" : "hls") : (mp4 ? "mp4" : container);
-    const char *filename = segmented ? (mkv ? "part_%08d.mkv" : "index.m3u8") :
+    // A private non-file URL keeps hlsenc from calling filesystem rename
+    // behind the quota-enforcing io callbacks. The host publishes the index
+    // atomically when its callback closes the writer.
+    const char *filename = segmented ? (mkv ? "part_%08d.mkv" : "ajn-cache:index.m3u8") :
         (mkv ? "continuous.mkv" : mp4 ? "continuous.mp4" : "continuous.ts");
     result = avformat_alloc_output_context2(&output, NULL, muxer, filename);
     if (result < 0) goto done;
@@ -129,7 +136,7 @@ MPV_EXPORT int mpv_ajn_mux_v1(void *opaque,
         av_dict_set(&options, "hls_segment_type", mp4 ? "fmp4" : "mpegts", 0);
         av_dict_set(&options, "hls_fmp4_init_filename", "init.mp4", 0);
         av_dict_set(&options, "hls_segment_filename", mp4 ? "part_%08d.m4s" : "part_%08d.ts", 0);
-        av_dict_set(&options, "hls_flags", "independent_segments+temp_file", 0);
+        av_dict_set(&options, "hls_flags", "independent_segments", 0);
     } else if (mp4) {
         av_dict_set(&options, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
     } else if (mkv) {

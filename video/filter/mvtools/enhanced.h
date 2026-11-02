@@ -121,8 +121,8 @@ inline std::vector<Point> points(const std::vector<float> &a,
     }
     // Match max_element's first-pixel tie break without rescanning the image
     // for each corner. Suppressed candidates are skipped in this fixed order.
-    std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
-        return score[a] != score[b] ? score[a] > score[b] : a < b;
+    std::sort(candidates.begin(), candidates.end(), [&](int first, int second) {
+        return score[first] != score[second] ? score[first] > score[second] : first < second;
     });
     std::vector<Point> out;
     int selected = 0;

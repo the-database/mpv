@@ -210,7 +210,7 @@ enum {
     // VO imports the frame's AVHWFramesContext directly. A hardware container
     // and its software surface format must both pass query_format; no display
     // interop device is involved (encoding).
-    VO_CAP_HW_FRAMES    = 1 << 8,
+    VO_CAP_HW_FRAMES    = 1 << 7,
 };
 
 enum {

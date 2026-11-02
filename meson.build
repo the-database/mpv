@@ -79,9 +79,6 @@ sources = files(
     'audio/out/buffer.c',
 
     ## Core
-    'common/ajn_probe.c',
-    'common/ajn_mux.c',
-    'common/ajn_subtitles.c',
     'common/av_common.c',
     'common/av_log.c',
     'common/codecs.c',
@@ -285,6 +282,10 @@ sources = files(
     'ta/ta_talloc.c',
     'ta/ta_utils.c',
 )
+if host_machine.system() == 'windows'
+    sources += files('common/ajn_probe.c', 'common/ajn_mux.c', 'common/ajn_subtitles.c')
+endif
+
 
 
 # compiler stuff
@@ -1443,7 +1444,9 @@ if features['cuda-hwaccel']
                      'video/out/hwdec/hwdec_cuda.c')
     if win32
         sources += files('video/filter/ajn_scene.c', 'video/filter/ajn_sample_cuda.c')
-        subdir('video/filter/mvtools')
+        if get_option('gpl')
+            subdir('video/filter/mvtools')
+        endif
     endif
 endif
 

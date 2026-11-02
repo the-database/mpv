@@ -28,7 +28,7 @@ struct priv {
     mp_mutex lock;
     mp_thread thread;
     HANDLE wake;
-    bool started, stopping, failed, detached, reserved;
+    bool started, failed, detached, reserved;
     struct ajn_sample_lifetime lifetime;
     int64_t producer;
     struct ajn_sample_gpu *gpu;
@@ -155,7 +155,7 @@ static int cancelled(void *context)
     struct priv *p = context;
     return p->detached ? ajn_sample_lifetime_stopping(&p->lifetime) ||
         read64(&p->shared->lease_until_ms) <= (int64_t)GetTickCount64() ||
-        read64(&p->shared->producer) != p->producer || !(read64(&p->shared->config) & 0xffffff) : p->stopping;
+        read64(&p->shared->producer) != p->producer || !(read64(&p->shared->config) & 0xffffff) : ajn_sample_lifetime_stopping(&p->lifetime);
 }
 
 static void analysis_state(void *context, int status)
@@ -170,7 +170,7 @@ static MP_THREAD_VOID readback(void *context)
     ULONGLONG retired_at = 0;
     for (;;) {
         mp_mutex_lock(&p->lock);
-        bool stopping = p->detached ? ajn_sample_lifetime_stopping(&p->lifetime) : p->stopping;
+        bool stopping = p->detached ? ajn_sample_lifetime_stopping(&p->lifetime) : ajn_sample_lifetime_stopping(&p->lifetime);
         // A lost host lease must retire analysis even if the Lua bridge stops
         // running. Only the optional worker observes this lease.
         if (p->detached && cancelled(p)) stopping = true;
@@ -229,7 +229,7 @@ static MP_THREAD_VOID readback(void *context)
         mp_mutex_unlock(&p->lock);
         WaitForSingleObject(p->wake, poll ? (retired_at && GetTickCount64() - retired_at > 250 ? 100 : 1) : (p->detached ? 500 : INFINITE));
     }
-    if (p->detached) release(p);
+    release(p);
     MP_THREAD_RETURN();
 }
 
@@ -359,22 +359,9 @@ static void cleanup(struct priv *p)
 static void destroy(struct mp_filter *f)
 {
     struct priv *p = f->priv;
-    if (p->detached) {
-        // The owner reference keeps p/wake valid until SetEvent completes even
-        // if the thread finishes concurrently. No mutex or driver wait here.
-        ajn_sample_lifetime_stop(&p->lifetime);
-        if (p->started) { SetEvent(p->wake); mp_thread_detach(p->thread); }
-        release(p);
-        return;
-    }
-    if (p->started) {
-        mp_mutex_lock(&p->lock); p->stopping = true; mp_mutex_unlock(&p->lock);
-        SetEvent(p->wake);
-        // Ordinary shutdown drains the sole GPU sample. The supervising native
-        // process has a bounded shutdown deadline if a GPU driver never replies.
-        mp_thread_join(p->thread);
-    }
-    cleanup(p);
+    ajn_sample_lifetime_stop(&p->lifetime);
+    if (p->started) { SetEvent(p->wake); mp_thread_detach(p->thread); }
+    release(p);
 }
 
 static const struct mp_filter_info filter = {
@@ -390,10 +377,10 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     mp_mutex_init(&p->lock);
     p->opts = talloc_steal(p, options);
     p->detached = p->opts->name && p->opts->name[0];
+    talloc_steal(NULL, p);
+    ajn_sample_lifetime_init(&p->lifetime);
     HANDLE mapping = (HANDLE)(uintptr_t)p->opts->mapping;
     if (p->detached) {
-        talloc_steal(NULL, p);
-        ajn_sample_lifetime_init(&p->lifetime);
         // Eight live/retiring branches bound retained driver work across rapid
         // reconfiguration. Failure leaves this observation filter a pass-through.
         if (InterlockedIncrement(&player_buffers) > 8) {
@@ -430,19 +417,19 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
         p->shared = NULL;
         goto fail;
     }
-    if (p->detached) {
+    {
         // Readback may outlive the mpv context. Pin this DLL and its imported
         // dependencies until process exit so asynchronous cleanup has valid code.
         HMODULE module;
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
             (LPCWSTR)(uintptr_t)readback, &module)) goto fail;
-        InterlockedExchange64((volatile LONG64 *)&p->shared->producer, p->producer);
+        if (p->detached) InterlockedExchange64((volatile LONG64 *)&p->shared->producer, p->producer);
     }
     p->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!p->wake) goto fail;
-    if (p->detached) ajn_sample_lifetime_acquire(&p->lifetime);
+    ajn_sample_lifetime_acquire(&p->lifetime);
     if (mp_thread_create(&p->thread, readback, p)) {
-        if (p->detached) release(p);
+        release(p);
         goto fail;
     }
     p->started = true;
@@ -459,6 +446,7 @@ fail:
         mp_filter_add_pin(f, MP_PIN_OUT, "out");
         return f;
     }
+    release(p);
     talloc_free(f);
     return NULL;
 }
