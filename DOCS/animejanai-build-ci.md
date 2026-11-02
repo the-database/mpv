@@ -149,8 +149,12 @@ failures are not blanket exemptions:
 - The i686 Wine job runs directly on the Ubuntu 24.04 VM. Its 32-bit socket calls fail
   in the hosted container before mpv runs; installing both Wine loaders did not fix that.
   The LTS package set also avoids 26.10's conflicting i386/amd64 libgphoto2 files.
+  Wine's prefix lives under the runner-owned workspace: an unprivileged Wine
+  process refuses to create a new prefix directly under root-owned `/tmp`.
 - CUDA-only callbacks are compiled with their callers, and standalone addon tests keep
   their assertions enabled even in release builds.
+- The D3D11 sample helper includes `d3d10_1.h` before the D3D11 header, as required by
+  the Windows SDK's SAL declarations; MinGW's headers alone do not catch this error.
 - The Xcode 27 runner rebuilds libarchive from source: its preinstalled dylib targets
   macOS 27.2 while the runner SDK targets 27.0. Linker warnings remain errors.
 - The scene test stages MVTools beside its executable; the Wine reload test uses the

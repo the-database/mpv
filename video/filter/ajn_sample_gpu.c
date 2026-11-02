@@ -4,7 +4,7 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
-#include <d3d10.h>
+#include <d3d10_1.h>
 #include "ajn_sample_gpu.h"
 
 struct ajn_sample_gpu {

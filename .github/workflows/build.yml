@@ -40,7 +40,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     env:
-      WINEPREFIX: /tmp/wine
+      WINEPREFIX: ${{ github.workspace }}/.wine
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
