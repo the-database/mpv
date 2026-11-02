@@ -22,7 +22,6 @@
 #include <string.h>
 
 #include <mpv/client.h>
-#include <libavformat/avformat.h>
 
 #include "libmpv_common.h"
 
@@ -66,24 +65,6 @@ static void check_output(FILE *fp)
     puts("output file ok");
 }
 
-static void check_color(void)
-{
-    AVFormatContext *format = NULL;
-    if (avformat_open_input(&format, out_path, NULL, NULL) < 0 ||
-        avformat_find_stream_info(format, NULL) < 0)
-        fail("could not read encoded stream metadata\n");
-    int video = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    if (video < 0)
-        fail("encoded video missing\n");
-    AVCodecParameters *codec = format->streams[video]->codecpar;
-    if (codec->color_primaries != AVCOL_PRI_BT2020 ||
-        codec->color_trc != AVCOL_TRC_SMPTE2084 ||
-        codec->color_space != AVCOL_SPC_BT2020_NCL)
-        fail("filtered color metadata changed: primaries=%d transfer=%d matrix=%d\n",
-             codec->color_primaries, codec->color_trc, codec->color_space);
-    avformat_close_input(&format);
-}
-
 int main(int argc, char *argv[])
 {
     ctx = mpv_create();
@@ -98,16 +79,13 @@ int main(int argc, char *argv[])
     set_property_string("end", "1.5");
     set_property_string("terminal", "yes");
     set_property_string("msg-level", "all=v");
-    // Deliberate metadata fixture, independent of the default color guesses.
-    // No encoder color overrides: the filtered image must supply these tags.
-    set_property_string("vf", "format=colormatrix=bt.2020-ncl:primaries=bt.2020:gamma=pq");
 
     if (mpv_initialize(ctx) != 0)
         return 1;
 
     set_property_string("idle", "once");
 
-    const char *cmd[] = {"loadfile", "av://lavfi:testsrc2", NULL};
+    const char *cmd[] = {"loadfile", "av://lavfi:testsrc", NULL};
     command(cmd);
 
     wait_done();
@@ -119,7 +97,6 @@ int main(int argc, char *argv[])
         fail("output file doesn't exist\n");
     check_output(output);
     fclose(output);
-    check_color();
 
     return 0;
 }

@@ -27,6 +27,8 @@ This optional analysis still consumes GPU/CPU resources and retains bounded sour
 
 The host retains its native library graph for the worker process lifetime. This PR does not add global ggml pinning to mpv's `DllMain`. Optional sample/scene workers retain their own module while retiring; filter destruction signals cancellation and releases ownership without waiting for worker initialization. Failed mapping/setup paths release their partial resources.
 
+Each native worker releases its module reference with `FreeLibraryAndExitThread`; it does not permanently pin libmpv. CUDA decode-context ownership follows the final FFmpeg hardware-device reference, including references retained by pending samples. VO teardown can therefore release its ownership without destroying a context that a retiring worker still needs. This adds no per-frame lock, download or observer work to normal playback.
+
 ## Compatibility and tests
 
 Keep the additive inference hooks synchronized with the companion inference PR. Default detection remains available with older backends; unsupported explicit overrides must not be silently accepted. Private maps validate versions, dimensions, ownership, epochs and leases before use. The host supervises worker termination if a device or native helper stops responding.
