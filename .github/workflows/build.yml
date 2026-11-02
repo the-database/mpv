@@ -54,7 +54,9 @@ jobs:
       matrix:
         include:
           - arch: i686
-            wine: wine32
+            # Use the native 64-bit wineserver with the 32-bit loader. The
+            # container runner rejects socket calls from the 32-bit server.
+            wine: wine32 wine64
           - arch: x86_64
             wine: wine64
     steps:
