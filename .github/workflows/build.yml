@@ -54,7 +54,7 @@ jobs:
           - arch: i686
             # 32-bit Wine's socket calls fail inside the hosted container.
             # Keep its execution tests on the VM with the LTS package set.
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             container: ''
             wine: wine32
           - arch: x86_64
