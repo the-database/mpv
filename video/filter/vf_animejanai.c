@@ -553,7 +553,8 @@ static void update_depth(struct mp_filter *vf)
     int depth = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
     p->depth = (p->aji_active && !p->rife_on && !p->temporal_r) ? depth : 1;
     mp_refqueue_set_refs(p->queue, 0,
-                         p->temporal_r ? p->temporal_r : p->depth - 1);
+                         MPMAX(p->temporal_r ? p->temporal_r : p->depth - 1,
+                               p->scene && p->rife_on ? 2 : 0));
 }
 
 // (Re)configure the shim for the current stream params and slot. Updates
@@ -657,21 +658,6 @@ static bool configure_aji(struct mp_filter *vf)
         update_depth(vf);
         stream_status(vf, p->rife_on ? "active" : "bypass");
         return true;  // no scaling chain; rife (if any) still applies
-    }
-
-    // The upscale engine can be ready while a RIFE-first engine is still
-    // building. Its input resize has already been hoisted out of the chain,
-    // but we cannot enter the RIFE-first path until RIFE is active. Keep
-    // passing through source frames until poll() reconfigures the ready pair.
-    if (!p->rife_on && p->api.pre_resize) {
-        int ww = 0, wh = 0;
-        if (p->api.pre_resize(p->aji, &ww, &wh)) {
-            p->out_fmt = p->aji_fmt;
-            update_depth(vf);
-            MP_VERBOSE(vf, "Pre-RIFE downscale waiting for RIFE engine\n");
-            stream_status(vf, "building");
-            return true;
-        }
     }
 
     p->aji_active = true;
@@ -1169,22 +1155,14 @@ done:
 }
 
 // Evaluate once per original pair, independent of the interpolation factor.
-// This optional bridge may download reduced-analysis input; ordinary playback
-// without a detector retains the existing GPU-only path.
+// Consume only a completed look-ahead result. Ordinary playback has no worker,
+// readback, extra references or waits for addon decisions.
 static int scene_pair(struct mp_filter *vf, struct mp_image *a, struct mp_image *b)
 {
     struct priv *p = vf->priv;
     if (!ajn_scene_active(p->scene)) return -1;
     bool supported = p->api.infer_rife_with_scene && p->api.rife_scene_supported &&
         p->api.rife_scene_supported(p->aji);
-    if (supported && !p->is_d3d11) {
-        if (!order_after_decode(vf) ||
-            CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0) return -1;
-        CUcontext dummy;
-        bool ready = CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
-        CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
-        if (!ready) return -1;
-    }
     return ajn_scene_decide(p->scene, a, b, supported);
 }
 
@@ -1753,6 +1731,15 @@ static void vf_animejanai_process(struct mp_filter *vf)
     if (!mp_refqueue_can_output(p->queue))
         return;
 
+    if (p->scene && p->rife_on && p->api.infer_rife_with_scene &&
+        p->api.rife_scene_supported && p->api.rife_scene_supported(p->aji)) {
+        // Analyze original decoded frames ahead of interpolation. GPU readback
+        // and all addon/native work run on the optional worker, never here.
+        for (int i = 0; i < 2; i++)
+            ajn_scene_submit(p->scene, mp_refqueue_get(p->queue, i),
+                             mp_refqueue_get(p->queue, i + 1));
+    }
+
     if (p->rife_first) {
         // RIFE-first: interpolate the source pair, then upscale each emitted
         // frame. Same output-grid cadence as the default path below, but
@@ -1957,13 +1944,16 @@ static bool vf_animejanai_command(struct mp_filter *vf,
     if (cmd->type != MP_FILTER_COMMAND_TEXT || !cmd->cmd)
         return false;
     if (strcmp(cmd->cmd, "scene-map") == 0 && cmd->arg) {
-        if (!*cmd->arg) {
-            ajn_scene_destroy(p->scene); p->scene = NULL;
-            p->scene_decision = -1;
-            return true;
+        ajn_scene_destroy(p->scene); p->scene = NULL;
+        p->scene_decision = -1;
+        bool ok = true;
+        if (*cmd->arg) {
+            p->scene = ajn_scene_create(vf->log);
+            ok = ajn_scene_connect(p->scene, cmd->arg);
+            if (!ok) { ajn_scene_destroy(p->scene); p->scene = NULL; }
         }
-        if (!p->scene) p->scene = ajn_scene_create(vf->log);
-        return ajn_scene_connect(p->scene, cmd->arg);
+        update_depth(vf);
+        return ok;
     }
     if (strcmp(cmd->cmd, "poll") == 0) {
         // No-op wakeup: while playback is paused no frames flow, so

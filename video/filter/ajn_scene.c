@@ -8,6 +8,8 @@
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 #include "common/common.h"
+#include "common/msg.h"
+#include "osdep/threads.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
 #include "video/sws_utils.h"
@@ -16,9 +18,24 @@
 #include "ajn_scene_shared.h"
 #include "mvtools/ajn_mvtools.h"
 
+// Only decoded source frames enter this bounded look-ahead worker. The player
+// enqueues references and consumes already-completed, exact-PTS decisions; it
+// never waits for readback, native analysis, or a guest reply.
+struct scene_job { struct mp_image *a, *b; int64_t epoch, generation; };
+struct scene_result { double a, b; int decision; int64_t epoch, generation; };
+static LONG scene_workers;
 struct ajn_scene {
     struct ajn_scene_shared *shared;
-    HANDLE ready, reply;
+    HANDLE ready, reply, wake;
+    mp_mutex mutex;
+    mp_thread thread;
+    LONG stopping, references;
+    bool started, reserved;
+    struct scene_job jobs[3];
+    int job_count, result_next;
+    struct scene_result results[8];
+    double submitted_pts;
+    int64_t submitted_epoch, processing_epoch;
     char name[96];
     struct mp_sws_context *sws;
     struct mp_image_pool *pool;
@@ -56,7 +73,10 @@ static bool mv_open(struct ajn_scene *s)
     // Fixed trusted installation path. Never load a DLL supplied by an addon,
     // nor search PATH/current directory. Called only for an enabled MVTools mode.
     wchar_t path[32768];
-    DWORD n = GetModuleFileNameW(NULL, path, MP_ARRAY_SIZE(path));
+    HMODULE self;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(uintptr_t)mv_open, &self)) goto fail;
+    DWORD n = GetModuleFileNameW(self, path, MP_ARRAY_SIZE(path));
     wchar_t *slash = n && n < MP_ARRAY_SIZE(path) ? wcsrchr(path, L'\\') : NULL;
     if (!slash || slash - path + 20 >= MP_ARRAY_SIZE(path)) goto fail;
     wcscpy(slash + 1, L"ajn-mvtools.dll");
@@ -96,7 +116,12 @@ struct ajn_scene *ajn_scene_create(struct mp_log *log)
 {
     struct ajn_scene *s = talloc_zero(NULL, struct ajn_scene);
     s->sws = mp_sws_alloc(s);
-    s->sws->log = log;
+    // The worker can retire after its filter has gone away.
+    s->sws->log = mp_null_log;
+    mp_mutex_init(&s->mutex);
+    s->references = 1;
+    s->submitted_pts = MP_NOPTS_VALUE;
+    (void)log;
     s->sws->flags = SWS_BILINEAR;
     s->pool = mp_image_pool_new(s);
     s->cached_pts = MP_NOPTS_VALUE;
@@ -105,9 +130,7 @@ struct ajn_scene *ajn_scene_create(struct mp_log *log)
 void ajn_scene_reset(struct ajn_scene *s)
 {
     if (!s) return;
-    s->cached_pts = MP_NOPTS_VALUE;
-    if (s->mv_context) s->mv_reset(s->mv_context);
-    TA_FREEP(&s->mv_cached);
+
     if (s->shared) {
         // A seek must invalidate pending replies even while the host copies
         // the sample under the header lock. The producer itself is serial.
@@ -116,6 +139,8 @@ void ajn_scene_reset(struct ajn_scene *s)
         InterlockedExchange64((volatile LONG64 *)&s->shared->response_id, 0);
     }
 }
+static MP_THREAD_VOID scene_worker(void *context);
+
 bool ajn_scene_connect(struct ajn_scene *s, const char *name)
 {
     if (!s || !name) return false;
@@ -125,13 +150,8 @@ bool ajn_scene_connect(struct ajn_scene *s, const char *name)
     if (*name && (strlen(name) != prefix_len + 32 ||
         strncmp(name, prefix, prefix_len) ||
         strspn(name + prefix_len, "0123456789abcdef") != 32)) return false;
-    ajn_scene_reset(s);
-    mv_close(s);
-    if (s->shared) UnmapViewOfFile(s->shared);
-    if (s->ready) CloseHandle(s->ready);
-    if (s->reply) CloseHandle(s->reply);
-    s->shared = NULL; s->ready = s->reply = NULL; s->name[0] = 0;
-    if (!*name) return true;
+    // Reconnection creates a new owner; never unmap a retiring worker's view.
+    if (s->shared || !*name) return false;
     wchar_t wide[128];
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, MP_ARRAY_SIZE(wide));
     HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wide);
@@ -149,6 +169,19 @@ bool ajn_scene_connect(struct ajn_scene *s, const char *name)
     if (!s->ready || !s->reply) goto fail;
     snprintf(s->name, sizeof(s->name), "%s", name);
     ajn_scene_reset(s);
+    s->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    HMODULE self;
+    if (!s->wake || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)(uintptr_t)ajn_scene_connect, &self)) goto fail;
+    if (InterlockedIncrement(&scene_workers) > 4) {
+        InterlockedDecrement(&scene_workers); goto fail;
+    }
+    s->reserved = true;
+    InterlockedIncrement(&s->references);
+    if (mp_thread_create(&s->thread, scene_worker, s)) {
+        InterlockedDecrement(&s->references); goto fail;
+    }
+    s->started = true;
     return true;
 fail:
     UnmapViewOfFile(s->shared); s->shared = NULL;
@@ -157,11 +190,28 @@ fail:
     s->ready = s->reply = NULL;
     return false;
 }
+static void scene_release(struct ajn_scene *s)
+{
+    if (InterlockedDecrement(&s->references)) return;
+    for (int i = 0; i < s->job_count; i++) {
+        talloc_free(s->jobs[i].a); talloc_free(s->jobs[i].b);
+    }
+    mv_close(s);
+    if (s->shared) UnmapViewOfFile(s->shared);
+    if (s->ready) CloseHandle(s->ready);
+    if (s->reply) CloseHandle(s->reply);
+    if (s->wake) CloseHandle(s->wake);
+    if (s->reserved) InterlockedDecrement(&scene_workers);
+    mp_mutex_destroy(&s->mutex);
+    talloc_free(s);
+}
 void ajn_scene_destroy(struct ajn_scene *s)
 {
     if (!s) return;
-    ajn_scene_connect(s, "");
-    talloc_free(s);
+    InterlockedExchange(&s->stopping, 1);
+    ajn_scene_reset(s);
+    if (s->started) { SetEvent(s->wake); mp_thread_detach(s->thread); }
+    scene_release(s);
 }
 static bool sample(struct ajn_scene *s, struct mp_image *image,
                    int width, int height, uint8_t *pixels)
@@ -272,20 +322,20 @@ done:
     struct ajn_scene_shared *h = s->shared;
     if (!enter(h)) return -1;
     // Disable, seek or reconfiguration must not consume an in-flight decision.
-    if (!h->enabled || h->generation != generation ||
+    if (h->epoch != s->processing_epoch || !h->enabled || h->generation != generation ||
         h->lease_until_ms <= (int64_t)GetTickCount64()) { leave(h); return -1; }
     h->status = state; h->source_width = b->w; h->source_height = b->h;
     h->previous_pts = a->pts; h->current_pts = b->pts;
     h->changed_blocks = result.changed_blocks; h->total_blocks = result.total_blocks;
     h->block_sad_threshold = result.block_sad_threshold; h->source_bits = bits;
     h->analysis_us = (end.QuadPart - start.QuadPart) * 1000000 / frequency.QuadPart;
-    if (decision >= 0 && h->accepted < INT32_MAX) h->accepted++;
-    if (decision == 1 && h->cut_pairs < INT32_MAX) h->cut_pairs++;
+
+
     leave(h);
     return decision;
 }
-int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
-                     bool supported)
+static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
+                   bool supported)
 {
     if (!s || !s->shared) return -1;
     struct ajn_scene_shared *h = s->shared;
@@ -318,7 +368,7 @@ int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b
     s->source_w = b->w; s->source_h = b->h;
     if (!enter(h)) return -1;
     now = GetTickCount64();
-    if (!h->enabled || h->generation != generation || h->lease_until_ms <= now ||
+    if (h->epoch != s->processing_epoch || !h->enabled || h->generation != generation || h->lease_until_ms <= now ||
         h->next_id == INT64_MAX) { leave(h); return -1; }
     int64_t request = ++h->next_id, deadline = now + budget;
     h->request_id = request; h->response_id = 0;
@@ -328,16 +378,15 @@ int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b
     memcpy(h->pixels, s->pixels, 2 * bytes);
     leave(h);
     SetEvent(s->ready);
-    while ((now = GetTickCount64()) < deadline) {
+    while (!InterlockedCompareExchange(&s->stopping, 0, 0) && (now = GetTickCount64()) < deadline) {
         WaitForSingleObject(s->reply, (DWORD)(deadline - now));
         if (!enter(h)) continue;
-        if (!h->enabled || h->generation != generation || h->request_id != request) {
+        if (h->epoch != s->processing_epoch || !h->enabled || h->generation != generation || h->request_id != request) {
             leave(h); return -1;
         }
         if (h->response_id == request && h->deadline_ms >= (int64_t)GetTickCount64()) {
             int decision = h->decision;
             h->status = 2;
-            if (h->accepted < INT32_MAX) h->accepted++;
             h->consecutive_timeouts = 0;
             leave(h);
             return decision >= -1 && decision <= 1 ? decision : -1;
@@ -354,4 +403,84 @@ int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b
         leave(h);
     }
     return -1;
+}
+
+static MP_THREAD_VOID scene_worker(void *context)
+{
+    struct ajn_scene *s = context;
+    mp_thread_set_name("ajn-scene");
+    while (!InterlockedCompareExchange(&s->stopping, 0, 0)) {
+        struct scene_job job = {0};
+        mp_mutex_lock(&s->mutex);
+        if (s->job_count) {
+            job = s->jobs[0];
+            memmove(s->jobs, s->jobs + 1, --s->job_count * sizeof(s->jobs[0]));
+        }
+        mp_mutex_unlock(&s->mutex);
+        if (!job.a) { WaitForSingleObject(s->wake, INFINITE); continue; }
+        int decision = -1;
+        if (job.epoch == InterlockedCompareExchange64((volatile LONG64 *)&s->shared->epoch, 0, 0)) {
+            if (s->processing_epoch != job.epoch) {
+                s->cached_pts = MP_NOPTS_VALUE;
+                if (s->mv_context) s->mv_reset(s->mv_context);
+                TA_FREEP(&s->mv_cached);
+            }
+            s->processing_epoch = job.epoch;
+            decision = analyze(s, job.a, job.b, true);
+        }
+        mp_mutex_lock(&s->mutex);
+        s->results[s->result_next++ % MP_ARRAY_SIZE(s->results)] =
+            (struct scene_result){job.a->pts, job.b->pts, decision, job.epoch, job.generation};
+        s->result_next %= MP_ARRAY_SIZE(s->results);
+        mp_mutex_unlock(&s->mutex);
+        talloc_free(job.a); talloc_free(job.b);
+    }
+    scene_release(s);
+    MP_THREAD_RETURN();
+}
+
+void ajn_scene_submit(struct ajn_scene *s, struct mp_image *a, struct mp_image *b)
+{
+    if (!a || !b || !ajn_scene_active(s) || !s->started || mp_mutex_trylock(&s->mutex)) return;
+    struct ajn_scene_shared *h = s->shared;
+    if (enter(h)) {
+        if (h->epoch != s->submitted_epoch) {
+            s->submitted_epoch = h->epoch;
+            s->submitted_pts = MP_NOPTS_VALUE;
+        }
+        if (s->job_count < MP_ARRAY_SIZE(s->jobs) &&
+            (s->submitted_pts == MP_NOPTS_VALUE || b->pts > s->submitted_pts)) {
+            struct mp_image *left = mp_image_new_ref(a), *right = mp_image_new_ref(b);
+            if (left && right) {
+                s->jobs[s->job_count++] = (struct scene_job){left, right, h->epoch, h->generation};
+                s->submitted_pts = b->pts;
+                SetEvent(s->wake);
+            } else { talloc_free(left); talloc_free(right); }
+        }
+        leave(h);
+    }
+    mp_mutex_unlock(&s->mutex);
+}
+
+int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
+                     bool supported)
+{
+    if (!s || !s->shared || !a || !b || mp_mutex_trylock(&s->mutex)) return -1;
+    int decision = -1;
+    struct ajn_scene_shared *h = s->shared;
+    if (enter(h)) {
+        if (!supported) h->status = 5;
+        if (supported && h->enabled && h->lease_until_ms > (int64_t)GetTickCount64()) {
+            for (int i = 0; i < MP_ARRAY_SIZE(s->results); i++) {
+                struct scene_result *r = &s->results[i];
+                if (r->epoch == h->epoch && r->generation == h->generation &&
+                    r->a == a->pts && r->b == b->pts) { decision = r->decision; break; }
+            }
+            if (decision >= 0 && h->accepted < INT32_MAX) h->accepted++;
+            if (decision == 1 && h->cut_pairs < INT32_MAX) h->cut_pairs++;
+        }
+        leave(h);
+    }
+    mp_mutex_unlock(&s->mutex);
+    return decision; // Built-in detector for any missing, stale or late result.
 }

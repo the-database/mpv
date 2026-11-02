@@ -2773,19 +2773,6 @@ void vo_w32_set_transparency(struct vo *vo, bool enable)
 
 BOOL WINAPI DllMain(HANDLE dll, DWORD reason, LPVOID reserved)
 {
-    if (reason == DLL_PROCESS_ATTACH) {
-        // The optional FFmpeg/Whisper dependency installs a process-wide C++
-        // terminate handler in ggml.cpp without restoring the previous handler
-        // on unload. Keep that code resident: otherwise a second libmpv load
-        // asserts in GGML (and an intervening exception calls unloaded code).
-        // Only pin already-loaded dependencies; never load a DLL in DllMain.
-        HMODULE module;
-        const wchar_t *names[] = {L"ggml-base-0.dll", L"ggml-0.dll"};
-        for (int i = 0; i < MP_ARRAY_SIZE(names); i++) {
-            if (GetModuleHandleW(names[i]))
-                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, names[i], &module);
-        }
-    }
     if (reason == DLL_PROCESS_DETACH && window_class)
         UnregisterClassW(MPV_WINDOW_CLASS_NAME, HINST_THISCOMPONENT);
     return TRUE;
