@@ -173,7 +173,7 @@ _dav1d () {
     [ -d dav1d ] || $gitclone https://code.videolan.org/videolan/dav1d.git
     builddir dav1d
     meson setup .. --cross-file "$prefix_dir/crossfile" \
-        -Denable_{tools,tests}=false
+        -Denable_{tools,tests}=false || { cat meson-logs/meson-log.txt; return 1; }
     makeplusinstall
     popd
 }
