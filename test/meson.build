@@ -126,7 +126,17 @@ if win32
         ajn_scene = executable('ajn-scene', 'ajn_scene.c', include_directories: incdir,
             objects: libmpv.extract_objects('video/filter/ajn_scene.c', 'video/mp_image_pool.c'),
             dependencies: [libavutil, libswscale, zimg, libplacebo], link_with: [img_utils, test_utils])
-        test('ajn-scene', ajn_scene)
+        scene_test_deps = []
+        if get_option('gpl')
+            # The bridge loads its detector beside its module, which is the test
+            # executable here. Keep it dynamically loaded to test retirement.
+            scene_test_deps += custom_target('ajn-scene-detector',
+                input: mvtools_library, output: 'ajn-mvtools.dll',
+                command: [python, '-c',
+                    'import shutil, sys; shutil.copyfile(sys.argv[1], sys.argv[2])',
+                    '@INPUT@', '@OUTPUT@'])
+        endif
+        test('ajn-scene', ajn_scene, depends: scene_test_deps)
     endif
 endif
 

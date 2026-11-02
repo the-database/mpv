@@ -39,7 +39,7 @@ jobs:
   mingw:
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:26.10
+      image: ${{ matrix.container }}
       env:
         WINEPREFIX: /tmp/wine
     env:
@@ -54,10 +54,13 @@ jobs:
       matrix:
         include:
           - arch: i686
+            # 26.10's i386/amd64 libgphoto2 packages have conflicting files.
+            container: ubuntu:24.04
             # Use the native 64-bit wineserver with the 32-bit loader. The
             # container runner rejects socket calls from the 32-bit server.
             wine: wine32 wine64
           - arch: x86_64
+            container: ubuntu:26.10
             wine: wine64
     steps:
       - name: Install dependencies
@@ -112,6 +115,8 @@ jobs:
       - name: Run meson tests
         id: tests
         run: |
+          # Dynamically loaded libmpv tests do not inherit Meson's DLL search paths.
+          export WINEPATH="$(winepath -w "$PWD/artifact")"
           meson test -C mingw_build
 
       - name: Print meson test log
@@ -388,6 +393,12 @@ jobs:
             luajit libass ffmpeg-full meson rust uchardet mujs libplacebo molten-vk vulkan-loader vulkan-headers \
             libarchive libbluray libcaca libcdio-paranoia libdvdnav libdvdread libsixel rubberband vapoursynth zimg
           brew link ffmpeg-full
+
+      - name: Rebuild libarchive for the runner SDK
+        if: ${{ matrix.os == 'xcode-27' }}
+        run: |
+          # The preinstalled dylib targets 27.2, newer than this runner's 27.0 SDK.
+          brew reinstall --build-from-source libarchive
 
       - name: Build with meson
         id: build
