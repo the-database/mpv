@@ -1,5 +1,6 @@
 /* Optional trusted native detector. No VapourSynth runtime or guest DLLs.
- * SPDX-License-Identifier: GPL-2.0-or-later */
+ * The interface is LGPL; the separately built detector remains GPL.
+ * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef AJN_MVTOOLS_H
 #define AJN_MVTOOLS_H
 #include <stddef.h>
