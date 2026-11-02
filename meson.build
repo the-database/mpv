@@ -488,7 +488,10 @@ features += {'rfork': cc.has_header_symbol('unistd.h', 'rfork_thread')}
 # links a probe, which can spuriously fail against a static libass whose
 # transitive deps aren't all on the probe link line (e.g. mingw cross builds),
 # silently compiling out the call.
-features += {'ass-render-thread-count': cc.has_header_symbol('ass/ass.h', 'ass_set_render_thread_count',
+# Meson cannot use an internal dependency in compiler feature probes. The
+# bundled libass used by the MSVC build is upstream and has none of these APIs.
+libass_can_probe = libass.type_name() != 'internal'
+features += {'ass-render-thread-count': libass_can_probe and cc.has_header_symbol('ass/ass.h', 'ass_set_render_thread_count',
                                                              dependencies: libass)}
 
 # Forked-libass deferred GPU primitive APIs (opt-in, off by default). Each is an
@@ -499,11 +502,11 @@ features += {'ass-render-thread-count': cc.has_header_symbol('ass/ass.h', 'ass_s
 #   ass-blur-deferred      -> HAVE_ASS_BLUR_DEFERRED       (ass_set_blur_deferred)
 #   ass-composite-deferred -> HAVE_ASS_COMPOSITE_DEFERRED  (ass_set_composite_deferred)
 #   ass-outline-deferred   -> HAVE_ASS_OUTLINE_DEFERRED    (ass_set_outline_deferred)
-features += {'ass-blur-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_blur_deferred',
+features += {'ass-blur-deferred': libass_can_probe and cc.has_header_symbol('ass/ass.h', 'ass_set_blur_deferred',
                                                        dependencies: libass)}
-features += {'ass-composite-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_composite_deferred',
+features += {'ass-composite-deferred': libass_can_probe and cc.has_header_symbol('ass/ass.h', 'ass_set_composite_deferred',
                                                              dependencies: libass)}
-features += {'ass-outline-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_outline_deferred',
+features += {'ass-outline-deferred': libass_can_probe and cc.has_header_symbol('ass/ass.h', 'ass_set_outline_deferred',
                                                            dependencies: libass)}
 
 # Fractional deferred-shadow offsets ride new ASS_Image FIELDS (shift_x64 /
@@ -511,7 +514,7 @@ features += {'ass-outline-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_
 # member: a fork with the deferred APIs but predating the fields must still
 # build (the packer then leaves the shift at 0 = the old whole-pixel rounding).
 #   ass-shadow-shift -> HAVE_ASS_SHADOW_SHIFT (ASS_Image.shift_x64)
-features += {'ass-shadow-shift': cc.has_member('ASS_Image', 'shift_x64',
+features += {'ass-shadow-shift': libass_can_probe and cc.has_member('ASS_Image', 'shift_x64',
                                                prefix: '#include <ass/ass.h>',
                                                dependencies: libass)}
 

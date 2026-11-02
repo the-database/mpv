@@ -53,21 +53,28 @@ ScaledBorderAndShadow: yes
 WrapStyle: 2
 
 [V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Dlg,DejaVu Sans,48,&H00FFFFFF,&H000000FF,&H00101010,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,30,1
-Style: Wall,DejaVu Sans,{run_fs},&H00E0E0E0,&H000000FF,&H00202020,&H00000000,0,0,0,0,100,100,0,0,1,4,0,7,0,0,0,1
-Style: Giant,DejaVu Sans,{giant_fs},&H60FFC080,&H000000FF,&H00301010,&H00000000,0,0,0,0,{giant_fscx},100,0,0,1,0,0,7,0,0,0,1
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour,\
+ Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline,\
+ Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Dlg,DejaVu Sans,48,&H00FFFFFF,&H000000FF,&H00101010,&H00000000,0,0,0,0,100,100,0,0,1,2,0,\
+2,40,40,30,1
+Style: Wall,DejaVu Sans,{run_fs},&H00E0E0E0,&H000000FF,&H00202020,&H00000000,0,0,0,0,100,100,0,\
+0,1,4,0,7,0,0,0,1
+Style: Giant,DejaVu Sans,{giant_fs},&H60FFC080,&H000000FF,&H00301010,&H00000000,0,0,0,0,\
+{giant_fscx},100,0,0,1,0,0,7,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 def ts(t):
-    h = int(t // 3600); m = int(t % 3600 // 60); s = t % 60
+    h = int(t // 3600)
+    m = int(t % 3600 // 60)
+    s = t % 60
     return f"{h}:{m:02d}:{s:05.2f}"
 
 def main(preset, out, static=False):
-    P = PRESETS[preset]
+    settings = PRESETS[preset]
     ev = []
     for i in range(8):
         t0 = i * 2.0
@@ -78,7 +85,7 @@ def main(preset, out, static=False):
 
     t0s, t1s = ts(WALL_T0), ts(WALL_T1)
     blocks = "█▓▒░"
-    for i in range(P["n_giant"]):
+    for i in range(settings["n_giant"]):
         gx = (i % 8) * 230 + 10
         gy = (i // 8) * 200 + 20
         ch = blocks[i % len(blocks)]
@@ -86,9 +93,9 @@ def main(preset, out, static=False):
               f"\\move({gx},{gy},{gx+8},{gy})")
         ev.append(
             f"Dialogue: 1,{t0s},{t1s},Giant,,0,0,0,,"
-            f"{{{mv}\\blur{P['giant_blur']}\\alpha&H90&}}{ch}")
+            f"{{{mv}\\blur{settings['giant_blur']}\\alpha&H90&}}{ch}")
     words = ["DENSETYPESET", "WALLOFSIGNSX", "KANJIKANJIKA", "SUBTITLEWALL"]
-    for i in range(P["n_runs"]):
+    for i in range(settings["n_runs"]):
         rx = (i % 10) * 190 + 5
         ry = (i * 37) % 900 + 30
         w = words[i % len(words)]
@@ -97,12 +104,12 @@ def main(preset, out, static=False):
               f"\\move({rx},{ry},{rx+6},{ry+2})")
         ev.append(
             f"Dialogue: 2,{t0s},{t1s},Wall,,0,0,0,,"
-            f"{{{mv}\\blur{P['run_blur']}\\bord4\\1c{c}}}{w}")
+            f"{{{mv}\\blur{settings['run_blur']}\\bord4\\1c{c}}}{w}")
     with open(out, "w") as f:
-        f.write(HDR.format(preset=preset, **P))
+        f.write(HDR.format(preset=preset, **settings))
         f.write("\n".join(ev) + "\n")
     print(f"wrote {out} [{preset}{' static' if static else ''}]: {len(ev)} events "
-          f"({P['n_giant']} giants + {P['n_runs']} runs in [{WALL_T0},{WALL_T1}))")
+          f"({settings['n_giant']} giants + {settings['n_runs']} runs in [{WALL_T0},{WALL_T1}))")
 
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if a != "--static"]

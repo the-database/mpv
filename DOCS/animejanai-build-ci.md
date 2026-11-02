@@ -135,26 +135,23 @@ into `master` and pushes; on conflict it aborts and files/comments on an issue t
 
 See [`../CLAUDE.md`](../CLAUDE.md) for the merge-only policy and the conflict dry-run command.
 
-## Pre-existing CI failures — do not "fix" these
+## CI compatibility
 
-A red check on this fork is not automatically a regression. Known-red, verified against a
-baseline:
+Fork-owned code and test tools must pass the same checks as the upstream sources. Historical
+failures are not blanket exemptions:
 
-- **The six `lint.yml` jobs.** They fail on fork-only content: `TOOLS/subtest` Python/Lua style,
-  missing final newlines in two JSON files, and the commit-message linter rejecting the fork's
-  merge-commit history.
-- **The two `win32` MSVC jobs.** They fail in `meson.build` at the libass feature probes —
-  `cc.has_header_symbol(..., dependencies: libass)` errors with "Dependencies must be external
-  dependencies" because libass is a meson **subproject** in that configuration. The fix would
-  be to guard the probes on `libass.type_name() == 'internal'`; it has not been done.
-- **`Fuzzing (undefined)`** can fail on FFmpeg-internal undefined behaviour (e.g. a
-  div-by-zero in `libavformat/vpk.c`), unrelated to mpv.
+- Stock libass builds omit deferred-composite streaming buffers and their cleanup calls.
+- MSVC's bundled upstream libass is an internal Meson dependency, which cannot be passed to
+  compiler feature probes. Its fork-only features stay disabled; installed external libass
+  builds retain the individual declaration checks.
+- The i686 Wine job installs both loaders so Wine can use the native 64-bit server. A
+  32-bit-only server fails its socket initialization in the hosted container before mpv runs.
+- `TOOLS/subtest` participates in Python/Lua lint, type checks and pre-commit hooks. Windows
+  D3D11 tests declare their platform requirement explicitly.
 
-Everything else in `build.yml` passes: Linux gcc/clang, macOS, FreeBSD/OpenBSD, all msys2
-variants, and the mingw cross builds.
-
-`gh run rerun --failed` is appropriate only for genuinely transient failures (e.g. a 502
-downloading freetype from savannah), never for the items above.
+Compare an unexpected failure with the same base commit and dependency versions before
+assigning it to a PR. `gh run rerun --failed` is appropriate for genuinely transient failures
+(e.g. a 502 downloading freetype), not reproducible source or environment errors.
 
 > **`build.yml`'s `publish` job can never run here.** It is guarded on
 > `github.repository == 'mpv-player/mpv'`, so it is skipped in every fork run by design.

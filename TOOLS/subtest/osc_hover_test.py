@@ -124,12 +124,14 @@ class Scenario:
         print(f"  [{self.tag}] {msg}", flush=True)
 
     def shot(self, name):
+        assert self.ipc is not None
         self.nshot += 1
         path = os.path.join(self.out, f"{self.tag}_{self.nshot:02d}_{name}.png")
         self.ipc.command(["screenshot-to-file", path, "window"], timeout=60.0)
         return read_png(path), path
 
     def mouse(self, x, y):
+        assert self.ipc is not None
         self.ipc.command(["mouse", int(x), int(y)])
 
     def sweep(self, y, w):

@@ -19,5 +19,7 @@ repos:
   rev: v2.4.3
   hooks:
     - id: codespell
-      args: ["--ignore-words-list", "ALS,als,datas,DNE,enew,HDA,numer,ontop,optionA,Paeth,pathc,inout,requestor"]
+      # ASS's bord tag and the isolated TE syllable in the rotated-text fixture
+      # are intentional, not spelling errors.
+      args: ["--ignore-words-list", "ALS,als,bord,datas,DNE,enew,HDA,numer,ontop,optionA,Paeth,pathc,inout,requestor,TE"]
       exclude: ^(etc/menu.conf|misc/language.c)$
