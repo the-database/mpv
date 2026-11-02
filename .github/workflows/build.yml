@@ -37,12 +37,10 @@ concurrency:
 
 jobs:
   mingw:
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ matrix.container }}
-      env:
-        WINEPREFIX: /tmp/wine
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     env:
+      WINEPREFIX: /tmp/wine
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
@@ -54,20 +52,24 @@ jobs:
       matrix:
         include:
           - arch: i686
-            # 26.10's i386/amd64 libgphoto2 packages have conflicting files.
-            container: ubuntu:24.04
-            # Use the native 64-bit wineserver with the 32-bit loader. The
-            # container runner rejects socket calls from the 32-bit server.
-            wine: wine32 wine64
+            # 32-bit Wine's socket calls fail inside the hosted container.
+            # Keep its execution tests on the VM with the LTS package set.
+            runner: ubuntu-24.04
+            container: ''
+            wine: wine32
           - arch: x86_64
+            runner: ubuntu-latest
             container: ubuntu:26.10
             wine: wine64
     steps:
       - name: Install dependencies
+        shell: bash
         run: |
-          dpkg --add-architecture i386
-          apt-get update
-          apt-get install --no-install-recommends -y ca-certificates ccache cmake g++-mingw-w64 gcc-multilib git make meson nasm ninja-build pkgconf rustup wget xz-utils ${{ matrix.wine }} wine
+          install_cmd=()
+          if [ "$(id -u)" -ne 0 ]; then install_cmd=(sudo); fi
+          "${install_cmd[@]}" dpkg --add-architecture i386
+          "${install_cmd[@]}" apt-get update
+          "${install_cmd[@]}" apt-get install --no-install-recommends -y ca-certificates ccache cmake g++-mingw-w64 gcc-multilib git make meson nasm ninja-build pkgconf rustup wget xz-utils ${{ matrix.wine }} wine
           rustup default stable
           rustup target add ${{ env.RUST_TARGET }}
         env:

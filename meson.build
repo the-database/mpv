@@ -1430,7 +1430,7 @@ if features['d3d11'] or features['egl-angle-win32'] or (features['vulkan'] and w
 endif
 
 # hwaccel
-ffnvcodec = dependency('ffnvcodec', version: '>= 11.1.5.1', required: false)
+ffnvcodec = dependency('ffnvcodec', version: '>= 11.1.5.3', required: false)
 features += {'ffnvcodec': ffnvcodec.found()}
 if features['ffnvcodec']
     dependencies += ffnvcodec
