@@ -150,6 +150,8 @@ failures are not blanket exemptions:
   in the hosted container before mpv runs; installing both Wine loaders did not fix that.
   This LTS has MinGW 13's 32-bit `ole32` imports for `CoIncrementMTAUsage` and
   `CoDecrementMTAUsage`; Ubuntu 24.04's MinGW 11 cannot link the WASAPI backend.
+  The GCC cross-build selects MinGW's C99 stdio explicitly so `%zu` remains valid
+  with GCC 13 and newer MinGW headers; format warnings remain errors.
   Setup creates the Wine prefix as its current user. Wine will not create it beneath
   another user's directory, such as `/tmp` on the VM or the container's mounted workspace.
 - CUDA-only callbacks are compiled with their callers, and standalone addon tests keep
