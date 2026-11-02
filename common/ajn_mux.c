@@ -98,7 +98,7 @@ MPV_EXPORT int mpv_ajn_mux_v1(void *opaque,
     if (input->nb_streams < 1 || input->nb_streams > 4) { result = AVERROR(EINVAL); goto done; }
     bool mkv = !strcmp(container, "matroska"), mp4 = !strcmp(container, "fragmentedMp4");
     const char *muxer = segmented ? (mkv ? "segment" : "hls") : (mp4 ? "mp4" : container);
-    // A private non-file URL keeps hlsenc from calling filesystem rename
+    // Private non-file index URLs keep the muxers from filesystem rename
     // behind the quota-enforcing io callbacks. The host publishes the index
     // atomically when its callback closes the writer.
     const char *filename = segmented ? (mkv ? "part_%08d.mkv" : "ajn-cache:index.m3u8") :
@@ -126,7 +126,7 @@ MPV_EXPORT int mpv_ajn_mux_v1(void *opaque,
     if (segmented && mkv) {
         av_dict_set(&options, "segment_time", interval, 0);
         av_dict_set(&options, "segment_format", "matroska", 0);
-        av_dict_set(&options, "segment_list", "index.csv", 0);
+        av_dict_set(&options, "segment_list", "ajn-cache:index.csv", 0);
         av_dict_set(&options, "segment_list_type", "csv", 0);
         av_dict_set(&options, "segment_list_size", "128", 0);
         av_dict_set(&options, "reset_timestamps", "1", 0);

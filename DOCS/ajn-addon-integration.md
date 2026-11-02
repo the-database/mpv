@@ -31,7 +31,7 @@ The host retains its native library graph for the worker process lifetime. This 
 
 Keep the additive inference hooks synchronized with the companion inference PR. Default detection remains available with older backends; unsupported explicit overrides must not be silently accepted. Private maps validate versions, dimensions, ownership, epochs and leases before use. The host supervises worker termination if a device or native helper stops responding.
 
-The probe, encoder, mux and subtitle entry points are Windows-only private exports declared in `common/ajn_probe.h`, `common/ajn_mux.h` and `common/ajn_subtitles.h`. They are not part of libmpv's public cross-platform API. The mux callback supports the FFmpeg 6.1 and 7+ signatures. HLS uses a private `ajn-cache:` URL with host-side atomic playlist publication, avoiding FFmpeg filesystem renames outside the supplied callbacks.
+The probe, encoder, mux and subtitle entry points are Windows-only private exports declared in `common/ajn_probe.h`, `common/ajn_mux.h` and `common/ajn_subtitles.h`. They are not part of libmpv's public cross-platform API. The mux callback supports the FFmpeg 6.1 and 7+ signatures. Segmented MKV and HLS use private `ajn-cache:` index URLs with host-side atomic publication, avoiding FFmpeg filesystem renames outside the supplied callbacks.
 
 The host enforces guest permissions and restricts player commands. mpv IPC and scripts are trusted separately: a caller already allowed to issue arbitrary mpv commands can configure scene/sample filters and raw-handle options. Do not expose that IPC endpoint to untrusted addons or clients.
 
