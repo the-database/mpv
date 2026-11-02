@@ -205,8 +205,7 @@ if get_option('libmpv')
         if win32
             exe = executable('libmpv-ajn-sample', 'libmpv_ajn_sample.c',
                              include_directories: [incdir, incdir_public])
-            test('libmpv-ajn-sample-invalid', exe, args: ['0'], depends: mpvlib, suite: 'libmpv')
-            test('libmpv-ajn-sample-worker', exe, args: ['1'], depends: mpvlib, suite: 'libmpv')
+            test('libmpv-ajn-sample', exe, depends: mpvlib, suite: 'libmpv')
         endif
     endif
 endif
