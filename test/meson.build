@@ -202,6 +202,11 @@ if get_option('libmpv')
         exe = executable('libmpv-lifetime', sources: 'libmpv_lifetime.c',
                          include_directories: incdir_public)
         test('libmpv-lifetime', exe, depends: mpvlib, suite: 'libmpv')
+        if win32
+            exe = executable('libmpv-ajn-sample', 'libmpv_ajn_sample.c',
+                             include_directories: [incdir, incdir_public])
+            test('libmpv-ajn-sample', exe, depends: mpvlib, suite: 'libmpv')
+        endif
     endif
 endif
 

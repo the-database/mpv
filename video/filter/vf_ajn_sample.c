@@ -26,7 +26,7 @@ struct priv {
     struct opts *opts;
     struct ajn_sample_shared *shared;
     mp_mutex lock;
-    mp_thread thread;
+    HMODULE worker_module;
     HANDLE wake;
     bool started, failed, detached, reserved;
     struct ajn_sample_lifetime lifetime;
@@ -163,9 +163,10 @@ static void analysis_state(void *context, int status)
     state(context, status, S_OK);
 }
 
-static MP_THREAD_VOID readback(void *context)
+static DWORD WINAPI readback(void *context)
 {
     struct priv *p = context;
+    HMODULE module = p->worker_module;
     mp_thread_set_name("ajn-sample");
     ULONGLONG retired_at = 0;
     for (;;) {
@@ -230,7 +231,7 @@ static MP_THREAD_VOID readback(void *context)
         WaitForSingleObject(p->wake, poll ? (retired_at && GetTickCount64() - retired_at > 250 ? 100 : 1) : (p->detached ? 500 : INFINITE));
     }
     release(p);
-    MP_THREAD_RETURN();
+    FreeLibraryAndExitThread(module, 0);
 }
 
 static void sample(struct mp_filter *f, struct mp_image *image)
@@ -360,7 +361,7 @@ static void destroy(struct mp_filter *f)
 {
     struct priv *p = f->priv;
     ajn_sample_lifetime_stop(&p->lifetime);
-    if (p->started) { SetEvent(p->wake); mp_thread_detach(p->thread); }
+    if (p->started) SetEvent(p->wake);
     release(p);
 }
 
@@ -418,20 +419,22 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
         goto fail;
     }
     {
-        // Readback may outlive the mpv context. Pin this DLL and its imported
-        // dependencies until process exit so asynchronous cleanup has valid code.
-        HMODULE module;
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-            (LPCWSTR)(uintptr_t)readback, &module)) goto fail;
         if (p->detached) InterlockedExchange64((volatile LONG64 *)&p->shared->producer, p->producer);
     }
     p->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!p->wake) goto fail;
+    // Keep code alive only while the detached worker exists. Windows releases
+    // its module reference atomically with exiting the native thread.
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (LPCWSTR)(uintptr_t)readback, &p->worker_module)) goto fail;
     ajn_sample_lifetime_acquire(&p->lifetime);
-    if (mp_thread_create(&p->thread, readback, p)) {
+    HANDLE thread = CreateThread(NULL, 0, readback, p, 0, NULL);
+    if (!thread) {
+        FreeLibrary(p->worker_module);
         release(p);
         goto fail;
     }
+    CloseHandle(thread);
     p->started = true;
     reset(f);
     state(p, AJN_SAMPLE_IDLE, S_OK);
@@ -446,7 +449,6 @@ fail:
         mp_filter_add_pin(f, MP_PIN_OUT, "out");
         return f;
     }
-    release(p);
     talloc_free(f);
     return NULL;
 }

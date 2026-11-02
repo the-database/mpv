@@ -557,9 +557,6 @@ static void update_depth(struct mp_filter *vf)
                                p->scene && p->rife_on ? 2 : 0));
 }
 
-// (Re)configure the shim for the current stream params and slot. Updates
-// out_params (and thus the output pool geometry). May block on first-play
-// engine builds, like the legacy pipeline.
 // Versioned, path-free signal for the trusted libmpv host. Never forward raw
 // inference logs to addons. Preparation/check modes produce no video frames.
 #define AJN_STREAM_VERSION 1
@@ -574,6 +571,9 @@ static void stream_status(struct mp_filter *vf, const char *state)
             p->rife_on ? 1 : 0, p->fps * (p->rife_on ? (double)p->rife_num / p->rife_den : 1));
 }
 
+// (Re)configure the shim for the current stream params and slot. Updates
+// out_params (and thus the output pool geometry). May block on first-play
+// engine builds, like the legacy pipeline.
 static bool configure_aji(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
@@ -2126,7 +2126,10 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         p->api.current_log = aji_lib_sym(p->api.handle, "aji_current_log");
         if (p->opts->stream_mode) {
             int (*version)(void) = aji_lib_sym(p->api.handle, "aji_stream_policy_version");
-            if (!version || version() != AJN_STREAM_VERSION) {
+            int (*configured_version)(const char *) =
+                aji_lib_sym(p->api.handle, "aji_stream_policy_version_for_config");
+            int policy = configured_version ? configured_version(p->path.conf) : version ? version() : 0;
+            if (policy != AJN_STREAM_VERSION) {
                 MP_ERR(f, "AJN_STREAM_POLICY_UNAVAILABLE\n");
                 goto fail;
             }

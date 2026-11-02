@@ -28,7 +28,7 @@ struct ajn_scene {
     struct ajn_scene_shared *shared;
     HANDLE ready, reply, wake;
     mp_mutex mutex;
-    mp_thread thread;
+    HMODULE worker_module;
     LONG stopping, references;
     bool started, reserved;
     struct scene_job jobs[3];
@@ -139,7 +139,7 @@ void ajn_scene_reset(struct ajn_scene *s)
         InterlockedExchange64((volatile LONG64 *)&s->shared->response_id, 0);
     }
 }
-static MP_THREAD_VOID scene_worker(void *context);
+static DWORD WINAPI scene_worker(void *context);
 
 bool ajn_scene_connect(struct ajn_scene *s, const char *name)
 {
@@ -170,20 +170,26 @@ bool ajn_scene_connect(struct ajn_scene *s, const char *name)
     snprintf(s->name, sizeof(s->name), "%s", name);
     ajn_scene_reset(s);
     s->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
-    HMODULE self;
-    if (!s->wake || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-        GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)(uintptr_t)ajn_scene_connect, &self)) goto fail;
+    if (!s->wake) goto fail;
     if (InterlockedIncrement(&scene_workers) > 4) {
         InterlockedDecrement(&scene_workers); goto fail;
     }
     s->reserved = true;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (LPCWSTR)(uintptr_t)scene_worker, &s->worker_module)) goto fail;
     InterlockedIncrement(&s->references);
-    if (mp_thread_create(&s->thread, scene_worker, s)) {
+    HANDLE thread = CreateThread(NULL, 0, scene_worker, s, 0, NULL);
+    if (!thread) {
         InterlockedDecrement(&s->references); goto fail;
     }
+    CloseHandle(thread);
     s->started = true;
     return true;
 fail:
+    if (s->worker_module) { FreeLibrary(s->worker_module); s->worker_module = NULL; }
+    if (s->reserved) { InterlockedDecrement(&scene_workers); s->reserved = false; }
+    if (s->wake) { CloseHandle(s->wake); s->wake = NULL; }
+    s->name[0] = 0;
     UnmapViewOfFile(s->shared); s->shared = NULL;
     if (s->ready) CloseHandle(s->ready);
     if (s->reply) CloseHandle(s->reply);
@@ -210,7 +216,7 @@ void ajn_scene_destroy(struct ajn_scene *s)
     if (!s) return;
     InterlockedExchange(&s->stopping, 1);
     ajn_scene_reset(s);
-    if (s->started) { SetEvent(s->wake); mp_thread_detach(s->thread); }
+    if (s->started) SetEvent(s->wake);
     scene_release(s);
 }
 static bool sample(struct ajn_scene *s, struct mp_image *image,
@@ -405,9 +411,10 @@ static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
     return -1;
 }
 
-static MP_THREAD_VOID scene_worker(void *context)
+static DWORD WINAPI scene_worker(void *context)
 {
     struct ajn_scene *s = context;
+    HMODULE module = s->worker_module;
     mp_thread_set_name("ajn-scene");
     while (!InterlockedCompareExchange(&s->stopping, 0, 0)) {
         struct scene_job job = {0};
@@ -436,7 +443,7 @@ static MP_THREAD_VOID scene_worker(void *context)
         talloc_free(job.a); talloc_free(job.b);
     }
     scene_release(s);
-    MP_THREAD_RETURN();
+    FreeLibraryAndExitThread(module, 0);
 }
 
 void ajn_scene_submit(struct ajn_scene *s, struct mp_image *a, struct mp_image *b)
