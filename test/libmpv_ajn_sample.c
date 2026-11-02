@@ -11,13 +11,11 @@
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "Failed: %s\n", #x); exit(1); } } while (0)
 #define SYM(name) __typeof__(&mpv_##name) name = (void *)GetProcAddress(module, "mpv_" #name); REQUIRE(name)
 
-int main(int argc, char **argv)
+int main(void)
 {
-    // Separate processes keep FFmpeg's optional ggml dependency from being
-    // reloaded between fixtures. Each fixture still verifies libmpv unloads.
-    REQUIRE(argc == 2);
-    {
-        int valid = atoi(argv[1]);
+    // Fully unload and reload between failure and worker fixtures. A dependency
+    // must not retain a process-wide callback into an unloaded module.
+    for (int valid = 0; valid < 2; valid++) {
         HMODULE module = LoadLibraryW(L"libmpv-2.dll");
         REQUIRE(module);
         SYM(create); SYM(initialize); SYM(set_option_string);
