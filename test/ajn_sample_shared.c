@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
+#undef NDEBUG
 #include <assert.h>
 #include "video/filter/ajn_sample_shared.h"
 

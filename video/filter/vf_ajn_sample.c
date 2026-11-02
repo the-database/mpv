@@ -158,10 +158,12 @@ static int cancelled(void *context)
         read64(&p->shared->producer) != p->producer || !(read64(&p->shared->config) & 0xffffff) : ajn_sample_lifetime_stopping(&p->lifetime);
 }
 
+#if HAVE_CUDA_HWACCEL
 static void analysis_state(void *context, int status)
 {
     state(context, status, S_OK);
 }
+#endif
 
 static DWORD WINAPI readback(void *context)
 {

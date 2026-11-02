@@ -146,6 +146,13 @@ failures are not blanket exemptions:
   builds retain the individual declaration checks.
 - The i686 Wine job installs both loaders so Wine can use the native 64-bit server. A
   32-bit-only server fails its socket initialization in the hosted container before mpv runs.
+  It uses Ubuntu 24.04 because 26.10's i386/amd64 libgphoto2 packages have conflicting files.
+- CUDA-only callbacks are compiled with their callers, and standalone addon tests keep
+  their assertions enabled even in release builds.
+- The Xcode 27 runner rebuilds libarchive from source: its preinstalled dylib targets
+  macOS 27.2 while the runner SDK targets 27.0. Linker warnings remain errors.
+- The scene test stages MVTools beside its executable; the Wine reload test uses the
+  packaged runtime DLL directory. Neither test links the DLL it must unload.
 - `TOOLS/subtest` participates in Python/Lua lint, type checks and pre-commit hooks. Windows
   D3D11 tests declare their platform requirement explicitly.
 
