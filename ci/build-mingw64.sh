@@ -371,7 +371,8 @@ if [ -z "$1" ]; then
     exit 0
 fi
 
-CFLAGS+=" -I'$prefix_dir/include'"
+# GCC 13 with newer MinGW headers otherwise checks fprintf as legacy MS printf.
+CFLAGS+=" -D__USE_MINGW_ANSI_STDIO=1 -I'$prefix_dir/include'"
 LDFLAGS+=" -L'$prefix_dir/lib'"
 export CFLAGS LDFLAGS
 build=mingw_build
