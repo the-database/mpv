@@ -146,9 +146,10 @@ failures are not blanket exemptions:
   builds retain the individual declaration checks.
 - CUDA builds require nv-codec-headers 11.1.5.3 or newer for `cuStreamWaitEvent`.
   MSVC uses the portable release's 13.0.19.0 headers instead of WrapDB's older fallback.
-- The i686 Wine job runs directly on the Ubuntu 24.04 VM. Its 32-bit socket calls fail
+- The i686 Wine job runs directly on the Ubuntu 26.04 VM. Its 32-bit socket calls fail
   in the hosted container before mpv runs; installing both Wine loaders did not fix that.
-  The LTS package set also avoids 26.10's conflicting i386/amd64 libgphoto2 files.
+  This LTS has MinGW 13's 32-bit `ole32` imports for `CoIncrementMTAUsage` and
+  `CoDecrementMTAUsage`; Ubuntu 24.04's MinGW 11 cannot link the WASAPI backend.
   Setup creates the Wine prefix as its current user. Wine will not create it beneath
   another user's directory, such as `/tmp` on the VM or the container's mounted workspace.
 - CUDA-only callbacks are compiled with their callers, and standalone addon tests keep
