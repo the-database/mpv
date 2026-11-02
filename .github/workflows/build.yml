@@ -40,7 +40,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     env:
-      WINEPREFIX: ${{ github.workspace }}/.wine
+      WINEPREFIX: /tmp/wine
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
@@ -72,6 +72,8 @@ jobs:
           "${install_cmd[@]}" apt-get install --no-install-recommends -y ca-certificates ccache cmake g++-mingw-w64 gcc-multilib git make meson nasm ninja-build pkgconf rustup wget xz-utils ${{ matrix.wine }} wine
           rustup default stable
           rustup target add ${{ env.RUST_TARGET }}
+          # Wine requires an existing prefix to belong to its current user.
+          mkdir -p "$WINEPREFIX"
         env:
           DEBIAN_FRONTEND: noninteractive
 
