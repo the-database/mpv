@@ -27,7 +27,7 @@ libavutil = dependency('libavutil', version: '>= 58.29.100')
 libswresample = dependency('libswresample', version: '>= 4.12.100')
 libswscale = dependency('libswscale', version: '>= 7.5.100')
 
-libplacebo = dependency('libplacebo', version: '>=7.360.1',
+libplacebo = dependency('libplacebo', version: '>=7.387.0',
                 default_options: ['default_library=static', 'demos=false'])
 
 libass = dependency('libass', version: '>= 0.12.2')
@@ -476,8 +476,11 @@ features += {'ppoll': cc.has_function('ppoll', args: '-D_GNU_SOURCE',
                                       prefix: '#include <poll.h>')}
 features += {'memrchr': cc.has_function('memrchr', args: '-D_GNU_SOURCE',
                                         prefix: '#include <string.h>')}
+features += {'pipe2': cc.has_function('pipe2', args: '-D_GNU_SOURCE',
+                                      prefix: '#include <unistd.h>')}
 features += {'clone': cc.has_header_symbol('sched.h', 'clone', args: '-D_GNU_SOURCE')}
-features += {'rfork': cc.has_header_symbol('unistd.h', 'rfork_thread')}
+features += {'rfork': cc.has_header_symbol('unistd.h', 'RFSPAWN') and
+                      cc.has_function('rfork_thread', prefix: '#include <unistd.h>')}
 
 # Multithreaded subtitle rendering (libass with ass_set_render_thread_count).
 # Use a compile-only declaration check rather than has_function(): the latter

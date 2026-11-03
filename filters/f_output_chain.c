@@ -79,7 +79,7 @@ struct mp_user_filter {
 
     bool last_is_active;
 
-    int64_t last_in_pts, last_out_pts;
+    double last_in_pts, last_out_pts;
 
     bool failed;
     bool error_eof_sent;
