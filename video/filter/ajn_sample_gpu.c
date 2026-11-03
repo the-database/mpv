@@ -127,12 +127,19 @@ fail:
     return hr;
 }
 
-HRESULT ajn_sample_gpu_read(struct ajn_sample_gpu *p, void *pixels)
+HRESULT ajn_sample_gpu_complete(struct ajn_sample_gpu *p)
 {
     BOOL complete = FALSE;
     HRESULT hr = ID3D11DeviceContext_GetData(p->context, (ID3D11Asynchronous *)p->completed,
         &complete, sizeof(complete), D3D11_ASYNC_GETDATA_DONOTFLUSH);
     if (hr != S_OK || !complete) return FAILED(hr) ? hr : S_FALSE;
+    return S_OK;
+}
+
+HRESULT ajn_sample_gpu_read(struct ajn_sample_gpu *p, void *pixels)
+{
+    HRESULT hr = ajn_sample_gpu_complete(p);
+    if (hr != S_OK) return hr;
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = ID3D11DeviceContext_Map(p->context, (ID3D11Resource *)p->staging, 0,
         D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);

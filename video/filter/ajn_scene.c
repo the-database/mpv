@@ -31,7 +31,9 @@ struct ajn_scene {
     HMODULE worker_module;
     LONG stopping, references;
     bool started, reserved;
-    struct scene_job jobs[3];
+    // At most one waiting pair plus the pair in flight; do not exhaust the
+    // decoder surface pool while an optional detector is slow.
+    struct scene_job jobs[1];
     int job_count, result_next;
     struct scene_result results[8];
     double submitted_pts;
@@ -68,6 +70,9 @@ static void mv_close(struct ajn_scene *s)
 }
 static bool mv_open(struct ajn_scene *s)
 {
+#if !HAVE_GPL
+    return false;
+#else
     if (s->mv_context) return true;
     if (s->mv_load_failed) return false;
     // Fixed trusted installation path. Never load a DLL supplied by an addon,
@@ -94,6 +99,7 @@ static bool mv_open(struct ajn_scene *s)
     if (s->mv_context) return true;
 fail:
     mv_close(s); s->mv_load_failed = true; return false;
+#endif
 }
 static bool enter(struct ajn_scene_shared *s)
 {
@@ -385,8 +391,10 @@ static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
     leave(h);
     SetEvent(s->ready);
     while (!InterlockedCompareExchange(&s->stopping, 0, 0) && (now = GetTickCount64()) < deadline) {
-        WaitForSingleObject(s->reply, (DWORD)(deadline - now));
-        if (!enter(h)) continue;
+        DWORD wait = WaitForSingleObject(s->reply, (DWORD)(deadline - now));
+        // A stale/manual-reset reply must not turn a guest's budget into a
+        // tight CPU loop. This wait is confined to the optional worker.
+        if (!enter(h)) { if (wait == WAIT_OBJECT_0) Sleep(1); continue; }
         if (h->epoch != s->processing_epoch || !h->enabled || h->generation != generation || h->request_id != request) {
             leave(h); return -1;
         }
@@ -398,6 +406,7 @@ static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
             return decision >= -1 && decision <= 1 ? decision : -1;
         }
         leave(h);
+        if (wait == WAIT_OBJECT_0) Sleep(1);
     }
     if (enter(h)) {
         if (h->request_id == request) {

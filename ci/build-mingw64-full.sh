@@ -135,7 +135,7 @@ mpv_args=(
 )
 if $gpl; then
     # Only the GPL image carries the dependencies of the GPL features.
-    mpv_args+=(-D{dvda,dvdnav,rubberband}=enabled)
+    mpv_args+=(-D{dvda,dvdnav,rubberband}=enabled -Dajn-mvtools=true)
 fi
 meson setup build "${mpv_args[@]}"
 meson compile -C build
