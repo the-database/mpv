@@ -885,6 +885,7 @@ static void init_avctx(struct mp_filter *vd)
         MP_ERR(vd, "Frame size too big %" PRIu32 "x%" PRIu32 ".\n", avctx->width, avctx->height);
         goto error;
     }
+    avctx->max_pixels = 2048 * 2048;
 #endif
 
     /* open it */

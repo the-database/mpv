@@ -339,6 +339,10 @@ static int open_f(stream_t *stream)
     stream->seekable = false;
 
     int flags = stream->mode == STREAM_WRITE ? AVIO_FLAG_WRITE : AVIO_FLAG_READ;
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    if (flags & AVIO_FLAG_WRITE)
+        goto out;
+#endif
 
     const char *filename = stream->url;
     if (!filename) {
@@ -386,6 +390,10 @@ static int open_f(stream_t *stream)
     av_dict_set(&dict, "reconnect_delay_max", "7", 0);
 
     mp_setup_av_network_options(&dict, NULL, stream->global, stream->log);
+
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    av_dict_set(&dict, "protocol_blacklist", "fd,pipe", 0);
+#endif
 
     AVIOInterruptCB cb = {
         .callback = interrupt_cb,
