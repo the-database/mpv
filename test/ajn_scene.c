@@ -178,7 +178,7 @@ int main(void)
     h->lease_until_ms = GetTickCount64() + 3000; h->enabled = 0;
     mp_require(!ajn_scene_active(s));
     mp_require(!GetModuleHandleW(L"ajn-mvtools.dll"));
-#if HAVE_GPL
+#if TEST_MVTOOLS
     talloc_free(a); talloc_free(b);
     a = mp_image_alloc(IMGFMT_Y8, 64, 64);
     b = mp_image_alloc(IMGFMT_Y8, 64, 64);
