@@ -123,8 +123,8 @@ typedef struct mkv_track {
     float v_projection_pose_roll;
 
     uint32_t a_channels, a_bps;
-    float a_sfreq;
-    float a_osfreq;
+    double a_sfreq;
+    double a_osfreq;
 
     double default_duration;
     double codec_delay;
@@ -564,16 +564,21 @@ static void parse_trackencodings(struct demuxer *demuxer,
     track->num_encodings = encodings->n_content_encoding;
 }
 
+static bool valid_samplerate(double rate)
+{
+    return rate > 0 && rate <= INT_MAX;
+}
+
 static void parse_trackaudio(struct demuxer *demuxer, struct mkv_track *track,
                              struct ebml_audio *audio)
 {
-    if (audio->n_sampling_frequency) {
+    if (audio->n_sampling_frequency && valid_samplerate(audio->sampling_frequency)) {
         track->a_sfreq = audio->sampling_frequency;
         MP_DBG(demuxer, "|   + Sampling frequency: %f\n", track->a_sfreq);
     } else {
         track->a_sfreq = 8000;
     }
-    if (audio->n_output_sampling_frequency) {
+    if (audio->n_output_sampling_frequency && valid_samplerate(audio->output_sampling_frequency)) {
         track->a_osfreq = audio->output_sampling_frequency;
         MP_DBG(demuxer, "|   + Output sampling frequency: %f\n", track->a_osfreq);
     } else {
@@ -1647,7 +1652,9 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track, int idx)
         extradata = track->private_data + 40;
         extradata_size = track->private_size - 40;
         mp_set_codec_from_tag(sh_v);
-        track->block_dts = true;
+        // The DTS are the PTS if the codec does not reorder frames.
+        const AVCodecDescriptor *desc = avcodec_descriptor_get(mp_codec_to_av_codec_id(sh_v->codec));
+        track->block_dts = !desc || (desc->props & AV_CODEC_PROP_REORDER);
     } else if (track->private_size >= RVPROPERTIES_SIZE
                && (!strcmp(track->codec_id, "V_REAL/RV10")
                 || !strcmp(track->codec_id, "V_REAL/RV20")
@@ -2150,7 +2157,8 @@ static int demux_mkv_open_audio(demuxer_t *demuxer, mkv_track_t *track, int idx)
         AV_WL16(data + 8, sh_a->bits_per_coded_sample);
         AV_WL32(data + 10, track->a_osfreq);
         mkv_demuxer_t *mkv_d = demuxer->priv;
-        AV_WL32(data + 14, mkv_d->duration * track->a_osfreq);
+        double samples = mkv_d->duration * track->a_osfreq;
+        AV_WL32(data + 14, samples > 0 ? MPMIN(samples, UINT32_MAX) : 0);
     } else if (!strcmp(codec, "opus")) {
         // Hardcode the rate libavcodec's opus decoder outputs, so that
         // AV_PKT_DATA_SKIP_SAMPLES actually works. The Matroska header only
@@ -3207,6 +3215,8 @@ static int handle_block(demuxer_t *demuxer, struct block_info *block_info)
                 int64_t padding = av_rescale(block_info->discardpadding,
                                              stream->codec->samplerate,
                                              1000000000);
+                if (padding < -INT_MAX || padding > INT_MAX)
+                    padding = 0;
                 int start = 0, end = 0;
                 if (padding < 0 && i == 0)
                     start = -padding;
@@ -3253,17 +3263,18 @@ static int read_block_group(demuxer_t *demuxer, int64_t end,
 
     while (stream_tell(s) < end) {
         switch (ebml_read_id(s)) {
-        case MATROSKA_ID_BLOCKDURATION:
-            block->duration = ebml_read_uint(s);
-            if (block->duration == EBML_UINT_INVALID)
+        case MATROSKA_ID_BLOCKDURATION:;
+            uint64_t duration;
+            if (!ebml_read_uint(s, &duration))
                 goto error;
-            block->duration *= mkv_d->tc_scale;
-            block->duration_known = true;
+            if (duration <= INT64_MAX / mkv_d->tc_scale) {
+                block->duration = duration * mkv_d->tc_scale;
+                block->duration_known = true;
+            }
             break;
 
         case MATROSKA_ID_DISCARDPADDING:
-            block->discardpadding = ebml_read_int(s);
-            if (block->discardpadding == EBML_INT_INVALID)
+            if (!ebml_read_int(s, &block->discardpadding))
                 goto error;
             break;
 
@@ -3273,8 +3284,8 @@ static int read_block_group(demuxer_t *demuxer, int64_t end,
             break;
 
         case MATROSKA_ID_REFERENCEBLOCK:;
-            int64_t num = ebml_read_int(s);
-            if (num == EBML_INT_INVALID)
+            int64_t num;
+            if (!ebml_read_int(s, &num))
                 goto error;
             block->keyframe = false;
             break;
@@ -3322,8 +3333,9 @@ static int read_next_block_into_queue(demuxer_t *demuxer)
             int64_t start_filepos = stream_tell(s);
             switch (ebml_read_id(s)) {
             case MATROSKA_ID_TIMECODE: {
-                uint64_t num = ebml_read_uint(s);
-                if (num == EBML_UINT_INVALID)
+                uint64_t num;
+                // Block timestamps add up to INT16_MAX ticks to this.
+                if (!ebml_read_uint(s, &num) || num > INT64_MAX / mkv_d->tc_scale - INT16_MAX)
                     goto find_next_cluster;
                 mkv_d->cluster_tc = num * mkv_d->tc_scale;
                 break;

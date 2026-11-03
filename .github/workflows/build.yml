@@ -59,7 +59,10 @@ jobs:
             wine: wine32
           - arch: x86_64
             runner: ubuntu-latest
-            container: ubuntu:26.10
+            container:
+              image: ubuntu:26.10
+              # https://github.com/actions/runner-images/issues/14790
+              options: --security-opt seccomp=unconfined
             wine: wine64
     steps:
       - name: Install dependencies
@@ -394,8 +397,10 @@ jobs:
           if brew list ffmpeg &> /dev/null; then brew unlink ffmpeg; fi
           if brew list openssl@1.1 &> /dev/null; then brew rm openssl@1.1; fi
           brew install -q autoconf automake curl pkgconf libtool python freetype fribidi little-cms2 \
-            luajit libass ffmpeg-full meson rust uchardet mujs libplacebo molten-vk vulkan-loader vulkan-headers \
+            luajit libass meson rust uchardet mujs molten-vk vulkan-loader vulkan-headers \
             libarchive libbluray libcaca libcdio-paranoia libdvdnav libdvdread libsixel rubberband vapoursynth zimg
+          brew install -q --HEAD libplacebo
+          brew install -q --HEAD ffmpeg-full
           brew link ffmpeg-full
 
       - name: Rebuild libarchive for the runner SDK
@@ -581,7 +586,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Start OpenBSD VM
-        uses: cross-platform-actions/action@v1.6.0
+        uses: cross-platform-actions/action@v1.7.0
         with:
           operating_system: openbsd
           version: '7.8'
@@ -651,7 +656,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Start FreeBSD VM
-        uses: cross-platform-actions/action@v1.6.0
+        uses: cross-platform-actions/action@v1.7.0
         with:
           operating_system: freebsd
           version: '15.1'
@@ -662,7 +667,7 @@ jobs:
           sudo pkg update
           sudo pkg install -y \
               alsa-lib \
-              cmake \
+              cmake-core \
               curl \
               evdev-proto \
               ffmpeg \
