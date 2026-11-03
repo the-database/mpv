@@ -13,8 +13,14 @@ struct output {
     int (*write)(void *, int64_t, const uint8_t *, int);
     int64_t (*seek)(void *, int64_t, int64_t, int);
     int (*close)(void *, int64_t);
+    struct output_file *files;
 };
-struct output_file { struct output *owner; int64_t handle; };
+struct output_file {
+    struct output *owner;
+    int64_t handle;
+    AVIOContext *io;
+    struct output_file *next;
+};
 #if LIBAVFORMAT_VERSION_MAJOR < 61
 static int write_packet(void *opaque, uint8_t *data, int size)
 #else
@@ -42,6 +48,9 @@ static int open_output(AVFormatContext *format, AVIOContext **pb,
     if (file->handle <= 0) { av_free(file); av_free(buffer); return AVERROR(EIO); }
     *pb = avio_alloc_context(buffer, 32768, 1, file, NULL, write_packet, seek_packet);
     if (!*pb) { out->close(out->opaque, file->handle); av_free(file); av_free(buffer); return AVERROR(ENOMEM); }
+    file->io = *pb;
+    file->next = out->files;
+    out->files = file;
     return 0;
 }
 static int close_output(AVFormatContext *format, AVIOContext *pb)
@@ -50,6 +59,9 @@ static int close_output(AVFormatContext *format, AVIOContext *pb)
     avio_flush(pb);
     int error = pb->error;
     int closed = file->owner->close(file->owner->opaque, file->handle);
+    struct output_file **entry = &file->owner->files;
+    while (*entry != file) entry = &(*entry)->next;
+    *entry = file->next;
     av_free(file); av_freep(&pb->buffer); avio_context_free(&pb);
     return error < 0 ? error : closed;
 }
@@ -76,7 +88,8 @@ MPV_EXPORT int mpv_ajn_mux_v1(void *opaque,
     AVPacket *packet = av_packet_alloc();
     uint8_t *buffer = av_malloc(32768);
     AVIOContext *io = buffer ? avio_alloc_context(buffer, 32768, 0, opaque, read_packet, NULL, NULL) : NULL;
-    struct output callbacks = {opaque, open_file, write_file, seek_file, close_file};
+    struct output callbacks = {.opaque = opaque, .open = open_file,
+        .write = write_file, .seek = seek_file, .close = close_file};
     if (!io) av_free(buffer);
     if (!io || !packet) goto done;
     io->seekable = 0;
@@ -174,6 +187,12 @@ done:
             if (result >= 0 && close_error < 0) result = close_error;
         }
         avformat_free_context(output);
+    }
+    // HLS deinit does not close an in-progress media segment on cancellation
+    // or write failure. Close every callback-owned file even without a trailer.
+    while (callbacks.files) {
+        int close_error = close_output(NULL, callbacks.files->io);
+        if (result >= 0 && close_error < 0) result = close_error;
     }
     avformat_close_input(&input);
     if (io) { av_freep(&io->buffer); avio_context_free(&io); }

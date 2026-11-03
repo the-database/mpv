@@ -203,7 +203,8 @@ static DWORD WINAPI readback(void *context)
                 p->gpu_us = gpu_ms * 1000;
             } else
 #endif
-                hr = ajn_sample_gpu_read(p->gpu, p->scratch);
+                hr = p->failed ? ajn_sample_gpu_complete(p->gpu) :
+                    ajn_sample_gpu_read(p->gpu, p->scratch);
             if (FAILED(hr)) {
                 // Preserve the source until completion or confirmed device
                 // removal. Player retirement cannot free a decoder-pool image
@@ -217,7 +218,7 @@ static DWORD WINAPI readback(void *context)
                 if (p->detached && FAILED(ID3D11Device_GetDeviceRemovedReason(p->device)))
                     TA_FREEP(&p->pending);
             } else if (hr == S_OK) {
-                if (p->pending_config == read64(&p->shared->config) &&
+                if (!p->failed && p->pending_config == read64(&p->shared->config) &&
                     p->pending_epoch == read64(&p->shared->epoch)) publish(p);
                 else drop(p);
                 TA_FREEP(&p->pending);
@@ -230,7 +231,7 @@ static DWORD WINAPI readback(void *context)
         }
         bool poll = p->pending && (!p->failed || p->detached);
         mp_mutex_unlock(&p->lock);
-        WaitForSingleObject(p->wake, poll ? (retired_at && GetTickCount64() - retired_at > 250 ? 100 : 1) : (p->detached ? 500 : INFINITE));
+        WaitForSingleObject(p->wake, poll ? (p->failed || (retired_at && GetTickCount64() - retired_at > 250) ? 100 : 1) : (p->detached ? 500 : INFINITE));
     }
     release(p);
     FreeLibraryAndExitThread(module, 0);
@@ -244,7 +245,11 @@ static void sample(struct mp_filter *f, struct mp_image *image)
     int64_t config = read64(&p->shared->config);
     if (!ajn_sample_config(config, &width, &height, &fps) ||
         (p->detached && read64(&p->shared->lease_until_ms) <= (int64_t)GetTickCount64())) {
-        state(p, AJN_SAMPLE_IDLE, S_OK);
+        if (!mp_mutex_trylock(&p->lock)) {
+            if (!p->pending && config == read64(&p->shared->config))
+                state(p, AJN_SAMPLE_IDLE, S_OK);
+            mp_mutex_unlock(&p->lock);
+        }
         return;
     }
     int64_t now = mp_time_ns();
@@ -412,7 +417,7 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
         if (p->shared) p->mask = calloc(AJN_SAMPLE_WIDTH * AJN_SAMPLE_HEIGHT, sizeof(uint16_t));
         if (!p->mask && p->shared) { UnmapViewOfFile(p->shared); p->shared = NULL; }
     }
-    if (p->detached) CloseHandle(mapping);
+    CloseHandle(mapping);
     if (!p->shared) goto fail;
     if (p->shared->magic != AJN_SAMPLE_MAGIC || p->shared->version != (p->mask ? 2 : AJN_SAMPLE_VERSION) ||
         p->shared->capacity != AJN_SAMPLE_BYTES + (p->mask ? AJN_SAMPLE_BYTES / 2 : 0) || p->shared->header_bytes != 256) {

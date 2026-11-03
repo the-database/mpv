@@ -1447,10 +1447,17 @@ if features['cuda-hwaccel']
                      'video/out/hwdec/hwdec_cuda.c')
     if win32
         sources += files('video/filter/ajn_scene.c', 'video/filter/ajn_sample_cuda.c')
-        if get_option('gpl')
+        if get_option('ajn-mvtools')
+            if not get_option('gpl')
+                error('ajn-mvtools requires a GPL build')
+            endif
             subdir('video/filter/mvtools')
         endif
     endif
+endif
+
+if get_option('ajn-mvtools') and not (win32 and features['cuda-hwaccel'])
+    error('ajn-mvtools requires Windows and cuda-hwaccel')
 endif
 
 cuda_interop = get_option('cuda-interop').require(

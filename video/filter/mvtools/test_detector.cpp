@@ -264,6 +264,11 @@ static void repeated_frames() {
     }
 }
 int main(int argc, char **argv) {
+    // Containers may carry values outside the declared 9–15-bit range.
+    // The enhanced histogram always has 32 bins of eight 8-bit levels.
+    Image oversized(64, 64, 10, false, 0);
+    oversized.fill(0, 65535);
+    require(enhanced::pixel(oversized.f, 0, 0) == 255, "out-of-range samples saturate before histogram indexing");
     corner_order();
     patch_tracking();
     regional_motion();

@@ -16,4 +16,6 @@ HRESULT ajn_sample_gpu_submit(struct ajn_sample_gpu *gpu, ID3D11Texture2D *sourc
 // Never waits for the GPU. The caller must retain the source until success or
 // device removal; a failed sample must not return a still-used texture to a pool.
 HRESULT ajn_sample_gpu_read(struct ajn_sample_gpu *gpu, void *pixels);
+// Completion only: drain a failed sample without retrying its failed Map.
+HRESULT ajn_sample_gpu_complete(struct ajn_sample_gpu *gpu);
 void ajn_sample_gpu_destroy(struct ajn_sample_gpu *gpu);
