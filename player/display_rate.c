@@ -50,6 +50,9 @@ void mp_probe_display_rates(struct demuxer *demux, int stream_flags)
                                           demux->cancel, demux->global);
     if (!probe)
         return;
+    // Payload skipping can seek once per frame. Keep those private stream
+    // messages out of verbose support logs; scan summaries use the real demuxer.
+    probe->stream->log = mp_null_log;
     if (params.probe_timestamps) {
         // Headers are tiny. The playback-sized read/skip buffer otherwise
         // reads most compressed frame payloads even when seeking past them.
@@ -114,7 +117,7 @@ void mp_probe_display_rates(struct demuxer *demux, int stream_flags)
             }
         }
     } else {
-        MP_VERBOSE(demux, "Display refresh scan incomplete; leaving display refresh unchanged.\n");
+        MP_VERBOSE(demux, "Display refresh scan incomplete; no verified refresh match.\n");
     }
     MP_VERBOSE(demux, "Display refresh scan took %.3f seconds.\n",
                mp_time_sec() - started);
