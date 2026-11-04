@@ -6788,7 +6788,7 @@ them.
     Schedule each frame to be presented for this number of VBlank intervals.
     (default: 1) Setting to 1 will enable VSync, setting to 0 will disable it.
 
-``--d3d11-adapter=<adapter name|help>``
+``--d3d11-adapter=<adapter name|pci:bus:device.function|help>``
     Select a specific D3D11 adapter to utilize for D3D11 rendering.
     Will pick the default adapter if unset. Alternatives are listed
     when the name "help" is given.
@@ -6796,6 +6796,11 @@ them.
     Checks for matches based on the start of the string, case
     insensitive. Thus, if the description of the adapter starts with
     the vendor name, that can be utilized as the selection parameter.
+
+    ``pci:`` followed by a PCI slot in hex, as ``help`` lists it (e.g.
+    ``pci:03:00.0``), selects the adapter in that slot instead. This tells
+    identical cards apart, and doesn't match a different card whose name
+    starts the same way.
 
     Hardware decoders utilizing the D3D11 rendering abstraction's helper
     functionality to receive a device, such as D3D11VA or DXVA2's DXGI
