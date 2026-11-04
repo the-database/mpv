@@ -492,6 +492,45 @@ bool mp_dxgi_list_or_verify_adapters(struct mp_log *log,
 // Create a Direct3D 11 device for rendering and presentation. This is meant to
 // reduce boilerplate in backends that D3D11, while also making sure they share
 // the same device creation logic and log the same information.
+// The first hardware adapter in the order of a GPU preference
+// (DXGI_GPU_PREFERENCE_MINIMUM_POWER or _HIGH_PERFORMANCE), or NULL if Windows
+// can't rank adapters (IDXGIFactory6 needs Windows 10 1803).
+static IDXGIAdapter1 *get_preferred_adapter(struct mp_log *log, int preference)
+{
+    PFN_CREATE_DXGI_FACTORY pCreateDXGIFactory1 = get_CreateDXGIFactory1();
+    IDXGIFactory6 *factory = NULL;
+    if (!pCreateDXGIFactory1 ||
+        FAILED(pCreateDXGIFactory1(&IID_IDXGIFactory6, (void **)&factory)))
+    {
+        mp_verbose(log, "Adapters can't be ranked by GPU preference here; "
+                        "using the default adapter.\n");
+        return NULL;
+    }
+
+    IDXGIAdapter1 *picked = NULL;
+    for (UINT i = 0; !picked; i++) {
+        IDXGIAdapter1 *adapter = NULL;
+        if (FAILED(IDXGIFactory6_EnumAdapterByGpuPreference(factory, i,
+                       preference, &IID_IDXGIAdapter1, (void **)&adapter)))
+            break;
+        DXGI_ADAPTER_DESC1 desc;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(adapter, &desc)) &&
+            !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+        {
+            char *name = mp_to_utf8(NULL, desc.Description);
+            mp_verbose(log, "Using adapter '%s' (%s GPU preference).\n", name,
+                       preference == DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE ?
+                       "high-performance" : "minimum-power");
+            talloc_free(name);
+            picked = adapter;
+        } else {
+            SAFE_RELEASE(adapter);
+        }
+    }
+    SAFE_RELEASE(factory);
+    return picked;
+}
+
 bool mp_d3d11_create_present_device(struct mp_log *log,
                                     struct d3d11_device_opts *opts,
                                     ID3D11Device **dev_out)
@@ -516,6 +555,9 @@ bool mp_d3d11_create_present_device(struct mp_log *log,
                      "Will fall back to the default adapter.\n",
                  adapter_name);
     }
+
+    if (!adapter && opts->adapter_preference != DXGI_GPU_PREFERENCE_UNSPECIFIED)
+        adapter = get_preferred_adapter(log, opts->adapter_preference);
 
     // Return here to retry creating the device
     do {

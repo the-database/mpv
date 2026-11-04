@@ -37,6 +37,7 @@ struct d3d11_opts {
     bool flip;
     int sync_interval;
     char *adapter_name;
+    int adapter_preference;
     int output_format;
     int color_space;
     bool exclusive_fs;
@@ -68,6 +69,12 @@ const struct m_sub_options d3d11_conf = {
         {"d3d11-sync-interval", OPT_INT(sync_interval), M_RANGE(0, 4)},
         {"d3d11-adapter",
             OPT_STRING_VALIDATE(adapter_name, mp_dxgi_validate_adapter),
+            .flags = UPDATE_VO,
+        },
+        {"d3d11-adapter-preference", OPT_CHOICE(adapter_preference,
+            {"default", DXGI_GPU_PREFERENCE_UNSPECIFIED},
+            {"minimum-power", DXGI_GPU_PREFERENCE_MINIMUM_POWER},
+            {"high-performance", DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE}),
             .flags = UPDATE_VO,
         },
         {"d3d11-output-format", OPT_CHOICE(output_format,
@@ -565,6 +572,7 @@ static bool d3d11_init(struct ra_ctx *ctx)
         .max_feature_level = p->opts->feature_level,
         .max_frame_latency = ctx->vo->opts->swapchain_depth,
         .adapter_name = p->opts->adapter_name,
+        .adapter_preference = p->opts->adapter_preference,
     };
     if (!mp_d3d11_create_present_device(ctx->log, &dopts, &p->device))
         goto error;
