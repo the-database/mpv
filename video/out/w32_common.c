@@ -798,9 +798,12 @@ static int match_display_rate(struct vo_w32_state *w32, struct mp_display_rate *
     if (score < 0) {
         // A playlist entry with unknown timing must not inherit the previous
         // entry's matched mode. Leave an unmodified desktop alone.
-        if (w32->rate_owned)
-            restore_display_rate(w32);
-        return VO_FALSE;
+        if (!w32->rate_owned)
+            return VO_FALSE;
+        if (!rate->apply)
+            return VO_TRUE; // core pauses the clocks before restoring
+        restore_display_rate(w32);
+        return VO_TRUE; // allow the configured display settling delay
     }
 
     // Change only refresh; enumerated modes must not move a secondary monitor
