@@ -8837,8 +8837,10 @@ static void uninit(struct vo *vo)
         pl_buf_destroy(p->gpu, &p->edge_stage[i]);
         pl_buf_destroy(p->gpu, &p->work_stage[i]);
     }
+#if HAVE_ASS_COMPOSITE_DEFERRED
     stream_ring_destroy(p, &p->gather_stream);
     stream_ring_destroy(p, &p->raster_stream);
+#endif
     for (int i = 0; i < 3; i++)
         pl_buf_destroy(p->gpu, &p->glyph_stage[i]);
     for (int i = 0; i < NUM_OVERLAY_BUFS; i++)
