@@ -79,11 +79,17 @@ int main(void) {
     assert(match_display_rate(&w32, &unknown) == VO_FALSE);
     assert(desktop.dmDisplayFrequency == 60 && changes == 0 && !w32.rate_owned);
 
-    // A known episode matches 23.976; an unknown next episode restores 60.
+    // Querying an unknown next episode must leave the matched mode alone
+    // while the core pauses playback and shows the refresh notice.
     assert(match_display_rate(&w32, &known) == VO_TRUE);
     assert(desktop.dmDisplayFrequency == 23 && w32.rate_owned && changes == 1);
-    assert(match_display_rate(&w32, &unknown) == VO_FALSE);
+    assert(match_display_rate(&w32, &unknown) == VO_TRUE);
+    assert(desktop.dmDisplayFrequency == 23 && w32.rate_owned && changes == 1);
+    // Only the apply call restores 60; VO_TRUE requests the settling hold.
+    unknown.apply = true;
+    assert(match_display_rate(&w32, &unknown) == VO_TRUE);
     assert(desktop.dmDisplayFrequency == 60 && !w32.rate_owned && changes == 2);
+    unknown.apply = false;
     assert(match_display_rate(&w32, &unknown) == VO_FALSE);
     assert(changes == 2);
 
@@ -93,7 +99,7 @@ int main(void) {
     assert(match_display_rate(&w32, &unknown) == VO_FALSE);
     assert(desktop.dmDisplayFrequency == 48 && changes == 3);
     assert(!w32.rate_owned && w32.rate_blocked);
-    puts("PASS unknown first file; playlist restore; manual display change");
+    puts("PASS unknown first file; two-step playlist restore; manual display change");
 }
 """
 
