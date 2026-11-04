@@ -6801,6 +6801,25 @@ them.
     functionality to receive a device, such as D3D11VA or DXVA2's DXGI
     mode, will be affected by this choice.
 
+``--d3d11-adapter-preference=<default|minimum-power|high-performance>``
+    Pick the D3D11 adapter by GPU type when ``--d3d11-adapter`` is unset or
+    names no adapter. On a PC with more than one GPU, such as a laptop with
+    integrated and discrete graphics, ``minimum-power`` prefers the integrated
+    GPU and ``high-performance`` the discrete or external one, as Windows
+    ranks them. Hardware decoders that receive their device from the D3D11
+    renderer follow the choice.
+
+    default
+        Use the default adapter: the GPU driving the main display, unless
+        Windows' per-app graphics settings choose another. (Default)
+    minimum-power
+        Prefer the lowest-power GPU.
+    high-performance
+        Prefer the highest-performance GPU.
+
+    Needs Windows 10 version 1803 or newer; older versions use the default
+    adapter.
+
 ``--d3d11-output-format=<auto|rgba8|bgra8|rgb10_a2|rgba16f>``
     Select a specific D3D11 output format to utilize for D3D11 rendering.
     "auto" is the default, which will pick either rgba8 or rgb10_a2 depending

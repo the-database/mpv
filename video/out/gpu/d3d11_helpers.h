@@ -60,6 +60,11 @@ struct d3d11_device_opts {
     // If unset, the default adapter will be utilized when creating
     // a device.
     char *adapter_name;
+
+    // The GPU preference (a DXGI_GPU_PREFERENCE) used to pick the adapter when
+    // adapter_name is unset or not found. 0 (unspecified) keeps the default
+    // adapter.
+    int adapter_preference;
 };
 
 struct mp_dxgi_factory_ctx {
