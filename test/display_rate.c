@@ -111,9 +111,10 @@ int main(void)
     const unsigned fractional[] = {120, 143, 119, 144};
     assert(choose_rate(rate, common, 3) == 120);
     assert(fabs(choose_rate(rate, fractional, 4) - 120000.0 / 1001) < 0.001);
-    // A missing/incomplete profile, unlike measured VFR, still uses maximum Hz.
-    assert(choose(0, tv, 8) == 60);
-    assert(choose(0, integer_modes, 10) == 144);
+    // A timed-out scan must not replace a correct 23.976 Hz desktop with 60 Hz
+    // merely because the whole-file timing could not be verified.
+    assert(choose(0, tv, 8) == 0);
+    assert(choose(0, integer_modes, 10) == 0);
 
     double t = 0;
     for (int n = 0; n < 600; n++) {
@@ -167,6 +168,6 @@ int main(void)
     assert(mp_display_rate_score(rate, 144) > mp_display_rate_score(rate, 60));
     assert(mp_display_rate_section(cadences, rate.num_cadences, 0) == -1);
     assert(mp_display_rate_section(cadences, rate.num_cadences, pts[599]) == -1);
-    puts("PASS CFR sections and seeks; whole-file CFR/VFR; rounded/reordered PTS; common multiples; duration-weighted selection; unknown fallback; playback scale");
+    puts("PASS CFR sections and seeks; whole-file CFR/VFR; rounded/reordered PTS; common multiples; duration-weighted selection; unknown preserves display; playback scale");
     return 0;
 }
