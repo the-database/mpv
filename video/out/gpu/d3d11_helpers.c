@@ -385,7 +385,8 @@ struct pci_slot { UINT bus, device, function; };
 // it tells identical cards apart.
 static bool adapter_pci_slot(LUID luid, struct pci_slot *slot)
 {
-    return kmt_query(luid, 6, slot, sizeof(*slot));
+    // all ones: an adapter that isn't on PCI (e.g. the software renderer)
+    return kmt_query(luid, 6, slot, sizeof(*slot)) && slot->bus != 0xffffffff;
 }
 
 // An indirect-display adapter: a virtual monitor (IddCx drivers such as
