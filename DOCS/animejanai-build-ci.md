@@ -11,7 +11,10 @@ repos. Neither is built on a dev machine.
 | Windows | `the-database/mpv-winbuild`, workflow `MPV` | `mpv-x86_64-<date>-git-<hash>.7z` + `mpv-dev-...7z` |
 
 Both are consumed by `the-database/mpv-AnimeJaNai`'s assembler, pinned by
-`MpvForkLinuxVersion` and `MpvForkVersion`/`MpvForkBuildDate`/`MpvForkGitHash`.
+`MpvForkLinuxVersion` and `MpvForkVersion`/`MpvForkBuildDate`/`MpvForkGitHash`. A dispatched
+Linux build ends by asking mpv-AnimeJaNai for a `MpvForkLinuxVersion` bump PR
+(`notify-downstream.yml`; needs the `JANAI_BUMP_TOKEN` secret); the winbuild run does the same
+for the Windows pins.
 
 ## Linux: `Build Linux (portable mpv + vf_animejanai)`
 
