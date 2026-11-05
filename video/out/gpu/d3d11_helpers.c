@@ -348,6 +348,69 @@ static int get_feature_levels(int max_fl, int min_fl,
     return len;
 }
 
+// D3DKMTQueryAdapterInfo for the adapter `luid`; false if anything fails. The
+// structs mirror d3dkmthk.h (which needs the driver kit's NTSTATUS headers),
+// and the calls resolve from gdi32 at runtime.
+static bool kmt_query(LUID luid, UINT type, void *data, UINT size)
+{
+    struct kmt_open { LUID luid; UINT handle; };
+    struct kmt_info { UINT handle; UINT type; void *data; UINT size; };
+    struct kmt_close { UINT handle; };
+    typedef LONG (APIENTRY *open_fn)(struct kmt_open *);
+    typedef LONG (APIENTRY *query_fn)(const struct kmt_info *);
+    typedef LONG (APIENTRY *close_fn)(const struct kmt_close *);
+
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi)
+        return false;
+    open_fn kmt_open_adapter = (open_fn)(void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid");
+    query_fn kmt_query_info = (query_fn)(void *)GetProcAddress(gdi, "D3DKMTQueryAdapterInfo");
+    close_fn kmt_close_adapter = (close_fn)(void *)GetProcAddress(gdi, "D3DKMTCloseAdapter");
+    if (!kmt_open_adapter || !kmt_query_info || !kmt_close_adapter)
+        return false;
+    struct kmt_open o = { .luid = luid };
+    if (kmt_open_adapter(&o) != 0)
+        return false;
+    struct kmt_info q = { o.handle, type, data, size };
+    bool ok = kmt_query_info(&q) == 0;
+    struct kmt_close c = { o.handle };
+    kmt_close_adapter(&c);
+    return ok;
+}
+
+struct pci_slot { UINT bus, device, function; };
+
+// The adapter's PCI slot (KMTQAITYPE_ADAPTERADDRESS). Unlike its LUID, the
+// slot stays the same across reboots and driver restarts, and unlike its name
+// it tells identical cards apart.
+static bool adapter_pci_slot(LUID luid, struct pci_slot *slot)
+{
+    // all ones: an adapter that isn't on PCI (e.g. the software renderer)
+    return kmt_query(luid, 6, slot, sizeof(*slot)) && slot->bus != 0xffffffff;
+}
+
+// An indirect-display adapter: a virtual monitor (IddCx drivers such as
+// Parsec's). DXGI lists one per virtual display, each describing the GPU that
+// renders for it, so they're skipped when matching by PCI slot.
+static bool adapter_is_indirect_display(LUID luid)
+{
+    UINT type = 0; // D3DKMT_ADAPTERTYPE (KMTQAITYPE_ADAPTERTYPE)
+    return kmt_query(luid, 15, &type, sizeof(type)) && (type & (1u << 6));
+}
+
+// "pci:<bus>:<device>.<function>", in hex as lspci prints it (e.g. pci:03:00.0).
+static bool parse_pci_slot(bstr name, struct pci_slot *slot)
+{
+    if (!bstr_case_startswith(name, bstr0("pci:")))
+        return false;
+    char *s = bstrto0(NULL, bstr_cut(name, 4));
+    int end = 0;
+    bool ok = sscanf(s, "%x:%x.%x%n", &slot->bus, &slot->device,
+                     &slot->function, &end) == 3 && s[end] == '\0';
+    talloc_free(s);
+    return ok;
+}
+
 IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
                                    bstr requested_adapter_name,
                                    bstr *listing)
@@ -355,6 +418,8 @@ IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
     HRESULT hr = S_OK;
     IDXGIFactory1 *factory;
     IDXGIAdapter1 *picked_adapter = NULL;
+    struct pci_slot requested_slot = {0};
+    bool by_slot = parse_pci_slot(requested_adapter_name, &requested_slot);
 
     PFN_CREATE_DXGI_FACTORY pCreateDXGIFactory1 = get_CreateDXGIFactory1();
     if (!pCreateDXGIFactory1) {
@@ -392,16 +457,32 @@ IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
 
         adapter_description = mp_to_utf8(NULL, desc.Description);
 
+        struct pci_slot slot;
+        bool has_slot = adapter_pci_slot(desc.AdapterLuid, &slot);
+
         if (listing) {
             bstr_xappend_asprintf(NULL, listing,
-                                  "Adapter %u: vendor: %u, description: %s\n",
+                                  "Adapter %u: vendor: %u, description: %s",
                                   adapter_num, desc.VendorId,
                                   adapter_description);
+            if (has_slot && !adapter_is_indirect_display(desc.AdapterLuid)) {
+                bstr_xappend_asprintf(NULL, listing, ", slot: pci:%02x:%02x.%x",
+                                      slot.bus, slot.device, slot.function);
+            }
+            bstr_xappend_asprintf(NULL, listing, "\n");
         }
 
-        if (requested_adapter_name.len &&
-            bstr_case_startswith(bstr0(adapter_description),
-                                 requested_adapter_name))
+        if (by_slot) {
+            if (has_slot && slot.bus == requested_slot.bus &&
+                slot.device == requested_slot.device &&
+                slot.function == requested_slot.function &&
+                !adapter_is_indirect_display(desc.AdapterLuid))
+            {
+                picked_adapter = adapter;
+            }
+        } else if (requested_adapter_name.len &&
+                   bstr_case_startswith(bstr0(adapter_description),
+                                        requested_adapter_name))
         {
             picked_adapter = adapter;
         }
@@ -492,6 +573,45 @@ bool mp_dxgi_list_or_verify_adapters(struct mp_log *log,
 // Create a Direct3D 11 device for rendering and presentation. This is meant to
 // reduce boilerplate in backends that D3D11, while also making sure they share
 // the same device creation logic and log the same information.
+// The first hardware adapter in the order of a GPU preference
+// (DXGI_GPU_PREFERENCE_MINIMUM_POWER or _HIGH_PERFORMANCE), or NULL if Windows
+// can't rank adapters (IDXGIFactory6 needs Windows 10 1803).
+static IDXGIAdapter1 *get_preferred_adapter(struct mp_log *log, int preference)
+{
+    PFN_CREATE_DXGI_FACTORY pCreateDXGIFactory1 = get_CreateDXGIFactory1();
+    IDXGIFactory6 *factory = NULL;
+    if (!pCreateDXGIFactory1 ||
+        FAILED(pCreateDXGIFactory1(&IID_IDXGIFactory6, (void **)&factory)))
+    {
+        mp_verbose(log, "Adapters can't be ranked by GPU preference here; "
+                        "using the default adapter.\n");
+        return NULL;
+    }
+
+    IDXGIAdapter1 *picked = NULL;
+    for (UINT i = 0; !picked; i++) {
+        IDXGIAdapter1 *adapter = NULL;
+        if (FAILED(IDXGIFactory6_EnumAdapterByGpuPreference(factory, i,
+                       preference, &IID_IDXGIAdapter1, (void **)&adapter)))
+            break;
+        DXGI_ADAPTER_DESC1 desc;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(adapter, &desc)) &&
+            !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+        {
+            char *name = mp_to_utf8(NULL, desc.Description);
+            mp_verbose(log, "Using adapter '%s' (%s GPU preference).\n", name,
+                       preference == DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE ?
+                       "high-performance" : "minimum-power");
+            talloc_free(name);
+            picked = adapter;
+        } else {
+            SAFE_RELEASE(adapter);
+        }
+    }
+    SAFE_RELEASE(factory);
+    return picked;
+}
+
 bool mp_d3d11_create_present_device(struct mp_log *log,
                                     struct d3d11_device_opts *opts,
                                     ID3D11Device **dev_out)
@@ -516,6 +636,9 @@ bool mp_d3d11_create_present_device(struct mp_log *log,
                      "Will fall back to the default adapter.\n",
                  adapter_name);
     }
+
+    if (!adapter && opts->adapter_preference != DXGI_GPU_PREFERENCE_UNSPECIFIED)
+        adapter = get_preferred_adapter(log, opts->adapter_preference);
 
     // Return here to retry creating the device
     do {
