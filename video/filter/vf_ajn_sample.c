@@ -99,6 +99,7 @@ static bool color_supported(struct priv *p, const struct mp_image *image)
     case PL_COLOR_TRC_SRGB: p->transfer = AJN_TRC_SRGB; break;
     case PL_COLOR_TRC_GAMMA22: p->transfer = AJN_TRC_G22; break;
     case PL_COLOR_TRC_GAMMA24: p->transfer = AJN_TRC_G24; break;
+    case PL_COLOR_TRC_GAMMA28: p->transfer = AJN_TRC_G28; break;
     default: return false;
     }
     return !(image->fields & MP_IMGFIELD_INTERLACED) && q->stereo3d == 0;
