@@ -45,7 +45,7 @@ enum ajn_sample_status {
     AJN_SAMPLE_LOADING, AJN_SAMPLE_MODEL_MISSING, AJN_SAMPLE_BUILDING,
 };
 enum ajn_sample_primaries { AJN_PRIM_709 = 1, AJN_PRIM_601_525, AJN_PRIM_601_625 };
-enum ajn_sample_transfer { AJN_TRC_1886 = 1, AJN_TRC_SRGB, AJN_TRC_G22, AJN_TRC_G24 };
+enum ajn_sample_transfer { AJN_TRC_1886 = 1, AJN_TRC_SRGB, AJN_TRC_G22, AJN_TRC_G24, AJN_TRC_G28 };
 
 _Static_assert(offsetof(struct ajn_sample_shared, config) == 16, "config ABI");
 _Static_assert(offsetof(struct ajn_sample_shared, sequence) == 32, "sequence ABI");
