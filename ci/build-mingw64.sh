@@ -173,7 +173,7 @@ _dav1d () {
     [ -d dav1d ] || $gitclone https://code.videolan.org/videolan/dav1d.git
     builddir dav1d
     meson setup .. --cross-file "$prefix_dir/crossfile" \
-        -Denable_{tools,tests}=false
+        -Denable_{tools,tests}=false || { cat meson-logs/meson-log.txt; return 1; }
     makeplusinstall
     popd
 }
@@ -371,7 +371,9 @@ if [ -z "$1" ]; then
     exit 0
 fi
 
-CFLAGS+=" -I'$prefix_dir/include'"
+# GCC <14 ignores MinGW's fprintf format annotation (GCC PR 95130).
+# Keep format checking through the C99 header declaration, not that builtin.
+CFLAGS+=" -D__USE_MINGW_ANSI_STDIO=1 -fno-builtin-fprintf -I'$prefix_dir/include'"
 LDFLAGS+=" -L'$prefix_dir/lib'"
 export CFLAGS LDFLAGS
 build=mingw_build

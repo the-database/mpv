@@ -116,6 +116,31 @@ test('json', json)
 linked_list = executable('linked-list', files('linked_list.c'), include_directories: incdir)
 test('linked-list', linked_list)
 
+ajn_sample_shared = executable('ajn-sample-shared', files('ajn_sample_shared.c'), include_directories: incdir)
+test('ajn-sample-shared', ajn_sample_shared)
+
+if win32
+    ajn_sample_lifetime = executable('ajn-sample-lifetime', files('ajn_sample_lifetime.c'), include_directories: incdir)
+    test('ajn-sample-lifetime', ajn_sample_lifetime)
+    if features['cuda-hwaccel']
+        ajn_scene = executable('ajn-scene', 'ajn_scene.c', include_directories: incdir,
+            objects: libmpv.extract_objects('video/filter/ajn_scene.c', 'video/mp_image_pool.c'),
+            c_args: get_option('ajn-mvtools') ? '-DTEST_MVTOOLS=1' : '-DTEST_MVTOOLS=0',
+            dependencies: [libavutil, libswscale, zimg, libplacebo], link_with: [img_utils, test_utils])
+        scene_test_deps = []
+        if get_option('ajn-mvtools')
+            # The bridge loads its detector beside its module, which is the test
+            # executable here. Keep it dynamically loaded to test retirement.
+            scene_test_deps += custom_target('ajn-scene-detector',
+                input: mvtools_library, output: 'ajn-mvtools.dll',
+                command: [python, '-c',
+                    'import shutil, sys; shutil.copyfile(sys.argv[1], sys.argv[2])',
+                    '@INPUT@', '@OUTPUT@'])
+        endif
+        test('ajn-scene', ajn_scene, depends: scene_test_deps)
+    endif
+endif
+
 timer = executable('timer', files('timer.c'), include_directories: incdir, link_with: test_utils)
 test('timer', timer)
 
@@ -188,6 +213,11 @@ if get_option('libmpv')
         exe = executable('libmpv-lifetime', sources: 'libmpv_lifetime.c',
                          include_directories: incdir_public)
         test('libmpv-lifetime', exe, depends: mpvlib, suite: 'libmpv')
+        if win32
+            exe = executable('libmpv-ajn-sample', 'libmpv_ajn_sample.c',
+                             include_directories: [incdir, incdir_public])
+            test('libmpv-ajn-sample', exe, depends: mpvlib, suite: 'libmpv')
+        endif
     endif
 endif
 

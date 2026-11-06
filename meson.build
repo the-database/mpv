@@ -282,6 +282,10 @@ sources = files(
     'ta/ta_talloc.c',
     'ta/ta_utils.c',
 )
+if host_machine.system() == 'windows'
+    sources += files('common/ajn_probe.c', 'common/ajn_mux.c', 'common/ajn_subtitles.c')
+endif
+
 
 
 # compiler stuff
@@ -487,7 +491,10 @@ features += {'rfork': cc.has_header_symbol('unistd.h', 'RFSPAWN') and
 # links a probe, which can spuriously fail against a static libass whose
 # transitive deps aren't all on the probe link line (e.g. mingw cross builds),
 # silently compiling out the call.
-features += {'ass-render-thread-count': cc.has_header_symbol('ass/ass.h', 'ass_set_render_thread_count',
+# Meson cannot use an internal dependency in compiler feature probes. The
+# bundled libass used by the MSVC build is upstream and has none of these APIs.
+libass_can_probe = libass.type_name() != 'internal'
+features += {'ass-render-thread-count': libass_can_probe and cc.has_header_symbol('ass/ass.h', 'ass_set_render_thread_count',
                                                              dependencies: libass)}
 
 # Forked-libass deferred GPU primitive APIs (opt-in, off by default). Each is an
@@ -498,11 +505,11 @@ features += {'ass-render-thread-count': cc.has_header_symbol('ass/ass.h', 'ass_s
 #   ass-blur-deferred      -> HAVE_ASS_BLUR_DEFERRED       (ass_set_blur_deferred)
 #   ass-composite-deferred -> HAVE_ASS_COMPOSITE_DEFERRED  (ass_set_composite_deferred)
 #   ass-outline-deferred   -> HAVE_ASS_OUTLINE_DEFERRED    (ass_set_outline_deferred)
-features += {'ass-blur-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_blur_deferred',
+features += {'ass-blur-deferred': libass_can_probe and cc.has_header_symbol('ass/ass.h', 'ass_set_blur_deferred',
                                                        dependencies: libass)}
-features += {'ass-composite-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_composite_deferred',
+features += {'ass-composite-deferred': libass_can_probe and cc.has_header_symbol('ass/ass.h', 'ass_set_composite_deferred',
                                                              dependencies: libass)}
-features += {'ass-outline-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_outline_deferred',
+features += {'ass-outline-deferred': libass_can_probe and cc.has_header_symbol('ass/ass.h', 'ass_set_outline_deferred',
                                                            dependencies: libass)}
 
 # Fractional deferred-shadow offsets ride new ASS_Image FIELDS (shift_x64 /
@@ -510,7 +517,7 @@ features += {'ass-outline-deferred': cc.has_header_symbol('ass/ass.h', 'ass_set_
 # member: a fork with the deferred APIs but predating the fields must still
 # build (the packer then leaves the shift at 0 = the old whole-pixel rounding).
 #   ass-shadow-shift -> HAVE_ASS_SHADOW_SHIFT (ASS_Image.shift_x64)
-features += {'ass-shadow-shift': cc.has_member('ASS_Image', 'shift_x64',
+features += {'ass-shadow-shift': libass_can_probe and cc.has_member('ASS_Image', 'shift_x64',
                                                prefix: '#include <ass/ass.h>',
                                                dependencies: libass)}
 
@@ -1426,7 +1433,7 @@ if features['d3d11'] or features['egl-angle-win32'] or (features['vulkan'] and w
 endif
 
 # hwaccel
-ffnvcodec = dependency('ffnvcodec', version: '>= 11.1.5.1', required: false)
+ffnvcodec = dependency('ffnvcodec', version: '>= 11.1.5.3', required: false)
 features += {'ffnvcodec': ffnvcodec.found()}
 if features['ffnvcodec']
     dependencies += ffnvcodec
@@ -1441,6 +1448,19 @@ features += {'cuda-hwaccel': cuda_hwaccel.allowed()}
 if features['cuda-hwaccel']
     sources += files('video/filter/vf_animejanai.c',
                      'video/out/hwdec/hwdec_cuda.c')
+    if win32
+        sources += files('video/filter/ajn_scene.c', 'video/filter/ajn_sample_cuda.c')
+        if get_option('ajn-mvtools')
+            if not get_option('gpl')
+                error('ajn-mvtools requires a GPL build')
+            endif
+            subdir('video/filter/mvtools')
+        endif
+    endif
+endif
+
+if get_option('ajn-mvtools') and not (win32 and features['cuda-hwaccel'])
+    error('ajn-mvtools requires Windows and cuda-hwaccel')
 endif
 
 cuda_interop = get_option('cuda-interop').require(
@@ -1471,7 +1491,9 @@ d3d_hwaccel = get_option('d3d-hwaccel').require(
 features += {'d3d-hwaccel': d3d_hwaccel.allowed()}
 if features['d3d-hwaccel']
     sources += files('video/d3d.c',
-                     'video/filter/vf_d3d11vpp.c')
+                     'video/filter/vf_d3d11vpp.c',
+                     'video/filter/ajn_sample_gpu.c',
+                     'video/filter/vf_ajn_sample.c')
 endif
 
 amf = cc.has_header('AMF/core/Factory.h', required:

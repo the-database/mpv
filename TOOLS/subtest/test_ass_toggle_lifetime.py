@@ -5,10 +5,14 @@ import ctypes
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
 import uuid
 
-from test_live_ass_options import ASS, IPC
+assert sys.platform == "win32", "This D3D11/named-pipe test requires Windows."
+
+if sys.platform == "win32":
+    from test_live_ass_options import ASS, IPC
 
 
 def fixture(events):
@@ -59,7 +63,7 @@ def run_case(args, events, ahead, gpu, threads):
         ipc.call("set_property", "pause", False)
         for i in range(args.toggles):
             ipc.call("set_property", "sub-ass-override", "no" if i % 2 == 0 else "force")
-            result["toggles"] += 1
+            result["toggles"] = i + 1
             time.sleep(.05)
         # Let queued renders and their final releases run before shutdown.
         time.sleep(.5)

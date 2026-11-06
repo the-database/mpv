@@ -138,12 +138,13 @@ class StatsSnapshot:
         self.samples: dict[str, list[tuple[int, float]]] = {}
         if not os.path.exists(path):
             return
-        with open(path, "r", errors="replace") as f:
+        with open(path, errors="replace") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) == 4 and parts[1] == "value":
                     try:
-                        ts = int(parts[0]); v = float(parts[2])
+                        ts = int(parts[0])
+                        v = float(parts[2])
                     except ValueError:
                         continue
                     self.samples.setdefault(parts[3], []).append((ts, v))
@@ -171,7 +172,7 @@ def parse_shot_times(log_path: str) -> dict[int, float]:
     if not os.path.exists(log_path):
         return out
     pat = re.compile(r"\[\s*(\d+\.\d+)\]\[.\].*tstep-shot idx=(\d+)")
-    with open(log_path, "r", errors="replace") as f:
+    with open(log_path, errors="replace") as f:
         for line in f:
             m = pat.search(line)
             if m:
@@ -269,7 +270,7 @@ def sampled_diff(a: Image, b: Image, gross_tol: int, stride: int = 4):
     ch = a.channels
     rb = a.row_bytes
     maxd = 0
-    nd = 0
+    differing = 0
     nd_gross = 0
     for y in range(0, a.h, stride):
         ra = a.raw[y * rb:(y + 1) * rb]
@@ -288,13 +289,13 @@ def sampled_diff(a: Image, b: Image, gross_tol: int, stride: int = 4):
                 if d > pd:
                     pd = d
             if pd:
-                nd += 1
+                differing += 1
                 if pd > gross_tol:
                     nd_gross += 1
                 if pd > maxd:
                     maxd = pd
     scale = stride * stride
-    return maxd, nd * scale, nd_gross * scale  # estimates over the full frame
+    return maxd, differing * scale, nd_gross * scale  # estimates over the full frame
 
 
 def compare_runs(ra: dict, rb: dict, args, tag: str, out_dir: str) -> dict:
@@ -314,7 +315,7 @@ def compare_runs(ra: dict, rb: dict, args, tag: str, out_dir: str) -> dict:
         if total_px is None:
             total_px = ia.w * ia.h
         if ia.raw == ib.raw:
-            rec = {"i": i, "exact": True, "maxdiff8": 0, "ndiff_est": 0}
+            rec: dict = {"i": i, "exact": True, "maxdiff8": 0, "ndiff_est": 0}
             if not args.keep_all:
                 os.unlink(fb)   # A frames may serve later --runs; main prunes
         else:

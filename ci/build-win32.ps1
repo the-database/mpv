@@ -34,6 +34,27 @@ project('vapoursynth', version: '$vapoursynthVersion')
 meson.override_dependency('vapoursynth', declare_dependency(include_directories: 'include'))
 "@
 
+# WrapDB still supplies 11.1.5.1, before the CUDA stream-wait entry point used by
+# AJN. Use the same headers as the portable release, including in FFmpeg's fallback.
+$nvCodecVersion = "13.0.19.0"
+$nvCodecPath = "$subprojects/ff-nvcodec-headers"
+if (-not (Test-Path "$nvCodecPath/include/ffnvcodec")) {
+    git clone --depth 1 --branch "n$nvCodecVersion" https://github.com/FFmpeg/nv-codec-headers.git $nvCodecPath
+}
+Set-Content -Path "$nvCodecPath/meson.build" -Value @"
+project('ff-nvcodec-headers', version: '$nvCodecVersion')
+meson.override_dependency('ffnvcodec', declare_dependency(
+    include_directories: 'include', version: meson.project_version()))
+"@
+Set-Content -Path "$subprojects/ff-nvcodec-headers.wrap" -Value @"
+[wrap-git]
+url = https://github.com/FFmpeg/nv-codec-headers.git
+revision = n$nvCodecVersion
+depth = 1
+[provide]
+dependency_names = ffnvcodec
+"@
+
 # Wrap shaderc to run git-sync-deps and patch unsupported generator expression
 if (-not (Test-Path "$subprojects/shaderc_cmake")) {
     git clone https://github.com/google/shaderc --depth 1 $subprojects/shaderc_cmake

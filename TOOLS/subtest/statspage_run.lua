@@ -32,7 +32,7 @@ mp.register_event("file-loaded", function()
         mp.commandv("script-binding", "stats/display-stats-toggle")
         mp.msg.info("sprun: stats page opened")
         if opts.shots_every > 0 then
-            local t = mp.add_periodic_timer(opts.shots_every, function()
+            mp.add_periodic_timer(opts.shots_every, function()
                 mp.commandv("screenshot-to-file",
                             string.format("%s/sp%03d.png", opts.out, shot_n),
                             "window")

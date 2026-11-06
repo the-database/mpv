@@ -37,14 +37,10 @@ concurrency:
 
 jobs:
   mingw:
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:26.10
-      # https://github.com/actions/runner-images/issues/14790
-      options: --security-opt seccomp=unconfined
-      env:
-        WINEPREFIX: /tmp/wine
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     env:
+      WINEPREFIX: /tmp/wine
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
@@ -56,17 +52,31 @@ jobs:
       matrix:
         include:
           - arch: i686
+            # 32-bit Wine's socket calls fail inside the hosted container.
+            # Keep its execution tests on the VM with the LTS package set.
+            runner: ubuntu-26.04
+            container: ''
             wine: wine32
           - arch: x86_64
+            runner: ubuntu-latest
+            container:
+              image: ubuntu:26.10
+              # https://github.com/actions/runner-images/issues/14790
+              options: --security-opt seccomp=unconfined
             wine: wine64
     steps:
       - name: Install dependencies
+        shell: bash
         run: |
-          dpkg --add-architecture i386
-          apt-get update
-          apt-get install --no-install-recommends -y ca-certificates ccache cmake g++-mingw-w64 gcc-multilib git make meson nasm ninja-build pkgconf rustup wget xz-utils ${{ matrix.wine }} wine
+          install_cmd=()
+          if [ "$(id -u)" -ne 0 ]; then install_cmd=(sudo); fi
+          "${install_cmd[@]}" dpkg --add-architecture i386
+          "${install_cmd[@]}" apt-get update
+          "${install_cmd[@]}" apt-get install --no-install-recommends -y ca-certificates ccache cmake g++-mingw-w64 gcc-multilib git make meson nasm ninja-build pkgconf rustup wget xz-utils ${{ matrix.wine }} wine
           rustup default stable
           rustup target add ${{ env.RUST_TARGET }}
+          # Wine requires an existing prefix to belong to its current user.
+          mkdir -p "$WINEPREFIX"
         env:
           DEBIAN_FRONTEND: noninteractive
 
@@ -112,6 +122,8 @@ jobs:
       - name: Run meson tests
         id: tests
         run: |
+          # Dynamically loaded libmpv tests do not inherit Meson's DLL search paths.
+          export WINEPATH="$(winepath -w "$PWD/artifact")"
           meson test -C mingw_build
 
       - name: Print meson test log
@@ -390,6 +402,12 @@ jobs:
           brew install -q --HEAD libplacebo
           brew install -q --HEAD ffmpeg-full
           brew link ffmpeg-full
+
+      - name: Rebuild libarchive for the runner SDK
+        if: ${{ matrix.os == 'xcode-27' }}
+        run: |
+          # The preinstalled dylib targets 27.2, newer than this runner's 27.0 SDK.
+          brew reinstall --build-from-source libarchive
 
       - name: Build with meson
         id: build

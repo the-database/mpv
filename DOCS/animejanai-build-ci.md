@@ -138,26 +138,43 @@ into `master` and pushes; on conflict it aborts and files/comments on an issue t
 
 See [`../CLAUDE.md`](../CLAUDE.md) for the merge-only policy and the conflict dry-run command.
 
-## Pre-existing CI failures — do not "fix" these
+## CI compatibility
 
-A red check on this fork is not automatically a regression. Known-red, verified against a
-baseline:
+Fork-owned code and test tools must pass the same checks as the upstream sources. Historical
+failures are not blanket exemptions:
 
-- **The six `lint.yml` jobs.** They fail on fork-only content: `TOOLS/subtest` Python/Lua style,
-  missing final newlines in two JSON files, and the commit-message linter rejecting the fork's
-  merge-commit history.
-- **The two `win32` MSVC jobs.** They fail in `meson.build` at the libass feature probes —
-  `cc.has_header_symbol(..., dependencies: libass)` errors with "Dependencies must be external
-  dependencies" because libass is a meson **subproject** in that configuration. The fix would
-  be to guard the probes on `libass.type_name() == 'internal'`; it has not been done.
-- **`Fuzzing (undefined)`** can fail on FFmpeg-internal undefined behaviour (e.g. a
-  div-by-zero in `libavformat/vpk.c`), unrelated to mpv.
+- Stock libass builds omit deferred-composite streaming buffers and their cleanup calls.
+- MSVC's bundled upstream libass is an internal Meson dependency, which cannot be passed to
+  compiler feature probes. Its fork-only features stay disabled; installed external libass
+  builds retain the individual declaration checks.
+- CUDA builds require nv-codec-headers 11.1.5.3 or newer for `cuStreamWaitEvent`.
+  MSVC uses the portable release's 13.0.19.0 headers instead of WrapDB's older fallback.
+- The i686 Wine job runs directly on the Ubuntu 26.04 VM. Its 32-bit socket calls fail
+  in the hosted container before mpv runs; installing both Wine loaders did not fix that.
+  This LTS has MinGW 13's 32-bit `ole32` imports for `CoIncrementMTAUsage` and
+  `CoDecrementMTAUsage`; Ubuntu 24.04's MinGW 11 cannot link the WASAPI backend.
+  The GCC cross-build selects MinGW's C99 stdio and avoids GCC 13's broken `fprintf`
+  builtin annotation ([GCC PR 95130](https://gcc.gnu.org/pipermail/gcc-bugs/2023-August/833793.html)).
+  Format checking uses the header declaration; format warnings remain errors.
+  Setup creates the Wine prefix as its current user. Wine will not create it beneath
+  another user's directory, such as `/tmp` on the VM or the container's mounted workspace.
+- CUDA-only callbacks are compiled with their callers, and standalone addon tests keep
+  their assertions enabled even in release builds.
+- The D3D11 sample helper includes `d3d10_1.h` before the D3D11 header, as required by
+  the Windows SDK's SAL declarations; MinGW's headers alone do not catch this error.
+- The Xcode 27 runner rebuilds libarchive from source: its preinstalled dylib targets
+  macOS 27.2 while the runner SDK targets 27.0. Linker warnings remain errors.
+- The scene test stages MVTools beside its executable; the Wine reload test uses the
+  packaged runtime DLL directory. Neither test links the DLL it must unload.
+- The full static Windows build rebuilds the image's OpenSSL with `no-pinshared`.
+  Otherwise OpenSSL permanently pins libmpv during curl initialization, preventing
+  unload even with no addon attached. The module-unload assertion stays enabled.
+- `TOOLS/subtest` participates in Python/Lua lint, type checks and pre-commit hooks. Windows
+  D3D11 tests declare their platform requirement explicitly.
 
-Everything else in `build.yml` passes: Linux gcc/clang, macOS, FreeBSD/OpenBSD, all msys2
-variants, and the mingw cross builds.
-
-`gh run rerun --failed` is appropriate only for genuinely transient failures (e.g. a 502
-downloading freetype from savannah), never for the items above.
+Compare an unexpected failure with the same base commit and dependency versions before
+assigning it to a PR. `gh run rerun --failed` is appropriate for genuinely transient failures
+(e.g. a 502 downloading freetype), not reproducible source or environment errors.
 
 > **`build.yml`'s `publish` job can never run here.** It is guarded on
 > `github.repository == 'mpv-player/mpv'`, so it is skipped in every fork run by design.

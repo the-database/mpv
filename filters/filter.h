@@ -326,6 +326,10 @@ struct mp_filter {
     struct mp_pin **pins;
     int num_pins;
 
+    // A required processing filter must never be replaced with passthrough
+    // after failure. The output chain terminates instead.
+    bool failure_is_fatal;
+
     // Internal pins, for access by the filter implementation. The meaning of
     // in/out is swapped from the public interface: inputs use MP_PIN_OUT,
     // because the filter reads from the inputs, and outputs use MP_PIN_IN,

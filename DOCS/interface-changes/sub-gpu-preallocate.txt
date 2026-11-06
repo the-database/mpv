@@ -1,0 +1,2 @@
+add `sub-gpu-preallocate` option (default yes) to allow demand-driven GPU subtitle
+transient texture allocation at 4K and above

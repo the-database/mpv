@@ -4,8 +4,8 @@
 # (ghcr.io/btbn/ffmpeg-builds/<target>-<variant>, see
 # https://github.com/BtbN/FFmpeg-Builds). The image ships the cross toolchain,
 # a matching /cross.meson and every FFmpeg dependency as static library in
-# $FFBUILD_PREFIX, so only FFmpeg itself and the things FFmpeg does not need
-# are built here. Run it from the mpv source tree inside the container:
+# $FFBUILD_PREFIX. OpenSSL is rebuilt without permanent DLL pinning for libmpv,
+# along with FFmpeg and the things FFmpeg does not need. Run from the mpv tree:
 #
 #   docker run --rm -v "$PWD:/mpv" -w /mpv \
 #       ghcr.io/btbn/ffmpeg-builds/win64-gpl:latest ./ci/build-mingw64-full.sh
@@ -28,6 +28,25 @@ gpl=false
 gitclone="git clone --depth=1 --recursive --shallow-submodules"
 group() { echo "::group::$1"; }
 endgroup() { echo "::endgroup::"; }
+
+group "Building unloadable OpenSSL"
+# The image's static OpenSSL pins its containing DLL during curl_global_init.
+# Preserve its version and features, but allow libmpv to unload after cleanup.
+openssl_ver=$(PKG_CONFIG_PATH="$FFBUILD_PREFIX/lib/pkgconfig" pkg-config --modversion openssl)
+$gitclone -b "openssl-$openssl_ver" https://github.com/openssl/openssl.git
+pushd openssl
+openssl_target=mingw64
+[[ $FFBUILD_TOOLCHAIN == aarch64-* ]] && openssl_target=mingwarm64
+CC="${CC/${FFBUILD_CROSS_PREFIX}/}" CXX="${CXX/${FFBUILD_CROSS_PREFIX}/}" \
+AR="${AR/${FFBUILD_CROSS_PREFIX}/}" RANLIB="${RANLIB/${FFBUILD_CROSS_PREFIX}/}" \
+CFLAGS="$CFLAGS -fno-strict-aliasing" \
+./Configure "$openssl_target" --cross-compile-prefix="$FFBUILD_CROSS_PREFIX" \
+            --prefix="$FFBUILD_PREFIX" --libdir=lib threads zlib no-shared no-pinshared \
+            no-tests no-apps no-legacy no-ssl3 enable-camellia enable-ec enable-srp
+make -j"$(nproc)" build_sw
+make install_sw
+popd
+endgroup
 
 group "Building FFmpeg"
 $gitclone https://github.com/FFmpeg/FFmpeg.git ffmpeg
@@ -144,7 +163,7 @@ mpv_args=(
 )
 if $gpl; then
     # Only the GPL image carries the dependencies of the GPL features.
-    mpv_args+=(-D{dvda,dvdnav,rubberband}=enabled)
+    mpv_args+=(-D{dvda,dvdnav,rubberband}=enabled -Dajn-mvtools=true)
 fi
 meson setup build "${mpv_args[@]}"
 meson compile -C build

@@ -67,9 +67,23 @@ static const struct cuda_interop_fn *interop_fns[] = {
     NULL
 };
 
+struct cuda_device_owner {
+    CudaFunctions *cu;
+    CUcontext context;
+};
+
+static void cuda_device_free(AVHWDeviceContext *device)
+{
+    struct cuda_device_owner *owner = device->user_opaque;
+    owner->cu->cuCtxDestroy(owner->context);
+    cuda_free_functions(&owner->cu);
+    talloc_free(owner);
+}
+
 static int cuda_init(struct ra_hwdec *hw)
 {
     AVBufferRef *hw_device_ctx = NULL;
+    struct cuda_device_owner *owner = NULL;
     CUcontext dummy;
     int ret = 0;
     struct cuda_hw_priv *p = hw->priv;
@@ -126,10 +140,20 @@ static int cuda_init(struct ra_hwdec *hw)
         goto error;
     }
 
+    owner = talloc_zero(NULL, struct cuda_device_owner);
+    if (!owner)
+        goto error;
     ret = CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     if (ret < 0)
         goto error;
 
+    // Decoded frames and optional analysis workers retain this AV device.
+    // Destroy its CUDA context only after the final frame/observer releases it,
+    // not when the VO stops using it. This adds no per-frame synchronization.
+    owner->cu = cu;
+    owner->context = p->decode_ctx;
+    device_ctx->user_opaque = owner;
+    device_ctx->free = cuda_device_free;
     p->hwctx = (struct mp_hwdec_ctx) {
         .driver_name = hw->driver->name,
         .av_device_ref = hw_device_ctx,
@@ -139,6 +163,7 @@ static int cuda_init(struct ra_hwdec *hw)
     return 0;
 
  error:
+    talloc_free(owner);
     av_buffer_unref(&hw_device_ctx);
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
 
@@ -151,6 +176,15 @@ static void cuda_uninit(struct ra_hwdec *hw)
     CudaFunctions *cu = p->cu;
 
     hwdec_devices_remove(hw->devs, &p->hwctx);
+    if (p->hwctx.av_device_ref) {
+        // A separate display context has no outstanding decoded-frame refs.
+        if (p->display_ctx && p->display_ctx != p->decode_ctx)
+            CHECK_CU(cu->cuCtxDestroy(p->display_ctx));
+        p->cu = NULL; // Ownership of the function table moved with decode_ctx.
+        p->decode_ctx = p->display_ctx = NULL;
+        av_buffer_unref(&p->hwctx.av_device_ref);
+        return;
+    }
     av_buffer_unref(&p->hwctx.av_device_ref);
 
     if (p->decode_ctx && p->decode_ctx != p->display_ctx)

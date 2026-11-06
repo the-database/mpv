@@ -79,6 +79,8 @@ const struct m_sub_options encode_config = {
         {"of", OPT_STRING(format)},
         {"ofopts", OPT_KEYVALUELIST(fopts), .flags = M_OPT_HAVE_HELP},
         {"ovc", OPT_STRING(vcodec)},
+        {"ovc-hwframes", OPT_BOOL(hwframes)},
+        {"ovc-keyframe-seconds", OPT_DOUBLE(keyframe_seconds), M_RANGE(0, 6)},
         {"ovcopts", OPT_KEYVALUELIST(vopts), .flags = M_OPT_HAVE_HELP},
         {"oac", OPT_STRING(acodec)},
         {"oacopts", OPT_KEYVALUELIST(aopts), .flags = M_OPT_HAVE_HELP},

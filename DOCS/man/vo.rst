@@ -348,6 +348,13 @@ Available video output drivers are:
         Simulate display FPS. This artificially limits how many frames the
         VO accepts per second.
 
+    ``--vo-null-accept-hwframes=<yes|no>``
+        Accept hardware frames without converting or downloading their pixels
+        before discarding them (default: no). The AnimeJaNai media worker opts
+        in for independent background processing. Existing ``--vo=null``
+        benchmark runs retain their conversion behavior unless this is enabled;
+        measurements with different values are not directly comparable.
+
 ``caca``
     Color ASCII art video output driver that works on a text console.
 
