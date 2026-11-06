@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-TEST = r'''
+TEST = r"""
 static int received;
 static WPARAM depth;
 static LPARAM dimensions;
@@ -57,24 +57,24 @@ int main(void) {
     DestroyWindow(parent);
     puts("PASS hidden top-level display notification reaches embedded child");
 }
-'''
+"""
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--compiler', required=True)
+    parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
-    source = (ROOT / 'video/out/w32_common.c').read_text(encoding='utf-8')
-    callback = re.search(r'static LRESULT CALLBACK display_event_proc\(.*?^}',
+    source = (ROOT / "video/out/w32_common.c").read_text(encoding="utf-8")
+    callback = re.search(r"static LRESULT CALLBACK display_event_proc\(.*?^}",
                          source, re.S | re.M)
     assert callback
-    with tempfile.TemporaryDirectory(prefix='ajn-display-events-') as directory:
-        c = Path(directory) / 'test.c'
-        exe = Path(directory) / 'test.exe'
-        c.write_text('#include <windows.h>\n#include <assert.h>\n'
-                     '#include <stdbool.h>\n#include <stdio.h>\n'
-                     + callback.group() + '\n' + TEST, encoding='utf-8')
-        subprocess.run([args.compiler, str(c), '-o', str(exe), '-luser32'], check=True)
+    with tempfile.TemporaryDirectory(prefix="ajn-display-events-") as directory:
+        c = Path(directory) / "test.c"
+        exe = Path(directory) / "test.exe"
+        c.write_text("#include <windows.h>\n#include <assert.h>\n"
+                     "#include <stdbool.h>\n#include <stdio.h>\n"
+                     + callback.group() + "\n" + TEST, encoding="utf-8")
+        subprocess.run([args.compiler, str(c), "-o", str(exe), "-luser32"], check=True)
         subprocess.run([str(exe)], check=True, timeout=10)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
