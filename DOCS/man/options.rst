@@ -2880,6 +2880,18 @@ Subtitles
 
     Default: no.
 
+``--sub-gpu-preallocate=<yes|no>``
+    Preallocate the full transient texture chain for GPU subtitles at 4K and
+    above (default: yes). This avoids driver allocation stalls when dense ASS
+    typesetting appears, but can reserve about 4 GiB at 8K even for simple
+    subtitles. Only affects ``--vo=gpu-next`` with GPU subtitles enabled.
+
+    Setting this to ``no`` starts with one link and uses the existing
+    demand-driven growth. This reduces initial allocation time and unused GPU
+    memory, at the cost of possible stalls when subtitle complexity increases
+    suddenly. The maximum subtitle capacity is unchanged. Restart the player
+    after changing this option; existing allocations are not immediately freed.
+
 ``--sub-glyph-atlas-size=<0|1024-16384>``
     Edge length, in pixels, of the square persistent GPU glyph atlas used by
     ``--sub-gpu-raster`` / ``--sub-gpu-composite`` on ``--vo=gpu-next``. The atlas
