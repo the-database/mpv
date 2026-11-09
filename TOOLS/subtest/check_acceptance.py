@@ -260,7 +260,7 @@ def read_counters(st: parse_stats.Stats) -> dict[str, float]:
     return out
 
 
-def scan_log(path: str) -> dict:
+def scan_log(path: str) -> dict | None:
     """Scan a sibling mpv log for the stock-libass warning."""
     info = {"path": path, "stock_libass_warn": False, "warn_line": ""}
     try:
@@ -429,7 +429,7 @@ def read_png(path):
             idat += body
         elif ctype == b"IEND":
             break
-    if width is None:
+    if width is None or height is None:
         raise ValueError(f"{path}: no IHDR")
     if interlace != 0:
         raise ValueError(f"{path}: interlaced not supported")
@@ -631,7 +631,7 @@ def print_scene(r: dict) -> None:
 
     d = r["frame_drops"]
     dtxt = "0" if d == 0 else \
-        f"{d}  (" + ", ".join(f"{k}={v}" for k, v in sorted(r['drop_breakdown'].items())) + ")"
+        f"{d}  (" + ", ".join(f"{k}={v}" for k, v in sorted(r["drop_breakdown"].items())) + ")"
     print(f"\nframe drops: {dtxt}")
 
     print(f"\n{'counter':<28} {'value':>7}   status")

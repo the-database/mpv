@@ -35,6 +35,8 @@ struct encode_opts {
     char *format;
     char **fopts;
     char *vcodec;
+    bool hwframes;
+    double keyframe_seconds;
     char **vopts;
     char *acodec;
     char **aopts;
