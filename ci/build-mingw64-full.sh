@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
 # Static mpv and libmpv builds on top of the FFmpeg-Builds container images
-# (ghcr.io/btbn/ffmpeg-builds/<target>-<variant>, see
-# https://github.com/BtbN/FFmpeg-Builds). The image ships the cross toolchain,
+# (ghcr.io/ffmpeg-builds/ffmpeg-builds/<target>-<variant>, see
+# https://github.com/FFmpeg-Builds/FFmpeg-Builds). The image ships the cross toolchain,
 # a matching /cross.meson and every FFmpeg dependency as static library in
 # $FFBUILD_PREFIX. OpenSSL is rebuilt without permanent DLL pinning for libmpv,
 # along with FFmpeg and the things FFmpeg does not need. Run from the mpv tree:
 #
 #   docker run --rm -v "$PWD:/mpv" -w /mpv \
-#       ghcr.io/btbn/ffmpeg-builds/win64-gpl:latest ./ci/build-mingw64-full.sh
+#       ghcr.io/ffmpeg-builds/ffmpeg-builds/win64-gpl:latest ./ci/build-mingw64-full.sh
 #
 # The mpv binaries end up in artifact/, the libmpv package in artifact-libmpv/.
 set -euo pipefail
@@ -158,6 +158,7 @@ mpv_args=(
     -Dmujs:default_library=static
     -Dlua=luajit
     -D{amf,d3d11,iconv,javascript,lcms2,libarchive,libbluray,libcurl}=enabled
+    -D{sdl2-audio,sdl2-gamepad,sdl2-video}=enabled
     -D{shaderc,sixel,spirv-cross,subrandr,uchardet,vapoursynth,vulkan}=enabled
     -D{win32-smtc,zimg}=enabled
 )
