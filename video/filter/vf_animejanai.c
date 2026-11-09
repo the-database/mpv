@@ -70,6 +70,7 @@
 #include "filters/user_filters.h"
 #include "options/m_option.h"
 #include "options/path.h"
+#include "osdep/io.h"
 #include "refqueue.h"
 #include "video/fmt-conversion.h"
 #include "video/mp_image.h"
@@ -92,15 +93,25 @@ static void *aji_lib_open(const char *path)
     // can live in one self-contained dir instead of next to mpv.exe or on
     // PATH. The search flags need a fully qualified, normalized path
     // (config expansion produces absolute-but-unnormalized ones).
+    // The path is UTF-8, like every mpv string: load it wide. The ANSI calls
+    // read it in the process code page, which breaks a non-ASCII install
+    // path in a host without a UTF-8 manifest (mpv.net).
+    wchar_t *wpath = mp_from_utf8(NULL, path);
+    HMODULE lib;
     if (strpbrk(path, "/\\")) {
-        char full[MAX_PATH];
-        DWORD n = GetFullPathNameA(path, sizeof(full), full, NULL);
-        const char *p = (n > 0 && n < sizeof(full)) ? full : path;
-        return (void *)LoadLibraryExA(p, NULL,
-                                      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                                      LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        DWORD need = GetFullPathNameW(wpath, 0, NULL, NULL);
+        wchar_t *full = need ? talloc_array(wpath, wchar_t, need) : NULL;
+        DWORD n = full ? GetFullPathNameW(wpath, need, full, NULL) : 0;
+        lib = LoadLibraryExW(n > 0 && n < need ? full : wpath, NULL,
+                             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                             LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    } else {
+        lib = LoadLibraryW(wpath);
     }
-    return (void *)LoadLibraryA(path);
+    DWORD err = GetLastError();  // for aji_lib_error()
+    talloc_free(wpath);
+    SetLastError(err);
+    return (void *)lib;
 #else
     return dlopen(path, RTLD_NOW | RTLD_LOCAL);
 #endif
