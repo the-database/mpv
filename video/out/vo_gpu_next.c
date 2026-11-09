@@ -891,6 +891,7 @@ struct gl_next_opts {
     int target_hint_mode;
     bool target_hint_strict;
     int sub_glyph_atlas_size;   // WP-E: persistent glyph atlas edge, created once
+    bool sub_gpu_preallocate;
     int sub_glyph_atlas_height; // WP-A3 debug knob; 0 = default (see option below)
     int sub_present_guard_ms;   // WP-E3: overlay-build deadline; -1 auto, 0 off
     int sub_debug_stall_ms;     // WP-E3 debug: injected overlay-section sleep
@@ -953,6 +954,7 @@ const struct m_sub_options gl_next_conf = {
         // overflows 8192^2). The debug --sub-glyph-atlas-height override
         // below still wins for tests.
         {"sub-glyph-atlas-size", OPT_INT(sub_glyph_atlas_size), M_RANGE(0, 16384)},
+        {"sub-gpu-preallocate", OPT_BOOL(sub_gpu_preallocate)},
         // DEBUG/dev only: cap the GPU glyph atlas size (pixels) at creation.
         // 0 = default (GPU max, up to 16384). A small value (e.g. 256) shrinks
         // the atlas to N x N and forces glyph-atlas overflow / cache-flush storms
@@ -991,6 +993,7 @@ const struct m_sub_options gl_next_conf = {
         .target_hint = -1,
         .target_hint_strict = true,
         .sub_glyph_atlas_size = 0,      // WP-H1d: auto (8192; 16384 on 4K+)
+        .sub_gpu_preallocate = true,
         .sub_present_guard_ms = -1,     // WP-E3: auto (frame duration)
         .sub_prefill_budget_ms = 3,
         .sub_compose_xstate = true,     // WP-H1b: idle glyph pre-fill budget
@@ -2284,7 +2287,7 @@ static void pregrow_swap_in(struct vo *vo)
                 p->tr_link_used_frame[k] = p->tr_frame;
             }
             p->n_trans_chain = nnew;
-            p->tr_prealloc_links = nnew;      // new floor (hysteresis: never retire below)
+            p->tr_prealloc_links = p->next_opts->sub_gpu_preallocate ? nnew : 1;
             p->tr_want_links = MPMAX(p->tr_want_links, nnew);
             p->n_tr_rebuild = 0;
             p->tr_rebuild_want = 0;
@@ -3680,7 +3683,8 @@ static void gc_warmup(struct priv *p)
 static void tr_prealloc_chain(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    if (!p->gpu || !p->n_trans_chain || p->tr_prealloc_links)
+    if (!p->gpu || !p->n_trans_chain || p->tr_prealloc_links ||
+        !p->next_opts->sub_gpu_preallocate)
         return;
     bool big = p->osd_res.w >= 3840 || p->osd_res.h >= 2160;
     if (!big || !osd_has_attached_sub(vo->osd))
@@ -3762,7 +3766,7 @@ static void tr_start_rebuild(struct vo *vo)
     // wants the full chain; otherwise just re-size the links already present.
     int want_n = p->n_trans_chain;
     bool big = p->osd_res.w >= 3840 || p->osd_res.h >= 2160;
-    if (big && osd_has_attached_sub(vo->osd)) {
+    if (big && p->next_opts->sub_gpu_preallocate && osd_has_attached_sub(vo->osd)) {
         void *tmp = talloc_new(NULL);
         struct mp_subtitle_opts *so =
             mp_get_config_group(tmp, p->global, &mp_subtitle_sub_opts);

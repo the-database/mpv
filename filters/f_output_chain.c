@@ -93,13 +93,29 @@ static void update_output_caps(struct chain *p)
 
     mp_autoconvert_clear(p->convert);
 
-    if (p->vo) {
+    // A discard sink can explicitly opt out of conversion and interop probing.
+    // Ordinary --vo=null retains its historical behavior for existing callers.
+    if (p->vo && !p->vo->accepts_any_image) {
         uint8_t allowed_output_formats[IMGFMT_END - IMGFMT_START] = {0};
         vo_query_formats(p->vo, allowed_output_formats);
 
         for (int n = 0; n < MP_ARRAY_SIZE(allowed_output_formats); n++) {
-            if (allowed_output_formats[n])
-                mp_autoconvert_add_imgfmt(p->convert, IMGFMT_START + n, 0);
+            if (!allowed_output_formats[n])
+                continue;
+            int format = IMGFMT_START + n;
+            mp_autoconvert_add_imgfmt(p->convert, format, 0);
+            if (IMGFMT_IS_HWACCEL(format) &&
+                (p->vo->driver->caps & VO_CAP_HW_FRAMES))
+            {
+                // The encoder consumes the upstream hardware pool. Register
+                // its accepted surface formats explicitly so autoconvert does
+                // not probe a missing display interop and download the frame.
+                for (int s = 0; s < MP_ARRAY_SIZE(allowed_output_formats); s++) {
+                    int subformat = IMGFMT_START + s;
+                    if (allowed_output_formats[s] && !IMGFMT_IS_HWACCEL(subformat))
+                        mp_autoconvert_add_imgfmt(p->convert, format, subformat);
+                }
+            }
         }
     }
 }
@@ -168,7 +184,7 @@ static void user_wrapper_process(struct mp_filter *f)
     mp_assert(u->name);
 
     if (!u->failed && mp_filter_has_failed(u->f)) {
-        if (u == p->convert_wrapper) {
+        if (u == p->convert_wrapper || u->f->failure_is_fatal) {
             // This is a fuckup we can't ignore.
             MP_FATAL(p, "Cannot convert decoder/filter output to any format "
                      "supported by the output.\n");
@@ -186,7 +202,7 @@ static void user_wrapper_process(struct mp_filter *f)
         // if this wrapper forwarded EOF into the inner filter, that EOF may
         // be lost. Reset filter may have discarded this frame from failed filter.
         // Synthesize EOF so downstream doesn't stall indefinitely.
-        if (u == p->convert_wrapper || u->in_eof) {
+        if (u == p->convert_wrapper || u->f->failure_is_fatal || u->in_eof) {
             if (mp_pin_in_needs_data(f->ppins[1])) {
                 if (!u->error_eof_sent)
                     mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);

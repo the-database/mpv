@@ -199,7 +199,7 @@ _SLOW_RE = re.compile(
     r"blur=(?P<blur>[\d.]+)\s+"
     r"other=(?P<other>[\d.]+)\)\s+"
     r"render-submit=(?P<submit>[\d.]+)\s+"
-    r"gpu-passes=(?P<gpu>[\d.]+)\s+ms"
+    r"gpu-passes=(?P<gpu>[\d.]+)\s+ms",
 )
 
 _SLOW_PHASES = [
@@ -213,7 +213,7 @@ _SLOW_PHASES = [
 ]
 
 _RA_RE = re.compile(
-    r"\[render-ahead\]\s+served=(?P<served>\d+)\s+empty=(?P<empty>\d+)\s+miss=(?P<miss>\d+)"
+    r"\[render-ahead\]\s+served=(?P<served>\d+)\s+empty=(?P<empty>\d+)\s+miss=(?P<miss>\d+)",
 )
 
 # Final client-area geometry mpv actually rendered into. This is the ONLY
@@ -291,7 +291,8 @@ def print_report(rep: Report, file=sys.stdout) -> None:
 
 
 def print_table(reports: list[Report], file=sys.stdout) -> None:
-    hdr = f"{'event':<20} {'frames':>6} {'mean':>7} {'p50':>7} {'p95':>7} {'p99':>7} {'max':>9} {'over':>6} {'%over':>7}"
+    hdr = (f"{'event':<20} {'frames':>6} {'mean':>7} {'p50':>7} {'p95':>7} "
+           f"{'p99':>7} {'max':>9} {'over':>6} {'%over':>7}")
     print(hdr, file=file)
     print("-" * len(hdr), file=file)
     for r in reports:
@@ -678,8 +679,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.anomalies and st.anomalies:
         print("\nanomalies (unpaired start/end):")
-        for name, (us, ue) in sorted(st.anomalies.items()):
-            print(f"  {name}: {us} unpaired start(s), {ue} unpaired end(s)")
+        for name, (starts, ends) in sorted(st.anomalies.items()):
+            print(f"  {name}: {starts} unpaired start(s), {ends} unpaired end(s)")
 
     return 0
 

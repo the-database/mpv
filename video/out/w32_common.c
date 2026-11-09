@@ -100,6 +100,7 @@ struct vo_w32_state {
 
     HWND window;
     HWND parent; // 0 normally, set in embedding mode
+    HWND display_event_window; // hidden top-level receiver for embedded playback
     HHOOK parent_win_hook;
     HWINEVENTHOOK parent_evt_hook;
     bool embed_desktop;
@@ -1893,6 +1894,21 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
 
 static mp_once window_class_init_once = MP_STATIC_ONCE_INITIALIZER;
 static ATOM window_class;
+static ATOM display_event_class;
+
+static LRESULT CALLBACK display_event_proc(HWND window, UINT message,
+                                          WPARAM wparam, LPARAM lparam)
+{
+    if (message == WM_NCCREATE) {
+        CREATESTRUCTW *cs = (void *)lparam;
+        SetWindowLongPtrW(window, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+    } else if (message == WM_DISPLAYCHANGE) {
+        HWND child = (HWND)GetWindowLongPtrW(window, GWLP_USERDATA);
+        PostMessageW(child, message, wparam, lparam);
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
 static void register_window_class(void)
 {
     window_class = RegisterClassExW(&(WNDCLASSEXW) {
@@ -1904,6 +1920,12 @@ static void register_window_class(void)
         .hCursor = LoadCursor(NULL, IDC_ARROW),
         .hbrBackground = (HBRUSH) GetStockObject(BLACK_BRUSH),
         .lpszClassName = MPV_WINDOW_CLASS_NAME,
+    });
+    display_event_class = RegisterClassExW(&(WNDCLASSEXW) {
+        .cbSize = sizeof(WNDCLASSEXW),
+        .lpfnWndProc = display_event_proc,
+        .hInstance = HINST_THISCOMPONENT,
+        .lpszClassName = L"mpv-display-events",
     });
 }
 
@@ -2243,6 +2265,19 @@ static MP_THREAD_VOID gui_thread(void *ptr)
         goto done;
     }
 
+    if (w32->parent) {
+        // WM_DISPLAYCHANGE is broadcast only to top-level windows. A child
+        // hosted by mpv.net otherwise retains its old refresh rate indefinitely.
+        // HWND_MESSAGE does not receive broadcasts, so keep a hidden popup.
+        w32->display_event_window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            (LPWSTR)MAKEINTATOM(display_event_class), L"", WS_POPUP,
+            0, 0, 0, 0, NULL, NULL, HINST_THISCOMPONENT, w32->window);
+        if (!w32->display_event_window) {
+            MP_ERR(w32, "unable to create display-event window!\n");
+            goto done;
+        }
+    }
+
     w32->menu_ctx = mp_win32_menu_init(w32->window);
     update_dark_mode(w32);
     update_corners_pref(w32);
@@ -2321,6 +2356,8 @@ done:
     MP_VERBOSE(w32, "uninit\n");
 
     remove_parent_hook(w32);
+    if (w32->display_event_window)
+        DestroyWindow(w32->display_event_window);
     if (w32->menu_ctx)
         mp_win32_menu_uninit(w32->menu_ctx);
     if (w32->window && !w32->destroyed)

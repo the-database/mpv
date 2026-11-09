@@ -123,7 +123,7 @@ def read_png(path: str) -> Image:
         elif ctype == b"IEND":
             break
 
-    if width is None:
+    if width is None or height is None:
         raise ValueError(f"{path}: no IHDR")
     if interlace != 0:
         raise ValueError(f"{path}: interlaced PNG not supported")
@@ -336,17 +336,18 @@ BASE_FLAGS = [
 class MpvIPC:
     def __init__(self, path: str, timeout: float = 30.0):
         deadline = time.time() + timeout
-        self.sock = None
+        sock = None
         while time.time() < deadline:
             try:
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 s.connect(path)
-                self.sock = s
+                sock = s
                 break
             except OSError:
                 time.sleep(0.1)
-        if self.sock is None:
+        if sock is None:
             raise RuntimeError(f"could not connect to mpv IPC socket {path}")
+        self.sock = sock
         self.sock.settimeout(1.0)
         self.buf = b""
         self.events: list[dict] = []
@@ -358,7 +359,7 @@ class MpvIPC:
                 return None
             try:
                 chunk = self.sock.recv(65536)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             if not chunk:
                 return None
