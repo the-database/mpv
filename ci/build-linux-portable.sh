@@ -70,13 +70,13 @@ cmake -B "$DEPS/shaderc/b" -S "$DEPS/shaderc" -G Ninja -DCMAKE_BUILD_TYPE=Releas
 cmake --build "$DEPS/shaderc/b" -j"$JOBS"; cmake --install "$DEPS/shaderc/b"
 
 say "libplacebo"
-clone https://code.videolan.org/videolan/libplacebo.git "$DEPS/libplacebo" v7.360.1
+clone https://code.videolan.org/videolan/libplacebo.git "$DEPS/libplacebo" v7.387.0
 git -C "$DEPS/libplacebo" submodule update --init --recursive
 # Present on graphics queue 0 so presents stay ordered while rendering keeps
 # rotating across --vulkan-queue-count queues (same fix as the Windows build's
-# libplacebo-present-queue.patch, for v7.360.1's pool->idx_queues layout).
+# libplacebo-present-queue.patch, for v7.387.0's cmd->qindex layout).
 # Idempotent; the grep fails the build if a libplacebo bump moves the line.
-sed -i 's/^\(    int qidx = \)pool->idx_queues;$/\10;/' "$DEPS/libplacebo/src/vulkan/swapchain.c"
+sed -i 's/^\(    int qidx = \)cmd->qindex;$/\10;/' "$DEPS/libplacebo/src/vulkan/swapchain.c"
 grep -q '^    int qidx = 0;$' "$DEPS/libplacebo/src/vulkan/swapchain.c"
 meson setup "$DEPS/libplacebo/b" "$DEPS/libplacebo" --prefix="$PREFIX" --buildtype=release \
   -Dlibdovi=disabled -Ddemos=false -Dtests=false 2>/dev/null || true
