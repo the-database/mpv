@@ -107,11 +107,14 @@ typedef struct aji_create_params {
     int slot;                 /* initial slot (1-9, 1001-1003, 1010-1011) */
     const char *rife_model_dir; /* dir with rife_v*.onnx + engine cache;
                                    NULL disables RIFE even if a chain asks */
-    int async_build;          /* nonzero: missing engines build on a
-                                 background thread; aji_configure returns
-                                 passthrough (or chain-without-rife)
-                                 meanwhile, and aji_poll() reports when to
-                                 reconfigure. Zero: builds block (CLI). */
+    int async_build;          /* 0: blocking builds; 1: background builds with
+                                 passthrough until aji_poll requests a
+                                 reconfigure; 2: cached-only, no builds,
+                                 cache writes/deletes or backend fallback.
+                                 Query aji_stream_policy_version_for_config
+                                 on the dispatcher, or the fixed
+                                 aji_stream_policy_version on a backend,
+                                 before requesting 2. */
     void *d3d11_device;       /* ID3D11Device* of the caller (the device
                                  the frame textures live on). Required by
                                  the DirectML backend; ignored by
@@ -141,6 +144,10 @@ typedef struct aji_frame {
 /* Additive policy capability. async_build=2 checks cached engines without
  * starting a builder or deleting incompatible engines. Query before use. */
 AJI_EXPORT int aji_stream_policy_version(void);
+/* Dispatcher query for the selected configuration (NULL = direct TensorRT).
+ * Reports policy support, not runtime/engine availability. No GPU work or
+ * backend fallback is performed. The dispatcher's no-argument probe is 0. */
+AJI_EXPORT int aji_stream_policy_version_for_config(const char *conf_path);
 AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params);
 
 /* Select the slot used by the next aji_configure() (conf mode). */
@@ -194,6 +201,19 @@ AJI_EXPORT int aji_scale_factor(aji_ctx *c);
 /* RIFE interpolation factor of the active chain. Returns 1 and fills
  * num/den if RIFE is active after the last aji_configure(), else 0. */
 AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den);
+
+/* Dispatcher query, no context: the RIFE factor (as configured, unreduced)
+ * of the chain aji_configure(w, h, fps) would activate for these create
+ * params (conf_path, model_dir, slot, rife_model_dir), read from the conf
+ * alone - no GPU work, no engine builds. Returns 1 and fills num/den if that
+ * chain runs RIFE, 0 if it doesn't (or direct mode, or an unreadable conf).
+ * Lets an offline caller reject a factor it can't schedule before
+ * aji_configure() spends minutes building engines; aji_rife_factor() stays
+ * the authority afterwards. Exported by the dispatcher only; additive, no
+ * API_VERSION bump. */
+AJI_EXPORT int aji_rife_factor_for_config(const aji_create_params *params,
+                                          int w, int h, double fps,
+                                          int *num, int *den);
 
 /* RIFE ordering of the active chain. Returns 1 if RIFE is active AND runs
  * before the upscale models (interpolating source-resolution frames, which
