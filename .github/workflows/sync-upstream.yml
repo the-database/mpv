@@ -4,6 +4,16 @@ name: Sync upstream
 # commits (e.g. the vf_vapoursynth fast-seek patch). Reproduces what GitHub's
 # "Sync fork" button does for a diverged fork: a merge, not a fast-forward.
 # (The merge-upstream REST API only fast-forwards, so it can't be used here.)
+#
+# Pushes with the MPV_SYNC_TOKEN secret: a fine-grained PAT on this repo only,
+# with Contents and Workflows read/write. GITHUB_TOKEN can't push a merge that
+# brings in upstream changes to .github/workflows (GitHub refuses it without the
+# workflows permission, which a workflow token can't have), and its pushes don't
+# start CI on master; the PAT's do. Without the secret it falls back to
+# GITHUB_TOKEN, which works only while upstream leaves the workflows alone.
+#
+# A conflict fails the run with the conflicting files in the run's summary
+# (issues are off on this repo); resolve it by hand as a merge commit.
 
 on:
   schedule:
@@ -12,7 +22,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 jobs:
   sync:
@@ -21,6 +30,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0   # full history required for a real merge
+          token: ${{ secrets.MPV_SYNC_TOKEN || github.token }}
 
       - name: Configure identity
         run: |
@@ -28,30 +38,39 @@ jobs:
           git config user.email "25811902+the-database@users.noreply.github.com"
 
       - name: Merge upstream
-        id: merge
+        env:
+          HAS_PAT: ${{ secrets.MPV_SYNC_TOKEN != '' }}
         run: |
           git remote add upstream https://github.com/mpv-player/mpv.git
           git fetch upstream master
-          if git merge -m "Merge branch 'mpv-player:master' into master" upstream/master; then
-            git push origin master
-          else
-            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
-            echo "conflict=1" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "Already up to date with upstream."
+            exit 0
+          fi
+          if ! git merge -m "Merge branch 'mpv-player:master' into master" upstream/master; then
+            files="$(git diff --name-only --diff-filter=U)"
             git merge --abort
+            {
+              echo "## Upstream sync conflict"
+              echo
+              echo "The merge of upstream/master conflicts in:"
+              echo
+              echo '```'
+              echo "$files"
+              echo '```'
+              echo
+              echo "Resolve it by hand as a merge commit (never a rebase or squash):"
+              echo
+              echo '```'
+              echo "git fetch upstream && git merge upstream/master"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            while read -r f; do echo "::error file=$f::upstream merge conflict"; done <<< "$files"
             exit 1
           fi
-
-      - name: Report conflict
-        if: failure() && steps.merge.outputs.conflict == '1'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          files="$(cat /tmp/conflicts.txt)"
-          title="Upstream sync conflict"
-          body=$'Nightly upstream merge hit conflicts in:\n\n```\n'"$files"$'\n```\n\nResolve manually:\n```\ngit fetch upstream && git merge upstream/master\n```'
-          n="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')"
-          if [ -n "$n" ]; then
-            gh issue comment "$n" --body "$body"$'\n\nRecurred in run '"${{ github.run_id }}"
-          else
-            gh issue create --title "$title" --body "$body"
+          if ! git push origin master; then
+            if [ "$HAS_PAT" != true ] && ! git diff --quiet HEAD^1 HEAD -- .github/workflows; then
+              echo "::error::The merge changes .github/workflows, which GITHUB_TOKEN can't push: set the MPV_SYNC_TOKEN secret (see this file's header)."
+            fi
+            exit 1
           fi
