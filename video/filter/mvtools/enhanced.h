@@ -1,6 +1,7 @@
 // AJN's optional scene classifier. The legacy MVTools search is unchanged.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <vector>
@@ -40,7 +41,7 @@ inline int pixel(const ajn_mvtools_frame &f, int x, int y) {
     const auto *row = f.planes[0] + y * f.strides[0];
     if (f.bits == 8) return row[x];
     uint16_t v; std::memcpy(&v, row + x * 2, sizeof(v));
-    return v >> (f.bits - 8);
+    return std::min(v >> (f.bits - 8), 255);
 }
 struct Appearance { Moments all, changed, matched; };
 inline Appearance measure(const ajn_mvtools_frame &a, const ajn_mvtools_frame &b,
@@ -158,8 +159,8 @@ inline std::vector<Point> points(const std::vector<float> &a,
     }
     // Match max_element's first-pixel tie break without rescanning the image
     // for each corner. Suppressed candidates are skipped in this fixed order.
-    std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
-        return score[a] != score[b] ? score[a] > score[b] : a < b;
+    std::sort(candidates.begin(), candidates.end(), [&](int first, int second) {
+        return score[first] != score[second] ? score[first] > score[second] : first < second;
     });
     std::vector<Point> out;
     int selected = 0;

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 #include <windows.h>
 #include "common/common.h"
 #include "test_utils.h"
@@ -227,21 +228,33 @@ int main(void)
 #if TEST_MVTOOLS
     // Built-in mode needs no host, named mapping, or lease renewal. It uses
     // the same nonblocking worker and must release the DLL when disabled.
+    // A missing optional DLL must fail startup before enabling look-ahead.
+    wchar_t dll_path[32768], unavailable_path[32768];
+    DWORD length = GetModuleFileNameW(NULL, dll_path, MP_ARRAY_SIZE(dll_path));
+    mp_require(length && length < MP_ARRAY_SIZE(dll_path));
+    wchar_t *slash = wcsrchr(dll_path, L'\\');
+    mp_require(slash && slash - dll_path + 32 < MP_ARRAY_SIZE(dll_path));
+    wcscpy(slash + 1, L"ajn-mvtools.dll");
+    wcscpy(unavailable_path, dll_path);
+    wcscat(unavailable_path, L".unavailable");
+    mp_require(MoveFileW(dll_path, unavailable_path));
+    s = ajn_scene_create(NULL);
+    bool missing_started = ajn_scene_start_enhanced(s);
+    bool missing_active = ajn_scene_active(s);
+    ajn_scene_destroy(s);
+    mp_require(MoveFileW(unavailable_path, dll_path));
+    mp_require(!missing_started && !missing_active);
+    mp_require(!GetModuleHandleW(L"ajn-mvtools.dll"));
     s = ajn_scene_create(NULL);
     mp_require(ajn_scene_start_enhanced(s) && ajn_scene_active(s));
-    mp_require(!GetModuleHandleW(L"ajn-mvtools.dll"));
+    mp_require(GetModuleHandleW(L"ajn-mvtools.dll"));
     for (int cut = 1; cut >= 0; cut--) {
         for (int y = 0; y < 32; y++)
             memset(b->planes[1] + y * b->stride[1], cut ? 192 : 64, 64);
         ajn_scene_reset(s);
         assert_int_equal(ajn_scene_decide(s, a, b, true), -1);
-        deadline = GetTickCount64() + 3000;
-        do {
-            ajn_scene_submit(s, a, b);
-            if (ajn_scene_decide(s, a, b, true) == cut) break;
-            mp_require(GetTickCount64() < deadline);
-            Sleep(1);
-        } while (true);
+        ajn_scene_submit(s, a, b);
+        assert_int_equal(await_decision(s, a, b, cut), cut);
         mp_require(GetModuleHandleW(L"ajn-mvtools.dll"));
     }
     ajn_scene_reset(s);
@@ -253,7 +266,7 @@ int main(void)
         Sleep(1);
     }
     mp_require(!ajn_scene_active(NULL));
-    puts("built-in enhanced mode: opt-in, cut/continuity, reset and DLL retirement passed");
+    puts("built-in enhanced mode: dependency probe, opt-in, cut/continuity, reset and DLL retirement passed");
 #endif
     talloc_free(a); talloc_free(b);
     UnmapViewOfFile(h); CloseHandle(mapping); CloseHandle(ready); CloseHandle(reply);
