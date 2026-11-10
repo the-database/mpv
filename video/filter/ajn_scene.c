@@ -30,7 +30,7 @@ struct ajn_scene {
     mp_mutex mutex;
     HMODULE worker_module;
     LONG stopping, references;
-    bool started, reserved;
+    bool started, reserved, builtin;
     // At most one waiting pair plus the pair in flight; do not exhaust the
     // decoder surface pool while an optional detector is slow.
     struct scene_job jobs[1];
@@ -147,6 +147,55 @@ void ajn_scene_reset(struct ajn_scene *s)
 }
 static DWORD WINAPI scene_worker(void *context);
 
+static bool start_worker(struct ajn_scene *s)
+{
+    ajn_scene_reset(s);
+    s->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!s->wake) goto fail;
+    if (InterlockedIncrement(&scene_workers) > 4) {
+        InterlockedDecrement(&scene_workers); goto fail;
+    }
+    s->reserved = true;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (LPCWSTR)(uintptr_t)scene_worker, &s->worker_module)) goto fail;
+    InterlockedIncrement(&s->references);
+    HANDLE thread = CreateThread(NULL, 0, scene_worker, s, 0, NULL);
+    if (!thread) {
+        InterlockedDecrement(&s->references); goto fail;
+    }
+    CloseHandle(thread);
+    s->started = true;
+    return true;
+fail:
+    if (s->worker_module) { FreeLibrary(s->worker_module); s->worker_module = NULL; }
+    if (s->reserved) { InterlockedDecrement(&scene_workers); s->reserved = false; }
+    if (s->wake) { CloseHandle(s->wake); s->wake = NULL; }
+    return false;
+}
+
+bool ajn_scene_start_enhanced(struct ajn_scene *s)
+{
+#if !HAVE_GPL
+    return false;
+#else
+    if (!s || s->shared) return false;
+    // Private state: no addon host, named mapping, heartbeat or reply event.
+    // This is allocated only when the active RIFE chain explicitly opts in.
+    s->shared = talloc_zero(s, struct ajn_scene_shared);
+    s->builtin = true;
+    *s->shared = (struct ajn_scene_shared){
+        .magic = AJN_SCENE_MAGIC, .version = AJN_SCENE_VERSION,
+        .capacity = AJN_SCENE_BYTES, .header_bytes = 256,
+        .enabled = 1, .generation = 1, .lease_until_ms = INT64_MAX,
+        .width = AJN_SCENE_WIDTH, .height = AJN_SCENE_HEIGHT,
+        .budget_ms = 100, .algorithm = 2, .thscd1 = 240, .thscd2 = 130,
+    };
+    if (start_worker(s)) return true;
+    TA_FREEP(&s->shared);
+    return false;
+#endif
+}
+
 bool ajn_scene_connect(struct ajn_scene *s, const char *name)
 {
     if (!s || !name) return false;
@@ -174,27 +223,8 @@ bool ajn_scene_connect(struct ajn_scene *s, const char *name)
     s->reply = OpenEventW(SYNCHRONIZE, FALSE, wide);
     if (!s->ready || !s->reply) goto fail;
     snprintf(s->name, sizeof(s->name), "%s", name);
-    ajn_scene_reset(s);
-    s->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!s->wake) goto fail;
-    if (InterlockedIncrement(&scene_workers) > 4) {
-        InterlockedDecrement(&scene_workers); goto fail;
-    }
-    s->reserved = true;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-        (LPCWSTR)(uintptr_t)scene_worker, &s->worker_module)) goto fail;
-    InterlockedIncrement(&s->references);
-    HANDLE thread = CreateThread(NULL, 0, scene_worker, s, 0, NULL);
-    if (!thread) {
-        InterlockedDecrement(&s->references); goto fail;
-    }
-    CloseHandle(thread);
-    s->started = true;
-    return true;
+    if (start_worker(s)) return true;
 fail:
-    if (s->worker_module) { FreeLibrary(s->worker_module); s->worker_module = NULL; }
-    if (s->reserved) { InterlockedDecrement(&scene_workers); s->reserved = false; }
-    if (s->wake) { CloseHandle(s->wake); s->wake = NULL; }
     s->name[0] = 0;
     UnmapViewOfFile(s->shared); s->shared = NULL;
     if (s->ready) CloseHandle(s->ready);
@@ -209,7 +239,7 @@ static void scene_release(struct ajn_scene *s)
         talloc_free(s->jobs[i].a); talloc_free(s->jobs[i].b);
     }
     mv_close(s);
-    if (s->shared) UnmapViewOfFile(s->shared);
+    if (s->shared && !s->builtin) UnmapViewOfFile(s->shared);
     if (s->ready) CloseHandle(s->ready);
     if (s->reply) CloseHandle(s->reply);
     if (s->wake) CloseHandle(s->wake);

@@ -1,7 +1,6 @@
 // AJN's optional scene classifier. The legacy MVTools search is unchanged.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
-#include <algorithm>
 #include <array>
 #include <cmath>
 #include <vector>
@@ -41,7 +40,7 @@ inline int pixel(const ajn_mvtools_frame &f, int x, int y) {
     const auto *row = f.planes[0] + y * f.strides[0];
     if (f.bits == 8) return row[x];
     uint16_t v; std::memcpy(&v, row + x * 2, sizeof(v));
-    return std::min(v >> (f.bits - 8), 255);
+    return v >> (f.bits - 8);
 }
 struct Appearance { Moments all, changed, matched; };
 inline Appearance measure(const ajn_mvtools_frame &a, const ajn_mvtools_frame &b,
@@ -99,6 +98,43 @@ inline bool patch_motion(const ajn_mvtools_frame &a, const ajn_mvtools_frame &b,
 }
 
 struct Point { int x, y; std::array<float, 36> descriptor; };
+inline bool structural_continuity(const ajn_mvtools_frame &a, const ajn_mvtools_frame &b,
+                                 const VECTOR *vectors, int nx, int ny, int64_t threshold) {
+    // A lighting pulse can invalidate SAD and its motion vector while leaving
+    // local structure intact. Check both the stationary and predicted patch.
+    // The caller also requires aligned, established motion; several textured
+    // regions must agree so a shared border alone cannot rescue the pair.
+    int tested = 0, good = 0, cells[12]{};
+    for (int by = 2; by < ny - 2; by += 4) for (int bx = 2; bx < nx - 2; bx += 4) {
+        const auto &v = vectors[by * nx + bx];
+        if (v.sad <= threshold) continue;
+        int x = bx * 8 + 4, y = by * 8 + 4;
+        Moments direct, aligned;
+        int u = x + v.x, z = y + v.y;
+        bool inside = u >= 16 && z >= 16 && u + 16 < b.width && z + 16 < b.height;
+        for (int yy = -16; yy <= 16; yy += 4) for (int xx = -16; xx <= 16; xx += 4) {
+            int av = pixel(a, x + xx, y + yy);
+            direct.add(av, pixel(b, x + xx, y + yy));
+            if (inside) aligned.add(av, pixel(b, u + xx, z + yy));
+        }
+        if (direct.variance(0) < 25 || direct.variance(1) < 25) continue;
+        ++tested;
+        auto agrees = [](const Moments &m) {
+            double va = m.variance(0), vb = m.variance(1);
+            return va > 25 && vb > 25 && va < 4 * vb && vb < 4 * va && m.correlation() > .92;
+        };
+        if (agrees(direct) || (inside && agrees(aligned))) {
+            ++good; ++cells[(y * 3 / a.height) * 4 + x * 4 / a.width];
+        }
+    }
+    if (good < 12 || good < .4 * tested) return false;
+    for (int i = 0; i < 12; ++i) if (cells[i] >= 3)
+        for (int j = 0; j < i; ++j) if (cells[j] >= 3)
+            for (int k = 0; k < j; ++k) if (cells[k] >= 3 &&
+                (i % 4 - k % 4) * (j / 4 - k / 4) !=
+                (j % 4 - k % 4) * (i / 4 - k / 4)) return true;
+    return false;
+}
 inline std::vector<float> thumbnail(const ajn_mvtools_frame &f, int w, int h) {
     std::vector<float> out(w * h);
     for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
@@ -110,7 +146,7 @@ inline std::vector<float> thumbnail(const ajn_mvtools_frame &f, int w, int h) {
     return out;
 }
 inline std::vector<Point> points(const std::vector<float> &a,
-                                 const std::vector<float> &b, int w, int h) {
+                                 const std::vector<float> &b, int w, int h, int limit = 96) {
     std::vector<float> score(w * h);
     std::vector<int> candidates;
     for (int y = 6; y < h - 6; ++y) for (int x = 6; x < w - 6; ++x) {
@@ -122,14 +158,14 @@ inline std::vector<Point> points(const std::vector<float> &a,
     }
     // Match max_element's first-pixel tie break without rescanning the image
     // for each corner. Suppressed candidates are skipped in this fixed order.
-    std::sort(candidates.begin(), candidates.end(), [&](int first, int second) {
-        return score[first] != score[second] ? score[first] > score[second] : first < second;
+    std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
+        return score[a] != score[b] ? score[a] > score[b] : a < b;
     });
     std::vector<Point> out;
     int selected = 0;
     for (int i : candidates) {
         if (!score[i]) continue;
-        if (selected++ == 96) break;
+        if (selected++ == limit) break;
         int x = i % w, y = i / w;
         Point p{x, y, {}}; int k = 0; float sum = 0, norm = 0;
         for (int yy = y - 5; yy <= y + 5; yy += 2)
@@ -273,13 +309,14 @@ inline bool regional_matches(const std::vector<std::pair<Point, Point>> &matches
     return false;
 }
 inline Correspondence correspondence(const ajn_mvtools_frame &a, const ajn_mvtools_frame &b,
-                                     int required_matches, bool finer = false, const VECTOR *vectors = nullptr) {
+                                     int required_matches, bool finer = false, const VECTOR *vectors = nullptr,
+                                     int max_points = 96) {
     int max_w = finer ? 240 : 120, max_h = finer ? 135 : 68;
     int w = std::min(max_w, a.width), h = std::max(1, std::min(a.height, (a.height * w + a.width / 2) / a.width));
     if (h > max_h) { w = std::max(1, w * max_h / h); h = max_h; }
     if (w < 13 || h < 13) return Correspondence::Unknown;
     auto ta = thumbnail(a, w, h), tb = thumbnail(b, w, h);
-    auto pa = points(ta, tb, w, h), pb = points(tb, ta, w, h);
+    auto pa = points(ta, tb, w, h, max_points), pb = points(tb, ta, w, h, max_points);
     if (pa.size() < 12 || pb.size() < 12) return Correspondence::Unknown;
     std::vector<float> distance(pa.size() * pb.size());
     for (size_t i = 0; i < pa.size(); ++i) for (size_t j = 0; j < pb.size(); ++j) {

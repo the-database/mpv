@@ -197,7 +197,8 @@ int ajn_mvtools_analyze_enhanced(void *context, const ajn_mvtools_frame *a,
             (std::max(s.changed.variance(0), s.changed.variance(1)) < 16 &&
              (s.changed.difference() < 12 || raw < 1.5 * old_raw));
         bool enough_blocks = out->changed_blocks > int64_t(thscd2) * out->total_blocks * 75 / (130 * 256);
-        bool flat_cut = enough_blocks && raw > std::max(12.0, 2 * old_raw) &&
+        bool flat_cut = enough_blocks && raw > std::max(8.0, 2 * old_raw) &&
+                        s.changed.difference() > 12 &&
                         std::min(s.all.variance(0), s.all.variance(1)) < 1;
         // Dark shots may have too few corners for feature correspondence.
         // After quiet history, anticorrelated (not flat) changed regions still
@@ -206,31 +207,67 @@ int ajn_mvtools_analyze_enhanced(void *context, const ajn_mvtools_frame *a,
         bool sparse_dark = old_raw == 2 && old_residual == 3 && raw > 5 &&
             spatial < 0 && aligned < 0 && s.all.n &&
             s.all.sum[0] < 32 * s.all.n && s.all.sum[1] < 32 * s.all.n;
+        // A reverse-angle edit can keep the same palette. After quiet frames,
+        // disagreement both before and after motion compensation warrants
+        // feature verification even if the brightness histograms still match.
+        // The existing correspondence and dark-cut checks still decide it.
+        bool abrupt_structure = old_raw == 2 && old_residual == 3 &&
+                                spatial < 0 && aligned < 0;
+        bool appearance_change = ((s.all.distance() > .12 || s.changed.distance() > .3) &&
+                                  histogram > .15) || abrupt_structure;
         bool weak = enough_blocks && !d.last_cut && spatial < .4 && aligned < .88 &&
-            (s.all.distance() > .12 || s.changed.distance() > .3) && histogram > .15 &&
+            appearance_change &&
             raw > 1.8 * old_raw && residual > 2.1 * old_residual &&
             raw * residual > 5.5 * old_raw * old_residual && (!s.all.dominated() || sparse_dark);
+        // A dark cut can change only the lit subject. Unlike a histogram,
+        // structural disagreement still distinguishes equal-palette shots.
+        bool structural_cut = !d.last_cut &&
+            out->changed_blocks > int64_t(thscd2) * out->total_blocks * 50 / (130 * 256) &&
+            spatial < .15 && aligned < .55 && raw > 1.8 * old_raw &&
+            residual > 1.5 * old_residual && raw * residual > 5.5 * old_raw * old_residual &&
+            std::min(s.changed.variance(0), s.changed.variance(1)) > 25 &&
+            s.all.distance() > .08 &&
+            ((old_raw == 2 && old_residual == 3) ||
+             (s.all.distance() > .4 && !s.all.dominated()));
         // A pan/zoom can change most pixels while retaining the same picture.
         // Require more feature matches to overturn a strong MVTools decision
         // than to reject a weak candidate. Insufficient detail is not evidence.
-        if (out->cut && !continuous && s.all.distance() < .3) {
-            continuous = enhanced::correspondence(*a, *b, 8) == enhanced::Correspondence::Moving;
-            // Smaller image patches can track a deforming face that coarse
-            // descriptors lose. Restrict refinement to already aligned,
-            // ongoing motion; abrupt edits need the stronger coarse evidence.
-            if (!continuous && spatial > .5 && aligned > .85 &&
+        bool verified_continuity = false;
+        if (out->cut && !continuous) {
+            if (s.all.distance() < .3 || (spatial > .6 && aligned > .85))
+                continuous = enhanced::correspondence(*a, *b, 8) == enhanced::Correspondence::Moving;
+            bool partial_motion = false;
+            if (!continuous && s.all.distance() < .3 && aligned > .6)
+                partial_motion = enhanced::correspondence(*a, *b, 4) == enhanced::Correspondence::Moving;
+            if (partial_motion && spatial > .7 && aligned > .9 &&
                 raw <= 2 * old_raw && residual <= 2 * old_residual)
-                continuous = enhanced::correspondence(*a, *b, 8, true, d.motion->gop.planes[0]->vectors) == enhanced::Correspondence::Moving;
+                continuous = true;
+            // Smaller image patches can track a deforming face that coarse
+            // descriptors lose. Partial coarse tracks need aligned appearance;
+            // a large palette shift instead needs ongoing whole-picture
+            // agreement and more features (e.g. moving, brightly lit cloth).
+            if (!continuous && aligned > .6 &&
+                ((partial_motion && spatial < .4) ||
+                 (spatial > .5 && aligned > .85 && raw <= 2 * old_raw && residual <= 2 * old_residual) ||
+                 (s.all.distance() >= .3 && s.all.correlation() > .7 && aligned > .75 &&
+                  raw <= 2 * old_raw && residual <= 2 * old_residual)))
+                continuous = enhanced::correspondence(*a, *b, 8, true, d.motion->gop.planes[0]->vectors,
+                    s.all.distance() >= .3 ? 192 : 96) == enhanced::Correspondence::Moving;
             // Effects can deform too much for sparse corner correspondence.
             // Require distributed patch continuity and an established motion
             // history before overriding a cut with this evidence.
             if (!continuous && aligned > .85 && raw <= 2 * old_raw && residual <= 2 * old_residual)
                 continuous = enhanced::patch_motion(*a, *b, d.motion->gop.planes[0]->vectors,
                     d.analysis.nBlkX, d.analysis.nBlkY, out->block_sad_threshold);
+            if (!continuous && spatial > .6 && aligned > .75 &&
+                raw <= 2 * old_raw && residual <= 2 * old_residual)
+                continuous = enhanced::structural_continuity(*a, *b, d.motion->gop.planes[0]->vectors,
+                    d.analysis.nBlkX, d.analysis.nBlkY, out->block_sad_threshold);
+            verified_continuity = continuous;
         }
         // Shared borders or a similar palette can mask an abrupt edit. Do not
         // override the original decision without actual feature continuity.
-        if (out->cut && continuous && spatial < .9 && histogram > .15 &&
+        if (out->cut && continuous && !verified_continuity && spatial < .9 && histogram > .15 &&
             raw > 2 * old_raw && residual > 2 * old_residual)
             continuous = enhanced::correspondence(*a, *b, 8) == enhanced::Correspondence::Moving;
         // Luma continuity cannot disprove a cut detected only in chroma.
@@ -240,6 +277,12 @@ int ajn_mvtools_analyze_enhanced(void *context, const ajn_mvtools_frame *a,
             auto relation = enhanced::correspondence(*a, *b, 4);
             cut = relation == enhanced::Correspondence::Distinct ||
                   (sparse_dark && relation == enhanced::Correspondence::Unknown);
+        }
+        if (!cut && structural_cut) {
+            auto relation = enhanced::correspondence(*a, *b, 4);
+            if (relation == enhanced::Correspondence::Unknown)
+                relation = enhanced::correspondence(*a, *b, 4, true);
+            cut = relation == enhanced::Correspondence::Distinct;
         }
         out->cut = cut;
         // Learn ordinary motion, not the discontinuity at an accepted cut.

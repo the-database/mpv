@@ -128,4 +128,4 @@ option('win32-subsystem', type : 'string', value: 'windows', description : 'Wind
 option('html-build', type: 'feature', value: 'disabled', description: 'HTML manual generation')
 option('manpage-build', type: 'feature', value: 'auto', description: 'manpage generation')
 option('pdf-build', type: 'feature', value: 'disabled', description: 'PDF manual generation')
-option('ajn-mvtools', type: 'boolean', value: false, description: 'Build the optional GPL addon scene-detector DLL (Windows/CUDA only)')
+option('ajn-mvtools', type: 'boolean', value: false, description: 'Build the optional GPL RIFE scene-detector DLL (Windows/CUDA only)')
