@@ -584,14 +584,25 @@ static void stream_status(struct mp_filter *vf, const char *state)
             p->rife_on ? 1 : 0, p->fps * (p->rife_on ? (double)p->rife_num / p->rife_den : 1));
 }
 
-static void configure_scene(struct mp_filter *vf)
+static void configure_scene(struct mp_filter *vf, bool rife_active)
 {
     struct priv *p = vf->priv;
     // External scene-map users retain ownership while attached. With the
     // experimental setting off, scene stays NULL and the existing frame path
     // (including queue depth) is unchanged. Query the setting only at setup.
-    if (p->scene || !p->aji || !p->rife_on || !p->api.rife_enhanced_scene ||
-        !p->api.rife_enhanced_scene(p->aji)) return;
+    if (p->scene && !p->scene_builtin) return;
+    bool enabled = p->aji && rife_active && p->api.rife_enhanced_scene &&
+                   p->api.rife_enhanced_scene(p->aji);
+    if (!enabled) {
+        if (p->scene_builtin) {
+            ajn_scene_destroy(p->scene); p->scene = NULL;
+            p->scene_builtin = false;
+        }
+        return;
+    }
+    // A reconfigure invalidates pending pairs, but an enabled chain can reuse
+    // its worker and native context instead of retiring and reloading them.
+    if (p->scene) return;
     if (!p->api.infer_rife_with_scene || !p->api.rife_scene_supported ||
         !p->api.rife_scene_supported(p->aji)) {
         MP_WARN(vf, "Experimental RIFE scene detection requires scene override support\n");
@@ -614,14 +625,12 @@ static bool configure_aji(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
 
-    if (p->scene_builtin) {
-        ajn_scene_destroy(p->scene); p->scene = NULL;
-        p->scene_builtin = false;
-    }
+    if (p->scene_builtin) ajn_scene_reset(p->scene);
     p->scene_decision = -1;
     p->out_params = p->params;
     p->aji_active = false;
     if (!p->aji) {
+        configure_scene(vf, false);
         update_depth(vf);
         return true;
     }
@@ -633,6 +642,7 @@ static bool configure_aji(struct mp_filter *vf)
     int ret = p->api.configure(p->aji, p->params.w, p->params.h, p->fps,
                                &ow, &oh);
     if (ret < 0) {
+        configure_scene(vf, false);
         const char *error = p->api.last_error(p->aji);
         stream_status(vf, strstr(error, "AJN_ENGINE_MISSING") ? "engineMissing" :
                           strstr(error, "AJN_ENGINE_INCOMPATIBLE") ? "engineIncompatible" : "failed");
@@ -651,10 +661,12 @@ static bool configure_aji(struct mp_filter *vf)
 
     const char *details = p->api.current_log(p->aji);
     if (p->opts->stream_mode && strstr(details, "Engine build FAILED")) {
+        configure_scene(vf, false);
         stream_status(vf, "preparationFailed");
         return false;
     }
     if (p->opts->stream_mode && strstr(details, "Building TensorRT engine")) {
+        configure_scene(vf, false);
         stream_status(vf, "building");
         return true; // Only preparation can reach here on the matching backend.
     }
@@ -688,7 +700,7 @@ static bool configure_aji(struct mp_filter *vf)
     }
     p->rife_acc = p->rife_den;
 
-    configure_scene(vf);
+    configure_scene(vf, p->rife_on);
 
     if (ret == 0) {
         MP_VERBOSE(vf, "No chain active for %dx%d@%.3f slot %d (passthrough)\n",
@@ -1996,7 +2008,7 @@ static bool vf_animejanai_command(struct mp_filter *vf,
             ok = ajn_scene_connect(p->scene, cmd->arg);
             if (!ok) { ajn_scene_destroy(p->scene); p->scene = NULL; }
         }
-        configure_scene(vf);
+        configure_scene(vf, p->rife_on);
         update_depth(vf);
         return ok;
     }
