@@ -83,16 +83,34 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     check_error(mpv_set_option_string(ctx, "demuxer", MPV_DEMUXER));
 #endif
 
-    check_error(mpv_initialize(ctx));
+    const char *url = filename;
+#ifdef MPV_SUB_FILE
+    mpv_node node = {
+        .format = MPV_FORMAT_NODE_ARRAY,
+        .u.list = &(mpv_node_list) {
+            .num = 1,
+            .values = &(mpv_node) {
+                .format = MPV_FORMAT_STRING,
+                .u.string = filename,
+            },
+        },
+    };
+    check_error(mpv_set_option(ctx, "sub-files", MPV_FORMAT_NODE, &node));
+    check_error(mpv_set_option_string(ctx, "sub-filter-sdh", "yes"));
+    check_error(mpv_set_option_string(ctx, "vf", "sub"));
+    url = "av://lavfi:yuvtestsrc=d=1";
+#endif
 
-    const char *cmd[] = {"load" MPV_LOAD, filename, NULL};
+    initialize(ctx);
+
+    const char *cmd[] = {"load" MPV_LOAD, url, NULL};
     check_error(mpv_command(ctx, cmd));
 
 #ifdef MPV_LOADFILE
     player_loop(ctx);
 #endif
 
-    mpv_terminate_destroy(ctx);
+    destroy(ctx);
 
     if (close(fd))
         exit(1);
