@@ -224,6 +224,37 @@ int main(void)
         mp_require(GetTickCount64() < deadline);
         Sleep(1);
     }
+#if TEST_MVTOOLS
+    // Built-in mode needs no host, named mapping, or lease renewal. It uses
+    // the same nonblocking worker and must release the DLL when disabled.
+    s = ajn_scene_create(NULL);
+    mp_require(ajn_scene_start_enhanced(s) && ajn_scene_active(s));
+    mp_require(!GetModuleHandleW(L"ajn-mvtools.dll"));
+    for (int cut = 1; cut >= 0; cut--) {
+        for (int y = 0; y < 32; y++)
+            memset(b->planes[1] + y * b->stride[1], cut ? 192 : 64, 64);
+        ajn_scene_reset(s);
+        assert_int_equal(ajn_scene_decide(s, a, b, true), -1);
+        deadline = GetTickCount64() + 3000;
+        do {
+            ajn_scene_submit(s, a, b);
+            if (ajn_scene_decide(s, a, b, true) == cut) break;
+            mp_require(GetTickCount64() < deadline);
+            Sleep(1);
+        } while (true);
+        mp_require(GetModuleHandleW(L"ajn-mvtools.dll"));
+    }
+    ajn_scene_reset(s);
+    assert_int_equal(ajn_scene_decide(s, a, b, true), -1);
+    ajn_scene_destroy(s);
+    deadline = GetTickCount64() + 3000;
+    while (GetModuleHandleW(L"ajn-mvtools.dll")) {
+        mp_require(GetTickCount64() < deadline);
+        Sleep(1);
+    }
+    mp_require(!ajn_scene_active(NULL));
+    puts("built-in enhanced mode: opt-in, cut/continuity, reset and DLL retirement passed");
+#endif
     talloc_free(a); talloc_free(b);
     UnmapViewOfFile(h); CloseHandle(mapping); CloseHandle(ready); CloseHandle(reply);
     puts("scene bridge: asynchronous decisions, no wait on a slow responder, samples, reset, fallback and revocation passed");

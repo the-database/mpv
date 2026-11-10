@@ -184,6 +184,7 @@ struct aji_api {
     int (*infer_rife)(aji_ctx *c, const aji_frame *a, const aji_frame *b,
                       double t, const aji_frame *out, void *cu_stream);
     int (*rife_scene_supported)(aji_ctx *c);
+    int (*rife_enhanced_scene)(aji_ctx *c); // optional configure-time query
     int (*infer_rife_with_scene)(aji_ctx *c, const aji_frame *a, const aji_frame *b,
                       double t, const aji_frame *out, void *cu_stream, int scene);
     int (*poll)(aji_ctx *c);
@@ -276,6 +277,7 @@ struct priv {
     // only serve as interpolation endpoints.
     bool rife_on;
     struct ajn_scene *scene;
+    bool scene_builtin;
     int scene_decision;
     int rife_num, rife_den;     // reduced output multiplier num/den
     int rife_acc;               // next grid point's offset into the
@@ -582,6 +584,29 @@ static void stream_status(struct mp_filter *vf, const char *state)
             p->rife_on ? 1 : 0, p->fps * (p->rife_on ? (double)p->rife_num / p->rife_den : 1));
 }
 
+static void configure_scene(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    // External scene-map users retain ownership while attached. With the
+    // experimental setting off, scene stays NULL and the existing frame path
+    // (including queue depth) is unchanged. Query the setting only at setup.
+    if (p->scene || !p->aji || !p->rife_on || !p->api.rife_enhanced_scene ||
+        !p->api.rife_enhanced_scene(p->aji)) return;
+    if (!p->api.infer_rife_with_scene || !p->api.rife_scene_supported ||
+        !p->api.rife_scene_supported(p->aji)) {
+        MP_WARN(vf, "Experimental RIFE scene detection requires scene override support\n");
+        return;
+    }
+    p->scene = ajn_scene_create(vf->log);
+    if (!ajn_scene_start_enhanced(p->scene)) {
+        ajn_scene_destroy(p->scene); p->scene = NULL;
+        MP_WARN(vf, "Experimental RIFE scene detection could not start\n");
+        return;
+    }
+    p->scene_builtin = true;
+    MP_INFO(vf, "Experimental RIFE scene detection enabled\n");
+}
+
 // (Re)configure the shim for the current stream params and slot. Updates
 // out_params (and thus the output pool geometry). May block on first-play
 // engine builds, like the legacy pipeline.
@@ -589,6 +614,11 @@ static bool configure_aji(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
 
+    if (p->scene_builtin) {
+        ajn_scene_destroy(p->scene); p->scene = NULL;
+        p->scene_builtin = false;
+    }
+    p->scene_decision = -1;
     p->out_params = p->params;
     p->aji_active = false;
     if (!p->aji) {
@@ -657,6 +687,8 @@ static bool configure_aji(struct mp_filter *vf)
         }
     }
     p->rife_acc = p->rife_den;
+
+    configure_scene(vf);
 
     if (ret == 0) {
         MP_VERBOSE(vf, "No chain active for %dx%d@%.3f slot %d (passthrough)\n",
@@ -1956,6 +1988,7 @@ static bool vf_animejanai_command(struct mp_filter *vf,
         return false;
     if (strcmp(cmd->cmd, "scene-map") == 0 && cmd->arg) {
         ajn_scene_destroy(p->scene); p->scene = NULL;
+        p->scene_builtin = false;
         p->scene_decision = -1;
         bool ok = true;
         if (*cmd->arg) {
@@ -1963,6 +1996,7 @@ static bool vf_animejanai_command(struct mp_filter *vf,
             ok = ajn_scene_connect(p->scene, cmd->arg);
             if (!ok) { ajn_scene_destroy(p->scene); p->scene = NULL; }
         }
+        configure_scene(vf);
         update_depth(vf);
         return ok;
     }
@@ -2126,6 +2160,7 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         p->api.resize = aji_lib_sym(p->api.handle, "aji_resize");
         p->api.infer_rife = aji_lib_sym(p->api.handle, "aji_infer_rife");
         p->api.rife_scene_supported = aji_lib_sym(p->api.handle, "aji_rife_scene_supported");
+        p->api.rife_enhanced_scene = aji_lib_sym(p->api.handle, "aji_rife_enhanced_scene");
         p->api.infer_rife_with_scene = aji_lib_sym(p->api.handle, "aji_infer_rife_with_scene");
         p->api.poll = aji_lib_sym(p->api.handle, "aji_poll");
         p->api.temporal_radius =

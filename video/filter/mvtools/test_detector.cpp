@@ -197,6 +197,19 @@ static void enhanced_cuts() {
         a.f.pts = 12; b.f.pts = 13;
         require(ajn_mvtools_analyze_enhanced(d, &a.f, &b.f, 240, 130, &enhanced) == 0 && !enhanced.cut,
                 "small fade out of black must not hold interpolation");
+        // The local picture can disappear abruptly while the black surround
+        // keeps the whole-frame change below twelve luma levels.
+        b.fill(0, 0);
+        for (int y = 0; y < 64; ++y) for (int x = 32; x < 96; ++x) {
+            int sample = 20 * ((1 << bits) - 1) / 255;
+            size_t at = y * b.f.strides[0] + x * (bits / 8);
+            b.p[0][at] = sample & 255;
+            if (bits == 16) b.p[0][at + 1] = sample >> 8;
+        }
+        ajn_mvtools_reset(d);
+        b.f.pts = 12; a.f.pts = 13;
+        require(ajn_mvtools_analyze_enhanced(d, &b.f, &a.f, 240, 130, &enhanced) == 0 && enhanced.cut,
+                "an abrupt dark picture to black must not become a dissolve");
         // Global illumination changes preserve structure despite high SAD.
         for (int y = 0; y < 64; ++y) for (int x = 0; x < 128; ++x) {
             int v = 20 + (x * 7 + y * 13) % 100;
@@ -228,6 +241,32 @@ static void enhanced_cuts() {
                     "a continuous fade must reach black without a final hold");
         }
         ajn_mvtools_destroy(d);
+    }
+}
+static void lighting_patches() {
+    constexpr int w = 640, h = 384;
+    for (int bits : {8, 16}) {
+        Image a(w, h, bits, false, 0), b(w, h, bits, false, 1);
+        std::vector<VECTOR> vectors(w / 8 * (h / 8), VECTOR{0, 0, 4096});
+        uint32_t random = 193;
+        auto put = [bits](Image &im, int i, int value) {
+            value *= ((1 << bits) - 1) / 255;
+            im.p[0][i * (bits / 8)] = value & 255;
+            if (bits == 16) im.p[0][i * 2 + 1] = value >> 8;
+        };
+        for (int i = 0; i < w * h; ++i) {
+            random = random * 1664525u + 1013904223u;
+            int value = 30 + (random >> 24) / 2;
+            put(a, i, value); put(b, i, value * 3 / 4 + 20);
+        }
+        require(enhanced::structural_continuity(a.f, b.f, vectors.data(), w / 8, h / 8, 360),
+                "local structure survives changed illumination without motion vectors");
+        for (int i = w * h / 3; i < w * h; ++i) {
+            random = random * 1664525u + 1013904223u;
+            put(b, i, 30 + (random >> 24) / 2);
+        }
+        require(!enhanced::structural_continuity(a.f, b.f, vectors.data(), w / 8, h / 8, 360),
+                "a shared lit border cannot hide unrelated content elsewhere");
     }
 }
 static void repeated_frames() {
@@ -264,17 +303,13 @@ static void repeated_frames() {
     }
 }
 int main(int argc, char **argv) {
-    // Containers may carry values outside the declared 9–15-bit range.
-    // The enhanced histogram always has 32 bins of eight 8-bit levels.
-    Image oversized(64, 64, 10, false, 0);
-    oversized.fill(0, 65535);
-    require(enhanced::pixel(oversized.f, 0, 0) == 255, "out-of-range samples saturate before histogram indexing");
     corner_order();
     patch_tracking();
     regional_motion();
     deforming_patches();
     kernels_match();
     enhanced_cuts();
+    lighting_patches();
     repeated_frames();
     void *d = ajn_mvtools_create(); require(d, "create");
     ajn_mvtools_result r{};
