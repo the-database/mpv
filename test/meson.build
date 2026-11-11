@@ -141,6 +141,19 @@ if win32
     endif
 endif
 
+if host_machine.system() == 'linux' and features['cuda-hwaccel'] and get_option('ajn-mvtools')
+    ajn_scene_builtin = executable('ajn-scene-builtin', 'ajn_scene_builtin.c', include_directories: incdir,
+        objects: libmpv.extract_objects('video/filter/ajn_scene.c', 'video/mp_image_pool.c'),
+        dependencies: [libavutil, libswscale, zimg, libplacebo, libdl], link_with: [img_utils, test_utils])
+    # Loaded beside its module, which is the test executable here.
+    ajn_scene_builtin_detector = custom_target('ajn-scene-builtin-detector',
+        input: mvtools_library, output: 'ajn-mvtools.so',
+        command: [python, '-c',
+            'import shutil, sys; shutil.copyfile(sys.argv[1], sys.argv[2])',
+            '@INPUT@', '@OUTPUT@'])
+    test('ajn-scene-builtin', ajn_scene_builtin, depends: ajn_scene_builtin_detector)
+endif
+
 timer = executable('timer', files('timer.c'), include_directories: incdir, link_with: test_utils)
 test('timer', timer)
 

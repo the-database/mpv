@@ -3,13 +3,21 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
 #include <wchar.h>
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <unistd.h>
+#endif
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 #include "common/common.h"
 #include "common/msg.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
 #include "video/sws_utils.h"
@@ -23,13 +31,95 @@
 // never waits for readback, native analysis, or a guest reply.
 struct scene_job { struct mp_image *a, *b; int64_t epoch, generation; };
 struct scene_result { double a, b; int decision; int64_t epoch, generation; };
-static LONG scene_workers;
+
+// The built-in detector runs wherever this file is built. The addon bridge
+// (a named mapping and events shared with a guest process) is Windows-only.
+#ifdef _WIN32
+typedef HMODULE scene_module;
+typedef HANDLE scene_event;
+#define scene_inc(p) InterlockedIncrement((volatile LONG *)(p))
+#define scene_dec(p) InterlockedDecrement((volatile LONG *)(p))
+#define scene_store(p, v) InterlockedExchange((volatile LONG *)(p), (v))
+#define scene_cas(p, v, old) InterlockedCompareExchange((volatile LONG *)(p), (v), (old))
+#define scene_inc64(p) InterlockedIncrement64((volatile LONG64 *)(p))
+#define scene_store64(p, v) InterlockedExchange64((volatile LONG64 *)(p), (v))
+#define scene_load64(p) InterlockedCompareExchange64((volatile LONG64 *)(p), 0, 0)
+static inline int64_t scene_now_ms(void) { return (int64_t)GetTickCount64(); }
+static inline int64_t scene_now_us(void)
+{
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
+    return now.QuadPart * 1000000 / frequency.QuadPart;
+}
+static inline scene_event scene_event_create(void) { return CreateEventW(NULL, FALSE, FALSE, NULL); }
+static inline void scene_event_set(scene_event e) { SetEvent(e); }
+static inline void scene_event_wait(scene_event e) { WaitForSingleObject(e, INFINITE); }
+static inline void scene_event_destroy(scene_event e) { if (e) CloseHandle(e); }
+#if HAVE_GPL
+static inline void *scene_sym(scene_module m, const char *name) { return (void *)GetProcAddress(m, name); }
+#endif
+static inline void scene_unload(scene_module m) { FreeLibrary(m); }
+#else
+typedef void *scene_module;
+// An auto-reset event: a set wakes one wait, and a set with no waiter is
+// remembered, like the Windows event the worker waits on there.
+typedef struct scene_event_state { mp_mutex lock; mp_cond cond; bool signaled; } *scene_event;
+#define scene_inc(p) __atomic_add_fetch((p), 1, __ATOMIC_SEQ_CST)
+#define scene_dec(p) __atomic_sub_fetch((p), 1, __ATOMIC_SEQ_CST)
+#define scene_store(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+#define scene_inc64(p) __atomic_add_fetch((p), 1, __ATOMIC_SEQ_CST)
+#define scene_store64(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+#define scene_load64(p) __atomic_load_n((p), __ATOMIC_SEQ_CST)
+static inline int32_t scene_cas(int32_t *p, int32_t v, int32_t old)
+{
+    // Like InterlockedCompareExchange: returns the value found at *p.
+    __atomic_compare_exchange_n(p, &old, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return old;
+}
+static inline int64_t scene_now_ms(void) { return mp_time_ns() / 1000000; }
+static inline int64_t scene_now_us(void) { return mp_time_ns() / 1000; }
+static inline scene_event scene_event_create(void)
+{
+    scene_event e = calloc(1, sizeof(*e));
+    if (e) { mp_mutex_init(&e->lock); mp_cond_init(&e->cond); }
+    return e;
+}
+static inline void scene_event_set(scene_event e)
+{
+    mp_mutex_lock(&e->lock);
+    e->signaled = true;
+    mp_cond_signal(&e->cond);
+    mp_mutex_unlock(&e->lock);
+}
+static inline void scene_event_wait(scene_event e)
+{
+    mp_mutex_lock(&e->lock);
+    while (!e->signaled) mp_cond_wait(&e->cond, &e->lock);
+    e->signaled = false;
+    mp_mutex_unlock(&e->lock);
+}
+static inline void scene_event_destroy(scene_event e)
+{
+    if (!e) return;
+    mp_cond_destroy(&e->cond); mp_mutex_destroy(&e->lock);
+    free(e);
+}
+#if HAVE_GPL
+static inline void *scene_sym(scene_module m, const char *name) { return dlsym(m, name); }
+#endif
+static inline void scene_unload(scene_module m) { dlclose(m); }
+#endif
+
+static int32_t scene_workers;
 struct ajn_scene {
     struct ajn_scene_shared *shared;
-    HANDLE ready, reply, wake;
-    mp_mutex mutex, private_header_mutex;
+    scene_event wake;
+#ifdef _WIN32
+    HANDLE ready, reply;
     HMODULE worker_module;
-    LONG stopping, references;
+#endif
+    mp_mutex mutex, private_header_mutex;
+    int32_t stopping, references;
     bool started, reserved, builtin;
     // At most one waiting pair plus the pair in flight; do not exhaust the
     // decoder surface pool while an optional detector is slow.
@@ -44,7 +134,7 @@ struct ajn_scene {
     uint8_t pixels[AJN_SCENE_BYTES], cached[AJN_SCENE_PLANE];
     double cached_pts;
     int cached_w, cached_h, source_w, source_h;
-    HMODULE mv_module;
+    scene_module mv_module;
     void *mv_context;
     bool mv_load_failed;
     int64_t mv_generation;
@@ -63,11 +153,57 @@ static void mv_close(struct ajn_scene *s)
 {
     if (s->mv_context) s->mv_destroy(s->mv_context);
     s->mv_context = NULL;
-    if (s->mv_module) FreeLibrary(s->mv_module);
+    if (s->mv_module) scene_unload(s->mv_module);
     s->mv_module = NULL;
     TA_FREEP(&s->mv_cached);
     s->mv_load_failed = false;
 }
+#if HAVE_GPL
+// Fixed trusted installation path: beside the module carrying this filter.
+// Never load a library supplied by an addon, nor search PATH or the current
+// directory. Called only for an enabled MVTools mode.
+#ifdef _WIN32
+static scene_module scene_load_detector(void)
+{
+    wchar_t path[32768];
+    HMODULE self;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(uintptr_t)scene_load_detector, &self))
+        return NULL;
+    DWORD n = GetModuleFileNameW(self, path, MP_ARRAY_SIZE(path));
+    wchar_t *slash = n && n < MP_ARRAY_SIZE(path) ? wcsrchr(path, L'\\') : NULL;
+    if (!slash || slash - path + 20 >= MP_ARRAY_SIZE(path)) return NULL;
+    wcscpy(slash + 1, L"ajn-mvtools.dll");
+    return LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
+#else
+static scene_module scene_load_detector(void)
+{
+    char dir[PATH_MAX], path[PATH_MAX + 32];
+    Dl_info info;
+    if (!dladdr((void *)(uintptr_t)scene_load_detector, &info) || !info.dli_fname)
+        return NULL;
+    // Resolve symlinks so the library is found beside the real file. glibc
+    // names the main executable by its argv[0], which can be a bare or
+    // relative name; resolve that case through the kernel instead.
+    char *real = info.dli_fname[0] == '/' ? realpath(info.dli_fname, NULL) : NULL;
+    if (real) {
+        int len = snprintf(dir, sizeof(dir), "%s", real);
+        free(real);
+        if (len >= (int)sizeof(dir)) return NULL;
+    } else {
+        ssize_t n = readlink("/proc/self/exe", dir, sizeof(dir) - 1);
+        if (n <= 0) return NULL;
+        dir[n] = 0;
+    }
+    char *slash = strrchr(dir, '/');
+    if (!slash) return NULL;
+    *slash = 0;
+    snprintf(path, sizeof(path), "%s/ajn-mvtools.so", dir);
+    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+#endif
+#endif
 static bool mv_open(struct ajn_scene *s)
 {
 #if !HAVE_GPL
@@ -75,24 +211,14 @@ static bool mv_open(struct ajn_scene *s)
 #else
     if (s->mv_context) return true;
     if (s->mv_load_failed) return false;
-    // Fixed trusted installation path. Never load a DLL supplied by an addon,
-    // nor search PATH/current directory. Called only for an enabled MVTools mode.
-    wchar_t path[32768];
-    HMODULE self;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(uintptr_t)mv_open, &self)) goto fail;
-    DWORD n = GetModuleFileNameW(self, path, MP_ARRAY_SIZE(path));
-    wchar_t *slash = n && n < MP_ARRAY_SIZE(path) ? wcsrchr(path, L'\\') : NULL;
-    if (!slash || slash - path + 20 >= MP_ARRAY_SIZE(path)) goto fail;
-    wcscpy(slash + 1, L"ajn-mvtools.dll");
-    s->mv_module = LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    s->mv_module = scene_load_detector();
     if (!s->mv_module) goto fail;
-    int (*version)(void) = (void *)GetProcAddress(s->mv_module, "ajn_mvtools_version");
-    s->mv_create = (void *)GetProcAddress(s->mv_module, "ajn_mvtools_create");
-    s->mv_destroy = (void *)GetProcAddress(s->mv_module, "ajn_mvtools_destroy");
-    s->mv_reset = (void *)GetProcAddress(s->mv_module, "ajn_mvtools_reset");
-    s->mv_analyze = (void *)GetProcAddress(s->mv_module, "ajn_mvtools_analyze");
-    s->mv_enhanced = (void *)GetProcAddress(s->mv_module, "ajn_mvtools_analyze_enhanced");
+    int (*version)(void) = scene_sym(s->mv_module, "ajn_mvtools_version");
+    s->mv_create = scene_sym(s->mv_module, "ajn_mvtools_create");
+    s->mv_destroy = scene_sym(s->mv_module, "ajn_mvtools_destroy");
+    s->mv_reset = scene_sym(s->mv_module, "ajn_mvtools_reset");
+    s->mv_analyze = scene_sym(s->mv_module, "ajn_mvtools_analyze");
+    s->mv_enhanced = scene_sym(s->mv_module, "ajn_mvtools_analyze_enhanced");
     if (!version || version() != AJN_MVTOOLS_ABI || !s->mv_create ||
         !s->mv_destroy || !s->mv_reset || !s->mv_analyze) goto fail;
     s->mv_context = s->mv_create();
@@ -109,12 +235,12 @@ static bool enter(struct ajn_scene *s)
         mp_mutex_lock(&s->private_header_mutex);
         return true;
     }
-    return !InterlockedCompareExchange((volatile LONG *)&s->shared->lock, 1, 0);
+    return !scene_cas(&s->shared->lock, 1, 0);
 }
 static void leave(struct ajn_scene *s)
 {
     if (s->builtin) mp_mutex_unlock(&s->private_header_mutex);
-    else InterlockedExchange((volatile LONG *)&s->shared->lock, 0);
+    else scene_store(&s->shared->lock, 0);
 }
 static bool lock_queue(struct ajn_scene *s)
 {
@@ -128,7 +254,7 @@ bool ajn_scene_active(struct ajn_scene *s)
 {
     if (!s || !s->shared || !enter(s)) return false;
     struct ajn_scene_shared *h = s->shared;
-    bool active = h->enabled && h->lease_until_ms > (int64_t)GetTickCount64() &&
+    bool active = h->enabled && h->lease_until_ms > scene_now_ms() &&
                   h->consecutive_timeouts < 3;
     leave(s);
     return active;
@@ -155,36 +281,68 @@ void ajn_scene_reset(struct ajn_scene *s)
     if (s->shared) {
         // A seek must invalidate pending replies even while the host copies
         // the sample under the header lock. The producer itself is serial.
-        InterlockedIncrement64((volatile LONG64 *)&s->shared->epoch);
-        InterlockedExchange64((volatile LONG64 *)&s->shared->request_id, 0);
-        InterlockedExchange64((volatile LONG64 *)&s->shared->response_id, 0);
+        scene_inc64(&s->shared->epoch);
+        scene_store64(&s->shared->request_id, 0);
+        scene_store64(&s->shared->response_id, 0);
     }
 }
+#ifdef _WIN32
 static DWORD WINAPI scene_worker(void *context);
+#else
+static MP_THREAD_VOID scene_worker(void *context);
 
+static void scene_pin_self(void)
+{
+    // A retiring worker can outlive its filter. On Windows it holds a module
+    // reference and drops it in FreeLibraryAndExitThread; POSIX has no such
+    // call, so keep the module carrying this code mapped for the process.
+    // The main executable (no library is loaded under its name) never unloads.
+    Dl_info info;
+    if (!dladdr((void *)(uintptr_t)scene_pin_self, &info) || !info.dli_fname) return;
+    void *self = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD | RTLD_NODELETE);
+    if (self) dlclose(self);
+}
+#endif
+
+#if !HAVE_GPL && !defined(_WIN32)
+// No detector and no addon bridge: nothing here starts a worker.
+__attribute__((unused))
+#endif
 static bool start_worker(struct ajn_scene *s)
 {
     ajn_scene_reset(s);
-    s->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    s->wake = scene_event_create();
     if (!s->wake) goto fail;
-    if (InterlockedIncrement(&scene_workers) > 4) {
-        InterlockedDecrement(&scene_workers); goto fail;
+    if (scene_inc(&scene_workers) > 4) {
+        scene_dec(&scene_workers); goto fail;
     }
     s->reserved = true;
+#ifdef _WIN32
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
         (LPCWSTR)(uintptr_t)scene_worker, &s->worker_module)) goto fail;
-    InterlockedIncrement(&s->references);
+    scene_inc(&s->references);
     HANDLE thread = CreateThread(NULL, 0, scene_worker, s, 0, NULL);
     if (!thread) {
-        InterlockedDecrement(&s->references); goto fail;
+        scene_dec(&s->references); goto fail;
     }
     CloseHandle(thread);
+#else
+    scene_pin_self();
+    scene_inc(&s->references);
+    mp_thread thread;
+    if (mp_thread_create(&thread, scene_worker, s)) {
+        scene_dec(&s->references); goto fail;
+    }
+    mp_thread_detach(thread);
+#endif
     s->started = true;
     return true;
 fail:
+#ifdef _WIN32
     if (s->worker_module) { FreeLibrary(s->worker_module); s->worker_module = NULL; }
-    if (s->reserved) { InterlockedDecrement(&scene_workers); s->reserved = false; }
-    if (s->wake) { CloseHandle(s->wake); s->wake = NULL; }
+#endif
+    if (s->reserved) { scene_dec(&scene_workers); s->reserved = false; }
+    scene_event_destroy(s->wake); s->wake = NULL;
     return false;
 }
 
@@ -195,7 +353,7 @@ bool ajn_scene_start_enhanced(struct ajn_scene *s)
 #else
     if (!s || s->shared) return false;
     // Validate the optional native dependency before enabling look-ahead.
-    // Disabled chains never reach this startup path or load the DLL.
+    // Disabled chains never reach this startup path or load the library.
     if (!mv_open(s) || !s->mv_enhanced) {
         mv_close(s);
         return false;
@@ -221,6 +379,7 @@ bool ajn_scene_start_enhanced(struct ajn_scene *s)
 #endif
 }
 
+#ifdef _WIN32
 bool ajn_scene_connect(struct ajn_scene *s, const char *name)
 {
     if (!s || !name) return false;
@@ -257,18 +416,28 @@ fail:
     s->ready = s->reply = NULL;
     return false;
 }
+#else
+bool ajn_scene_connect(struct ajn_scene *s, const char *name)
+{
+    // Addon scene detectors are Windows-only; the built-in mode needs no host.
+    (void)s; (void)name;
+    return false;
+}
+#endif
 static void scene_release(struct ajn_scene *s)
 {
-    if (InterlockedDecrement(&s->references)) return;
+    if (scene_dec(&s->references)) return;
     for (int i = 0; i < s->job_count; i++) {
         talloc_free(s->jobs[i].a); talloc_free(s->jobs[i].b);
     }
     mv_close(s);
+#ifdef _WIN32
     if (s->shared && !s->builtin) UnmapViewOfFile(s->shared);
     if (s->ready) CloseHandle(s->ready);
     if (s->reply) CloseHandle(s->reply);
-    if (s->wake) CloseHandle(s->wake);
-    if (s->reserved) InterlockedDecrement(&scene_workers);
+#endif
+    scene_event_destroy(s->wake);
+    if (s->reserved) scene_dec(&scene_workers);
     if (s->builtin) mp_mutex_destroy(&s->private_header_mutex);
     mp_mutex_destroy(&s->mutex);
     talloc_free(s);
@@ -276,11 +445,12 @@ static void scene_release(struct ajn_scene *s)
 void ajn_scene_destroy(struct ajn_scene *s)
 {
     if (!s) return;
-    InterlockedExchange(&s->stopping, 1);
+    scene_store(&s->stopping, 1);
     ajn_scene_reset(s);
-    if (s->started) SetEvent(s->wake);
+    if (s->started) scene_event_set(s->wake);
     scene_release(s);
 }
+#ifdef _WIN32
 static bool sample(struct ajn_scene *s, struct mp_image *image,
                    int width, int height, uint8_t *pixels)
 {
@@ -302,6 +472,7 @@ static bool sample(struct ajn_scene *s, struct mp_image *image,
     talloc_free(cpu); talloc_free(small);
     return ok;
 }
+#endif
 static struct mp_image *mv_frame(struct ajn_scene *s, struct mp_image *image)
 {
     if (image->fields & MP_IMGFIELD_INTERLACED || image->params.stereo3d ||
@@ -357,8 +528,7 @@ static struct ajn_mvtools_frame mv_description(struct mp_image *image)
 static int mv_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
                      int64_t generation, int th1, int th2, bool enhanced)
 {
-    LARGE_INTEGER start, end, frequency;
-    QueryPerformanceCounter(&start); QueryPerformanceFrequency(&frequency);
+    int64_t start = scene_now_us();
     int state = 7, decision = -1;
     struct ajn_mvtools_result result = {0};
     struct mp_image *previous = NULL, *current = NULL;
@@ -386,17 +556,17 @@ static int mv_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b
     s->mv_cached = current; current = NULL;
 done:
     talloc_free(previous); talloc_free(current);
-    QueryPerformanceCounter(&end);
+    int64_t elapsed_us = scene_now_us() - start;
     struct ajn_scene_shared *h = s->shared;
     if (!enter(s)) return -1;
     // Disable, seek or reconfiguration must not consume an in-flight decision.
     if (h->epoch != s->processing_epoch || !h->enabled || h->generation != generation ||
-        h->lease_until_ms <= (int64_t)GetTickCount64()) { leave(s); return -1; }
+        h->lease_until_ms <= scene_now_ms()) { leave(s); return -1; }
     h->status = state; h->source_width = b->w; h->source_height = b->h;
     h->previous_pts = a->pts; h->current_pts = b->pts;
     h->changed_blocks = result.changed_blocks; h->total_blocks = result.total_blocks;
     h->block_sad_threshold = result.block_sad_threshold; h->source_bits = bits;
-    h->analysis_us = (end.QuadPart - start.QuadPart) * 1000000 / frequency.QuadPart;
+    h->analysis_us = elapsed_us;
 
 
     leave(s);
@@ -408,7 +578,7 @@ static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
     if (!s || !s->shared) return -1;
     struct ajn_scene_shared *h = s->shared;
     if (!enter(s)) return -1;
-    int64_t now = GetTickCount64(), generation = h->generation;
+    int64_t now = scene_now_ms(), generation = h->generation;
     int width = h->width, height = h->height, budget = h->budget_ms;
     int algorithm = h->algorithm, th1 = h->thscd1, th2 = h->thscd2;
     bool active = h->enabled && h->lease_until_ms > now && h->consecutive_timeouts < 3;
@@ -420,6 +590,10 @@ static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
         b->pts <= a->pts || a->w != b->w || a->h != b->h) return -1;
     if (algorithm == 1 || algorithm == 2)
         return mv_decide(s, a, b, generation, th1, th2, algorithm == 2);
+#ifndef _WIN32
+    // Algorithm 0 is an addon guest's own detector; there is none here.
+    return -1;
+#else
     if (algorithm != 0) return -1;
     int bytes = width * height;
     bool cached = s->cached_pts == a->pts && s->cached_w == width &&
@@ -446,7 +620,7 @@ static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
     memcpy(h->pixels, s->pixels, 2 * bytes);
     leave(s);
     SetEvent(s->ready);
-    while (!InterlockedCompareExchange(&s->stopping, 0, 0) && (now = GetTickCount64()) < deadline) {
+    while (!scene_cas(&s->stopping, 0, 0) && (now = GetTickCount64()) < deadline) {
         DWORD wait = WaitForSingleObject(s->reply, (DWORD)(deadline - now));
         // A stale/manual-reset reply must not turn a guest's budget into a
         // tight CPU loop. This wait is confined to the optional worker.
@@ -474,14 +648,13 @@ static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
         leave(s);
     }
     return -1;
+#endif
 }
 
-static DWORD WINAPI scene_worker(void *context)
+static void scene_worker_loop(struct ajn_scene *s)
 {
-    struct ajn_scene *s = context;
-    HMODULE module = s->worker_module;
     mp_thread_set_name("ajn-scene");
-    while (!InterlockedCompareExchange(&s->stopping, 0, 0)) {
+    while (!scene_cas(&s->stopping, 0, 0)) {
         struct scene_job job = {0};
         mp_mutex_lock(&s->mutex);
         if (s->job_count) {
@@ -489,9 +662,9 @@ static DWORD WINAPI scene_worker(void *context)
             memmove(s->jobs, s->jobs + 1, --s->job_count * sizeof(s->jobs[0]));
         }
         mp_mutex_unlock(&s->mutex);
-        if (!job.a) { WaitForSingleObject(s->wake, INFINITE); continue; }
+        if (!job.a) { scene_event_wait(s->wake); continue; }
         int decision = -1;
-        if (job.epoch == InterlockedCompareExchange64((volatile LONG64 *)&s->shared->epoch, 0, 0)) {
+        if (job.epoch == scene_load64(&s->shared->epoch)) {
             if (s->processing_epoch != job.epoch) {
                 s->cached_pts = MP_NOPTS_VALUE;
                 if (s->mv_context) s->mv_reset(s->mv_context);
@@ -507,9 +680,25 @@ static DWORD WINAPI scene_worker(void *context)
         mp_mutex_unlock(&s->mutex);
         talloc_free(job.a); talloc_free(job.b);
     }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI scene_worker(void *context)
+{
+    struct ajn_scene *s = context;
+    HMODULE module = s->worker_module;
+    scene_worker_loop(s);
     scene_release(s);
     FreeLibraryAndExitThread(module, 0);
 }
+#else
+static MP_THREAD_VOID scene_worker(void *context)
+{
+    scene_worker_loop(context);
+    scene_release(context);
+    MP_THREAD_RETURN();
+}
+#endif
 
 void ajn_scene_submit(struct ajn_scene *s, struct mp_image *a, struct mp_image *b)
 {
@@ -526,7 +715,7 @@ void ajn_scene_submit(struct ajn_scene *s, struct mp_image *a, struct mp_image *
             if (left && right) {
                 s->jobs[s->job_count++] = (struct scene_job){left, right, h->epoch, h->generation};
                 s->submitted_pts = b->pts;
-                SetEvent(s->wake);
+                scene_event_set(s->wake);
             } else { talloc_free(left); talloc_free(right); }
         }
         leave(s);
@@ -542,7 +731,7 @@ int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b
     struct ajn_scene_shared *h = s->shared;
     if (enter(s)) {
         if (!supported) h->status = 5;
-        if (supported && h->enabled && h->lease_until_ms > (int64_t)GetTickCount64()) {
+        if (supported && h->enabled && h->lease_until_ms > scene_now_ms()) {
             for (int i = 0; i < MP_ARRAY_SIZE(s->results); i++) {
                 struct scene_result *r = &s->results[i];
                 if (r->epoch == h->epoch && r->generation == h->generation &&
