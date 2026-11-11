@@ -8096,9 +8096,12 @@ static void prewarm_video_path(struct vo *vo, const struct mp_image_params *para
     if (!tfmt)
         tfmt = pl_find_named_fmt(gpu, "rgba8");
     int tw = MPMAX(mp_rect_w(p->dst), 64), th = MPMAX(mp_rect_h(p->dst), 64);
+    // blit_dst: the renderer clears target areas the image doesn't cover
+    // (e.g. a video rect under the 64px floor), and pl_tex_clear needs it.
     pl_tex ttex = ok && tfmt && (tfmt->caps & PL_FMT_CAP_RENDERABLE)
         ? pl_tex_create(gpu, pl_tex_params(.format = tfmt, .w = tw, .h = th,
-                                           .renderable = true))
+                                           .renderable = true,
+                                           .blit_dst = tfmt->caps & PL_FMT_CAP_BLITTABLE))
         : NULL;
     if (ttex) {
         struct pl_frame target = {
@@ -8127,8 +8130,14 @@ static void prewarm_video_path(struct vo *vo, const struct mp_image_params *para
         }
         apply_target_options(p, &target, 0, false, ref_luma, &target_csp);
         apply_crop(&img, p->src, par.w, par.h);
-        if (mp_rect_w(p->dst) > 0 && mp_rect_h(p->dst) > 0)
-            apply_crop(&target, p->dst, tw, th);
+        if (mp_rect_w(p->dst) > 0 && mp_rect_h(p->dst) > 0) {
+            // ttex is only the video rect's size, so place the rect at its
+            // origin. p->dst's own offset (letterbox/pillarbox borders) would
+            // push the crop past the texture; the compiled passes depend on
+            // the size alone.
+            struct mp_rect dst = {0, 0, mp_rect_w(p->dst), mp_rect_h(p->dst)};
+            apply_crop(&target, dst, tw, th);
+        }
         struct pl_render_params rp = p->pars->params;
         rp.info_callback = NULL;
         rp.skip_caching_single_frame = true;
