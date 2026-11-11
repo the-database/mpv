@@ -5,7 +5,8 @@
 struct mp_image;
 struct mp_log;
 struct ajn_scene;
-#ifdef _WIN32
+// Built with cuda-hwaccel on Windows and Linux (meson.build); stubs elsewhere.
+#if defined(_WIN32) || defined(__linux__)
 struct ajn_scene *ajn_scene_create(struct mp_log *log);
 bool ajn_scene_connect(struct ajn_scene *s, const char *name);
 bool ajn_scene_start_enhanced(struct ajn_scene *s);
