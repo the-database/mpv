@@ -1,5 +1,5 @@
 # Optional detector DLL. Not linked into mpv/libmpv; loaded only after explicit
-# addon activation. The legacy analysis core is GPL-2.0-or-later.
+# RIFE activation (built-in or addon). The legacy core is GPL-2.0-or-later.
 add_languages('cpp', required: true)
 mv_cpp = meson.get_compiler('cpp')
 mv_cpp_args = ['-DAJN_MVTOOLS_BUILD', '-D_CRT_SECURE_NO_WARNINGS']

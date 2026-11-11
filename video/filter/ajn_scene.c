@@ -27,10 +27,10 @@ static LONG scene_workers;
 struct ajn_scene {
     struct ajn_scene_shared *shared;
     HANDLE ready, reply, wake;
-    mp_mutex mutex;
+    mp_mutex mutex, private_header_mutex;
     HMODULE worker_module;
     LONG stopping, references;
-    bool started, reserved;
+    bool started, reserved, builtin;
     // At most one waiting pair plus the pair in flight; do not exhaust the
     // decoder surface pool while an optional detector is slow.
     struct scene_job jobs[1];
@@ -101,21 +101,36 @@ fail:
     mv_close(s); s->mv_load_failed = true; return false;
 #endif
 }
-static bool enter(struct ajn_scene_shared *s)
+static bool enter(struct ajn_scene *s)
 {
-    return !InterlockedCompareExchange((volatile LONG *)&s->lock, 1, 0);
+    // Private state has no guest that could hold its lock indefinitely. Only
+    // brief metadata copies run here; downloads and analysis stay outside.
+    if (s->builtin) {
+        mp_mutex_lock(&s->private_header_mutex);
+        return true;
+    }
+    return !InterlockedCompareExchange((volatile LONG *)&s->shared->lock, 1, 0);
 }
-static void leave(struct ajn_scene_shared *s)
+static void leave(struct ajn_scene *s)
 {
-    InterlockedExchange((volatile LONG *)&s->lock, 0);
+    if (s->builtin) mp_mutex_unlock(&s->private_header_mutex);
+    else InterlockedExchange((volatile LONG *)&s->shared->lock, 0);
+}
+static bool lock_queue(struct ajn_scene *s)
+{
+    if (s->builtin) {
+        mp_mutex_lock(&s->mutex);
+        return true;
+    }
+    return !mp_mutex_trylock(&s->mutex);
 }
 bool ajn_scene_active(struct ajn_scene *s)
 {
-    if (!s || !s->shared || !enter(s->shared)) return false;
+    if (!s || !s->shared || !enter(s)) return false;
     struct ajn_scene_shared *h = s->shared;
     bool active = h->enabled && h->lease_until_ms > (int64_t)GetTickCount64() &&
                   h->consecutive_timeouts < 3;
-    leave(h);
+    leave(s);
     return active;
 }
 struct ajn_scene *ajn_scene_create(struct mp_log *log)
@@ -147,6 +162,65 @@ void ajn_scene_reset(struct ajn_scene *s)
 }
 static DWORD WINAPI scene_worker(void *context);
 
+static bool start_worker(struct ajn_scene *s)
+{
+    ajn_scene_reset(s);
+    s->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!s->wake) goto fail;
+    if (InterlockedIncrement(&scene_workers) > 4) {
+        InterlockedDecrement(&scene_workers); goto fail;
+    }
+    s->reserved = true;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (LPCWSTR)(uintptr_t)scene_worker, &s->worker_module)) goto fail;
+    InterlockedIncrement(&s->references);
+    HANDLE thread = CreateThread(NULL, 0, scene_worker, s, 0, NULL);
+    if (!thread) {
+        InterlockedDecrement(&s->references); goto fail;
+    }
+    CloseHandle(thread);
+    s->started = true;
+    return true;
+fail:
+    if (s->worker_module) { FreeLibrary(s->worker_module); s->worker_module = NULL; }
+    if (s->reserved) { InterlockedDecrement(&scene_workers); s->reserved = false; }
+    if (s->wake) { CloseHandle(s->wake); s->wake = NULL; }
+    return false;
+}
+
+bool ajn_scene_start_enhanced(struct ajn_scene *s)
+{
+#if !HAVE_GPL
+    return false;
+#else
+    if (!s || s->shared) return false;
+    // Validate the optional native dependency before enabling look-ahead.
+    // Disabled chains never reach this startup path or load the DLL.
+    if (!mv_open(s) || !s->mv_enhanced) {
+        mv_close(s);
+        return false;
+    }
+    // Private state: no addon host, named mapping, heartbeat or reply event.
+    // This is allocated only when the active RIFE chain explicitly opts in.
+    s->shared = talloc_zero(s, struct ajn_scene_shared);
+    s->builtin = true;
+    mp_mutex_init(&s->private_header_mutex);
+    *s->shared = (struct ajn_scene_shared){
+        .magic = AJN_SCENE_MAGIC, .version = AJN_SCENE_VERSION,
+        .capacity = AJN_SCENE_BYTES, .header_bytes = 256,
+        .enabled = 1, .generation = 1, .lease_until_ms = INT64_MAX,
+        .width = AJN_SCENE_WIDTH, .height = AJN_SCENE_HEIGHT,
+        .budget_ms = 100, .algorithm = 2, .thscd1 = 240, .thscd2 = 130,
+    };
+    if (start_worker(s)) return true;
+    TA_FREEP(&s->shared);
+    mp_mutex_destroy(&s->private_header_mutex);
+    s->builtin = false;
+    mv_close(s);
+    return false;
+#endif
+}
+
 bool ajn_scene_connect(struct ajn_scene *s, const char *name)
 {
     if (!s || !name) return false;
@@ -174,27 +248,8 @@ bool ajn_scene_connect(struct ajn_scene *s, const char *name)
     s->reply = OpenEventW(SYNCHRONIZE, FALSE, wide);
     if (!s->ready || !s->reply) goto fail;
     snprintf(s->name, sizeof(s->name), "%s", name);
-    ajn_scene_reset(s);
-    s->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!s->wake) goto fail;
-    if (InterlockedIncrement(&scene_workers) > 4) {
-        InterlockedDecrement(&scene_workers); goto fail;
-    }
-    s->reserved = true;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-        (LPCWSTR)(uintptr_t)scene_worker, &s->worker_module)) goto fail;
-    InterlockedIncrement(&s->references);
-    HANDLE thread = CreateThread(NULL, 0, scene_worker, s, 0, NULL);
-    if (!thread) {
-        InterlockedDecrement(&s->references); goto fail;
-    }
-    CloseHandle(thread);
-    s->started = true;
-    return true;
+    if (start_worker(s)) return true;
 fail:
-    if (s->worker_module) { FreeLibrary(s->worker_module); s->worker_module = NULL; }
-    if (s->reserved) { InterlockedDecrement(&scene_workers); s->reserved = false; }
-    if (s->wake) { CloseHandle(s->wake); s->wake = NULL; }
     s->name[0] = 0;
     UnmapViewOfFile(s->shared); s->shared = NULL;
     if (s->ready) CloseHandle(s->ready);
@@ -209,11 +264,12 @@ static void scene_release(struct ajn_scene *s)
         talloc_free(s->jobs[i].a); talloc_free(s->jobs[i].b);
     }
     mv_close(s);
-    if (s->shared) UnmapViewOfFile(s->shared);
+    if (s->shared && !s->builtin) UnmapViewOfFile(s->shared);
     if (s->ready) CloseHandle(s->ready);
     if (s->reply) CloseHandle(s->reply);
     if (s->wake) CloseHandle(s->wake);
     if (s->reserved) InterlockedDecrement(&scene_workers);
+    if (s->builtin) mp_mutex_destroy(&s->private_header_mutex);
     mp_mutex_destroy(&s->mutex);
     talloc_free(s);
 }
@@ -332,10 +388,10 @@ done:
     talloc_free(previous); talloc_free(current);
     QueryPerformanceCounter(&end);
     struct ajn_scene_shared *h = s->shared;
-    if (!enter(h)) return -1;
+    if (!enter(s)) return -1;
     // Disable, seek or reconfiguration must not consume an in-flight decision.
     if (h->epoch != s->processing_epoch || !h->enabled || h->generation != generation ||
-        h->lease_until_ms <= (int64_t)GetTickCount64()) { leave(h); return -1; }
+        h->lease_until_ms <= (int64_t)GetTickCount64()) { leave(s); return -1; }
     h->status = state; h->source_width = b->w; h->source_height = b->h;
     h->previous_pts = a->pts; h->current_pts = b->pts;
     h->changed_blocks = result.changed_blocks; h->total_blocks = result.total_blocks;
@@ -343,7 +399,7 @@ done:
     h->analysis_us = (end.QuadPart - start.QuadPart) * 1000000 / frequency.QuadPart;
 
 
-    leave(h);
+    leave(s);
     return decision;
 }
 static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
@@ -351,13 +407,13 @@ static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
 {
     if (!s || !s->shared) return -1;
     struct ajn_scene_shared *h = s->shared;
-    if (!enter(h)) return -1;
+    if (!enter(s)) return -1;
     int64_t now = GetTickCount64(), generation = h->generation;
     int width = h->width, height = h->height, budget = h->budget_ms;
     int algorithm = h->algorithm, th1 = h->thscd1, th2 = h->thscd2;
     bool active = h->enabled && h->lease_until_ms > now && h->consecutive_timeouts < 3;
     if (active && !supported) h->status = 5;
-    leave(h);
+    leave(s);
     if (!active || !supported || width < 1 || width > AJN_SCENE_WIDTH ||
         height < 1 || height > AJN_SCENE_HEIGHT || budget < 5 || budget > 100 ||
         !isfinite(a->pts) || !isfinite(b->pts) || a->pts == MP_NOPTS_VALUE ||
@@ -371,51 +427,51 @@ static int analyze(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
     if (cached) memcpy(s->pixels, s->cached, bytes);
     if ((!cached && !sample(s, a, width, height, s->pixels)) ||
         !sample(s, b, width, height, s->pixels + bytes)) {
-        if (enter(h)) { h->status = 4; leave(h); }
+        if (enter(s)) { h->status = 4; leave(s); }
         s->cached_pts = MP_NOPTS_VALUE;
         return -1;
     }
     memcpy(s->cached, s->pixels + bytes, bytes);
     s->cached_pts = b->pts; s->cached_w = width; s->cached_h = height;
     s->source_w = b->w; s->source_h = b->h;
-    if (!enter(h)) return -1;
+    if (!enter(s)) return -1;
     now = GetTickCount64();
     if (h->epoch != s->processing_epoch || !h->enabled || h->generation != generation || h->lease_until_ms <= now ||
-        h->next_id == INT64_MAX) { leave(h); return -1; }
+        h->next_id == INT64_MAX) { leave(s); return -1; }
     int64_t request = ++h->next_id, deadline = now + budget;
     h->request_id = request; h->response_id = 0;
     h->deadline_ms = deadline; h->decision = -1; h->status = 1;
     h->previous_pts = a->pts; h->current_pts = b->pts;
     h->source_width = b->w; h->source_height = b->h;
     memcpy(h->pixels, s->pixels, 2 * bytes);
-    leave(h);
+    leave(s);
     SetEvent(s->ready);
     while (!InterlockedCompareExchange(&s->stopping, 0, 0) && (now = GetTickCount64()) < deadline) {
         DWORD wait = WaitForSingleObject(s->reply, (DWORD)(deadline - now));
         // A stale/manual-reset reply must not turn a guest's budget into a
         // tight CPU loop. This wait is confined to the optional worker.
-        if (!enter(h)) { if (wait == WAIT_OBJECT_0) Sleep(1); continue; }
+        if (!enter(s)) { if (wait == WAIT_OBJECT_0) Sleep(1); continue; }
         if (h->epoch != s->processing_epoch || !h->enabled || h->generation != generation || h->request_id != request) {
-            leave(h); return -1;
+            leave(s); return -1;
         }
         if (h->response_id == request && h->deadline_ms >= (int64_t)GetTickCount64()) {
             int decision = h->decision;
             h->status = 2;
             h->consecutive_timeouts = 0;
-            leave(h);
+            leave(s);
             return decision >= -1 && decision <= 1 ? decision : -1;
         }
-        leave(h);
+        leave(s);
         if (wait == WAIT_OBJECT_0) Sleep(1);
     }
-    if (enter(h)) {
+    if (enter(s)) {
         if (h->request_id == request) {
             if (h->timeouts < INT32_MAX) h->timeouts++;
             h->consecutive_timeouts++;
             h->status = h->consecutive_timeouts >= 3 ? 6 : 3;
             h->deadline_ms = 0;
         }
-        leave(h);
+        leave(s);
     }
     return -1;
 }
@@ -457,9 +513,9 @@ static DWORD WINAPI scene_worker(void *context)
 
 void ajn_scene_submit(struct ajn_scene *s, struct mp_image *a, struct mp_image *b)
 {
-    if (!a || !b || !ajn_scene_active(s) || !s->started || mp_mutex_trylock(&s->mutex)) return;
+    if (!a || !b || !ajn_scene_active(s) || !s->started || !lock_queue(s)) return;
     struct ajn_scene_shared *h = s->shared;
-    if (enter(h)) {
+    if (enter(s)) {
         if (h->epoch != s->submitted_epoch) {
             s->submitted_epoch = h->epoch;
             s->submitted_pts = MP_NOPTS_VALUE;
@@ -473,7 +529,7 @@ void ajn_scene_submit(struct ajn_scene *s, struct mp_image *a, struct mp_image *
                 SetEvent(s->wake);
             } else { talloc_free(left); talloc_free(right); }
         }
-        leave(h);
+        leave(s);
     }
     mp_mutex_unlock(&s->mutex);
 }
@@ -481,10 +537,10 @@ void ajn_scene_submit(struct ajn_scene *s, struct mp_image *a, struct mp_image *
 int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b,
                      bool supported)
 {
-    if (!s || !s->shared || !a || !b || mp_mutex_trylock(&s->mutex)) return -1;
+    if (!s || !s->shared || !a || !b || !lock_queue(s)) return -1;
     int decision = -1;
     struct ajn_scene_shared *h = s->shared;
-    if (enter(h)) {
+    if (enter(s)) {
         if (!supported) h->status = 5;
         if (supported && h->enabled && h->lease_until_ms > (int64_t)GetTickCount64()) {
             for (int i = 0; i < MP_ARRAY_SIZE(s->results); i++) {
@@ -495,7 +551,7 @@ int ajn_scene_decide(struct ajn_scene *s, struct mp_image *a, struct mp_image *b
             if (decision >= 0 && h->accepted < INT32_MAX) h->accepted++;
             if (decision == 1 && h->cut_pairs < INT32_MAX) h->cut_pairs++;
         }
-        leave(h);
+        leave(s);
     }
     mp_mutex_unlock(&s->mutex);
     return decision; // Built-in detector for any missing, stale or late result.
