@@ -12,6 +12,10 @@ on:
         description: 'Release tag (matches MpvForkLinuxVersion in the assembler). Leave blank for <yyyy-mm-dd>-<short commit hash>.'
         required: false
         default: ''
+      publish:
+        description: 'Publish the release and ask mpv-AnimeJaNai for a bump PR. Off: upload the bundle as a workflow artifact only.'
+        type: boolean
+        default: true
   push:
     branches: [linux-support]
     paths:
@@ -56,7 +60,15 @@ jobs:
         chmod +x ci/build-linux-portable.sh
         MPV_SRC="$PWD" ci/build-linux-portable.sh "$RELEASE_TAG" "$PWD/out"
 
+    - name: Upload bundle (unpublished test build)
+      if: github.event_name == 'workflow_dispatch' && !inputs.publish
+      uses: actions/upload-artifact@v4
+      with:
+        name: mpv-linux-x64-${{ env.RELEASE_TAG }}
+        path: out/mpv-linux-x64-${{ env.RELEASE_TAG }}.tar.zst
+
     - name: Publish release
+      if: github.event_name != 'workflow_dispatch' || inputs.publish
       uses: ncipollo/release-action@v1
       with:
         tag: ${{ env.RELEASE_TAG }}
@@ -72,7 +84,7 @@ jobs:
   # Dispatched builds only: push builds come from linux-support, which is behind master.
   notify-downstream:
     needs: build-linux
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
     uses: ./.github/workflows/notify-downstream.yml
     with:
       tag: ${{ needs.build-linux.outputs.tag }}
