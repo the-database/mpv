@@ -1420,6 +1420,13 @@ static bool stream_slot_add(struct priv *p, struct stream_ring *r)
         return false;
     if (r->storable && r->slot_size > p->gpu->limits.max_ssbo_size)
         return false;
+    // Backends without persistently mapped buffers (d3d11: max_mapped_size
+    // is 0) would fail pl_buf_create's validation and log an error; take the
+    // fallback upload path directly instead.
+    if (r->slot_size > p->gpu->limits.max_mapped_size) {
+        r->grow_failed = true;
+        return false;
+    }
     pl_buf *buf = &r->slot[r->num];
     *buf = pl_buf_create(p->gpu, pl_buf_params(.size = r->slot_size,
                                                .storable = r->storable,
