@@ -55,7 +55,9 @@ static inline scene_event scene_event_create(void) { return CreateEventW(NULL, F
 static inline void scene_event_set(scene_event e) { SetEvent(e); }
 static inline void scene_event_wait(scene_event e) { WaitForSingleObject(e, INFINITE); }
 static inline void scene_event_destroy(scene_event e) { if (e) CloseHandle(e); }
+#if HAVE_GPL
 static inline void *scene_sym(scene_module m, const char *name) { return (void *)GetProcAddress(m, name); }
+#endif
 static inline void scene_unload(scene_module m) { FreeLibrary(m); }
 #else
 typedef void *scene_module;
@@ -102,7 +104,9 @@ static inline void scene_event_destroy(scene_event e)
     mp_cond_destroy(&e->cond); mp_mutex_destroy(&e->lock);
     free(e);
 }
+#if HAVE_GPL
 static inline void *scene_sym(scene_module m, const char *name) { return dlsym(m, name); }
+#endif
 static inline void scene_unload(scene_module m) { dlclose(m); }
 #endif
 
@@ -300,6 +304,10 @@ static void scene_pin_self(void)
 }
 #endif
 
+#if !HAVE_GPL && !defined(_WIN32)
+// No detector and no addon bridge: nothing here starts a worker.
+__attribute__((unused))
+#endif
 static bool start_worker(struct ajn_scene *s)
 {
     ajn_scene_reset(s);
