@@ -1449,7 +1449,11 @@ if features['cuda-hwaccel']
     sources += files('video/filter/vf_animejanai.c',
                      'video/out/hwdec/hwdec_cuda.c')
     if win32
-        sources += files('video/filter/ajn_scene.c', 'video/filter/ajn_sample_cuda.c')
+        sources += files('video/filter/ajn_sample_cuda.c')
+    endif
+    # The built-in scene detector runs on both; its addon bridge is Windows-only.
+    if win32 or host_machine.system() == 'linux'
+        sources += files('video/filter/ajn_scene.c')
         if get_option('ajn-mvtools')
             if not get_option('gpl')
                 error('ajn-mvtools requires a GPL build')
@@ -1459,8 +1463,8 @@ if features['cuda-hwaccel']
     endif
 endif
 
-if get_option('ajn-mvtools') and not (win32 and features['cuda-hwaccel'])
-    error('ajn-mvtools requires Windows and cuda-hwaccel')
+if get_option('ajn-mvtools') and not ((win32 or host_machine.system() == 'linux') and features['cuda-hwaccel'])
+    error('ajn-mvtools requires Windows or Linux, and cuda-hwaccel')
 endif
 
 cuda_interop = get_option('cuda-interop').require(

@@ -99,8 +99,12 @@ clone https://github.com/the-database/libass.git "$DEPS/libass" master
 
 say "mpv (this fork)"
 meson setup "$MPV_SRC/b" "$MPV_SRC" --prefix="$PREFIX" --buildtype=release \
-  -Dlibmpv=true -Dcuda-hwaccel=enabled -Dvulkan=enabled -Dlua=enabled 2>/dev/null || true
+  -Dlibmpv=true -Dcuda-hwaccel=enabled -Dvulkan=enabled -Dlua=enabled \
+  -Dajn-mvtools=true -Dtests=true 2>/dev/null || true
 ninja -C "$MPV_SRC/b" install
+
+say "scene detector tests"
+meson test -C "$MPV_SRC/b" --print-errorlogs ajn-mvtools-detector ajn-scene-builtin
 
 # ---- collect a self-contained bundle -------------------------------------
 # mpv + libmpv + every NEEDED .so, minus the host-provided set (glibc/libstdc++,
@@ -114,6 +118,12 @@ cp -a "$PREFIX/bin/mpv" "$BUNDLE/"
 for so in "$PREFIX"/lib/x86_64-linux-gnu/libmpv.so* "$PREFIX"/lib/libmpv.so*; do
   [ -e "$so" ] && cp -aL "$so" "$BUNDLE/" 2>/dev/null || true
 done
+# The optional GPL scene detector for RIFE's enhanced scene detection. mpv
+# dlopen()s it from beside itself only when a chain opts in, so it is not a
+# NEEDED lib and collect() below would never pick it up.
+cp -aL "$PREFIX/bin/ajn-mvtools.so" "$BUNDLE/"
+mkdir -p "$BUNDLE/licenses/mvtools"
+cp "$MPV_SRC/video/filter/mvtools/LICENSE" "$MPV_SRC/video/filter/mvtools/UPSTREAM.md" "$BUNDLE/licenses/mvtools/"
 # host-provided, never bundled (driver/display-coupled + the C/C++ runtime)
 # libvulkan is bundled (our newer loader; it still finds the host's NVIDIA ICD at
 # runtime). libGL/EGL/drm/gbm/cuda/nvidia stay host-provided (driver-coupled).
@@ -134,9 +144,10 @@ collect(){ # recursively copy a binary's non-excluded NEEDED libs
 }
 collect "$BUNDLE/mpv"
 for so in "$BUNDLE"/libmpv.so*; do collect "$so"; done
+collect "$BUNDLE/ajn-mvtools.so"
 
 say "bundle glibc/GLIBCXX floor"
-for f in "$BUNDLE/mpv" "$BUNDLE"/libmpv.so.2 "$BUNDLE"/libplacebo.so* "$BUNDLE"/libavcodec.so*; do
+for f in "$BUNDLE/mpv" "$BUNDLE"/libmpv.so.2 "$BUNDLE"/libplacebo.so* "$BUNDLE"/libavcodec.so* "$BUNDLE/ajn-mvtools.so"; do
   [ -e "$f" ] || continue
   g=$(objdump -T "$f" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1)
   printf "  %-28s GLIBC<=%s\n" "$(basename "$f")" "${g:-none}"
