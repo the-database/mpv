@@ -551,6 +551,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
 
     dst->pict_type = src->pict_type;
     dst->fields = src->fields;
+    dst->corrupt = src->corrupt;
     dst->pts = src->pts;
     dst->dts = src->dts;
     dst->pkt_duration = src->pkt_duration;
@@ -1126,6 +1127,8 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     }
 
     dst->pict_type = src->pict_type;
+    dst->corrupt = (src->flags & AV_FRAME_FLAG_CORRUPT) ||
+                   src->decode_error_flags;
 
     dst->params.crop.x0 = src->crop_left;
     dst->params.crop.y0 = src->crop_top;
