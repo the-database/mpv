@@ -99,6 +99,8 @@ typedef struct mp_image {
 
     int pict_type; // 0->unknown, 1->I, 2->P, 3->B
     int fields;
+    // the decoder flagged errors in this frame (corrupt, or concealed)
+    bool corrupt;
 
     /* only inside filter chain */
     double pts;
