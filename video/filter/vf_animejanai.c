@@ -26,6 +26,12 @@
  * window provides the input read-ahead. RIFE chains stay synchronous
  * (their scene-change decision is a CPU readback per frame pair).
  *
+ * Held-frame reuse (plain upscale chains): a source frame that is the same
+ * picture as the last upscaled one (the anchor) skips inference, and the
+ * anchor's output goes out again under the frame's pts. libaji's held-frame
+ * engine (aji_held_*) decides, with the two frames after it as look-ahead;
+ * see held_decide().
+ *
  * Runtime: `vf-command animejanai slot <N>` switches the active slot.
  *
  * This file is part of mpv.
@@ -71,6 +77,7 @@
 #include "options/m_option.h"
 #include "options/path.h"
 #include "osdep/io.h"
+#include "osdep/timer.h"
 #include "refqueue.h"
 #include "video/fmt-conversion.h"
 #include "video/mp_image.h"
@@ -161,6 +168,7 @@ struct opts {
     bool output_444;
     int queue_depth;
     int stream_mode; // 0 ordinary, 1 cached-only stream, 2 prepare, 3 check
+    int reuse_held;  // 0 auto (animejanai.conf decides), 1 no
 };
 
 #define MAX_DEPTH 4
@@ -197,7 +205,23 @@ struct aji_api {
     const char *(*current_log)(aji_ctx *c);
     const char *(*last_error)(aji_ctx *c);
     void (*destroy)(aji_ctx **c);
+    // Held-frame reuse, all optional: an older shim has none of them, and
+    // then no frame is reused.
+    int (*reuse_for_config)(const char *conf_path);
+    aji_held *(*held_create)(aji_ctx *c, const aji_held_params *params);
+    int (*held_set_trace)(aji_held *h, const char *path);
+    int (*held_decide)(aji_held *h, const aji_held_frame *p,
+                       const aji_held_frame *n, const aji_held_frame *n2,
+                       void *cu_stream, aji_held_decision *out);
+    int (*held_set_anchor)(aji_held *h, const aji_held_frame *copy);
+    void (*held_reset)(aji_held *h);
+    void (*held_get_stats)(aji_held *h, aji_held_stats *out);
+    void (*held_destroy)(aji_held **h);
 };
+
+// D3D11 + held-frame reuse: staged copies of refqueue frames kept, at most
+// the current frame plus the decision look-ahead (depth + 2).
+#define MAX_STAGED (MAX_DEPTH + 3)
 
 struct priv {
     struct opts *opts;
@@ -261,10 +285,35 @@ struct priv {
     struct {
         struct mp_image *src;
         struct mp_image *out;
+        struct mp_image *stage;  // D3D11 + reuse: the staged input, kept
+                                 // until the ticket was waited (or NULL)
         uint64_t ticket;
     } ring[MAX_DEPTH];
     int ring_n;
     int depth;
+
+    // Held-frame reuse (see held_decide). Frames are identified by their
+    // refqueue sequence number (seq0 + rel, as for temporal chains).
+    aji_held *held;
+    bool held_on;                  // reusing frames in the current chain
+    const char *held_why;          // with a chain active and reuse off: why
+    struct mp_image *anchor_out;   // the anchor's upscaled output
+    struct mp_image *anchor_src;   // the anchor's source copy: CUDA a frame
+                                   // of src_pool, D3D11 its staged copy
+    uint64_t anchor_ticket;        // the anchor's inference ticket
+    double held_last_pts;
+    aji_held_stats held_base;      // counters at the last configure
+    double stats_time;             // last write_stats, mp_time_sec()
+    CUstream diff_stream;          // CUDA: the comparisons and anchor copies
+    CUevent held_evt;              // CUDA: decode progress for diff_stream
+    bool stats_warned;
+#if HAVE_D3D11
+    struct {
+        uint64_t seq;
+        struct mp_image *img;
+    } staged[MAX_STAGED];
+    int staged_n;
+#endif
 
     // RIFE: outputs live on a uniform grid of num/den times the input
     // rate (vsmlrt video_player semantics: output j sits at input
@@ -382,6 +431,273 @@ static int map_siting(struct mp_image_params *params)
     }
 }
 
+static struct mp_image *alloc_src(struct mp_filter *vf);
+static void held_destroy(struct mp_filter *vf);
+static void held_destroy_cuda(struct mp_filter *vf);
+#if HAVE_D3D11
+static struct mp_image *stage_src_d3d11(struct mp_filter *vf,
+                                        struct mp_image *src);
+#endif
+
+/*
+ * Held-frame reuse, plain upscale chains only (RIFE and temporal chains keep
+ * it off, like aji_encode's defaults). Every refqueue frame is decided once,
+ * in order, as submit_frame takes it: libaji's engine compares it with the
+ * anchor and with the two frames after it (rel + 1 and rel + 2, so the
+ * refqueue buffers depth + 1 future frames; at the end of the stream they
+ * are missing and the frame is upscaled). REUSE puts a new ref of the
+ * anchor's output into the ring under the frame's pts, with the anchor's
+ * ticket: tickets complete in order and nothing is upscaled between the
+ * anchor and a frame that reuses it (every upscale drops the anchor), so the
+ * ring's wait and drain rules stay as they are. Frame count and pts are
+ * those without reuse; damaged frames are never reused nor anchors.
+ *
+ * CUDA: the comparisons run on diff_stream, which waits on an event recorded
+ * on the decode stream when the frame is decided; the frames after it were
+ * decoded before. The anchor's source is a copy in src_pool, so a long still
+ * doesn't pin a decoder surface.
+ *
+ * D3D11: decoder surfaces aren't shareable, so each frame gets a staged
+ * copy in src_pool (pooled, refcounted, written once) the first time it is
+ * compared; the same copy is the inference input and, if the frame is
+ * upscaled, the anchor's source. The d3d_stage ring is not used then.
+ * Marks are 0: a comparison waits for the work queued on the immediate
+ * context, never for inference.
+ */
+
+static aji_held_stats held_stats(struct priv *p)
+{
+    aji_held_stats s = {.struct_size = sizeof(s)};
+    if (p->held)
+        p->api.held_get_stats(p->held, &s);
+    return s;
+}
+
+// Forget the anchor, the look-ahead and the staged copies: a seek, a
+// discontinuity, a reconfigure or a pipeline resync. Counters stay.
+static void held_reset(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    if (p->held)
+        p->api.held_reset(p->held);
+    mp_image_unrefp(&p->anchor_out);
+    mp_image_unrefp(&p->anchor_src);
+    p->anchor_ticket = 0;
+    p->held_last_pts = MP_NOPTS_VALUE;
+#if HAVE_D3D11
+    for (int i = 0; i < p->staged_n; i++)
+        mp_image_unrefp(&p->staged[i].img);
+    p->staged_n = 0;
+#endif
+}
+
+// Reuse stops for the rest of this chain (until the next configure).
+static void held_fail(struct mp_filter *vf, const char *what)
+{
+    struct priv *p = vf->priv;
+    MP_WARN(vf, "Held-frame reuse failed (%s); reusing no more frames\n", what);
+    held_reset(vf);
+    p->held_on = false;
+    p->held_why = "failed during playback";
+}
+
+static void held_desc(struct priv *p, aji_held_frame *d, struct mp_image *img,
+                      uint64_t id, bool damaged)
+{
+    *d = (aji_held_frame){
+        .frame = {
+            .width = p->params.w, .height = p->params.h,
+            .format = p->aji_fmt,
+            .matrix = map_matrix(&p->params),
+            .range = map_range(&p->params),
+            .siting = map_siting(&p->params),
+            .plane = {img->planes[0], img->planes[1]},
+        },
+        .id = id,
+        .flags = damaged ? AJI_HELD_FRAME_DAMAGED : 0,
+    };
+    if (!p->is_d3d11) {
+        d->frame.plane[2] = img->planes[2];
+        for (int i = 0; i < 3; i++)
+            d->frame.stride[i] = img->stride[i];
+    }
+}
+
+#if HAVE_D3D11
+// The staged copy of the refqueue frame at rel, made on first use and kept
+// while the frame can still be compared (its sequence number >= seq0).
+static struct mp_image *staged_get(struct mp_filter *vf, int rel)
+{
+    struct priv *p = vf->priv;
+    const uint64_t seq = p->seq0 + rel;
+    struct mp_image *found = NULL;
+    int n = 0;
+    for (int i = 0; i < p->staged_n; i++) {
+        if (p->staged[i].seq < p->seq0) {
+            mp_image_unrefp(&p->staged[i].img);
+            continue;
+        }
+        if (p->staged[i].seq == seq)
+            found = p->staged[i].img;
+        p->staged[n++] = p->staged[i];
+    }
+    p->staged_n = n;
+    if (found)
+        return found;
+    struct mp_image *src = mp_refqueue_get(p->queue, rel);
+    if (!src || p->staged_n == MAX_STAGED)
+        return NULL;
+    struct mp_image *img = stage_src_d3d11(vf, src);
+    if (!img)
+        return NULL;
+    p->staged[p->staged_n].seq = seq;
+    p->staged[p->staged_n].img = img;
+    p->staged_n++;
+    return img;
+}
+#endif
+
+// Decide the refqueue frame at rel (in). true: reuse the anchor's output.
+// *stage (D3D11) gets a ref of in's staged copy for the inference input; it
+// stays NULL on CUDA, or if staging failed (then in is staged as without
+// reuse). A failure turns reuse off for the chain and decides UPSCALE.
+static bool held_decide(struct mp_filter *vf, struct mp_image *in, int rel,
+                        struct mp_image **stage)
+{
+    struct priv *p = vf->priv;
+    *stage = NULL;
+
+    // pts going back (or not moving) without a reset: a discontinuity
+    if (in->pts != MP_NOPTS_VALUE && p->held_last_pts != MP_NOPTS_VALUE &&
+        in->pts <= p->held_last_pts)
+        held_reset(vf);
+    p->held_last_pts = in->pts;
+
+    struct mp_image *f[3] = {
+        in,
+        mp_refqueue_get(p->queue, rel + 1),
+        mp_refqueue_get(p->queue, rel + 2),
+    };
+    const int nf = f[1] && f[2] ? 3 : 1;  // no look-ahead: forced upscale
+    aji_held_frame d[3];
+    void *stream = NULL;
+#if HAVE_D3D11
+    if (p->is_d3d11) {
+        struct mp_image *s[3] = {0};
+        for (int i = 0; i < nf; i++) {
+            if (!(s[i] = staged_get(vf, rel + i))) {
+                held_fail(vf, "staging a frame");
+                return false;
+            }
+        }
+        for (int i = 0; i < nf; i++)
+            held_desc(p, &d[i], s[i], p->seq0 + rel + i, f[i]->corrupt);
+        *stage = mp_image_new_ref(s[0]);
+        MP_HANDLE_OOM(*stage);
+    } else
+#endif
+    {
+        CUcontext dummy;
+        if (CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0) {
+            held_fail(vf, "CUDA context");
+            return false;
+        }
+        bool ok = CHECK_CU(p->cu->cuEventRecord(p->held_evt,
+                                                p->decode_stream)) >= 0 &&
+                  CHECK_CU(p->cu->cuStreamWaitEvent(p->diff_stream,
+                                                    p->held_evt, 0)) >= 0;
+        p->cu->cuCtxPopCurrent(&dummy);
+        if (!ok) {
+            held_fail(vf, "CUDA event");
+            return false;
+        }
+        for (int i = 0; i < nf; i++)
+            held_desc(p, &d[i], f[i], p->seq0 + rel + i, f[i]->corrupt);
+        stream = p->diff_stream;
+    }
+
+    aji_held_decision dec = {0};
+    if (p->api.held_decide(p->held, &d[0], nf == 3 ? &d[1] : NULL,
+                           nf == 3 ? &d[2] : NULL, stream, &dec) != AJI_OK ||
+        dec.error)
+    {
+        MP_WARN(vf, "Held-frame comparison failed: %s\n",
+                p->api.last_error(p->aji));
+        held_fail(vf, "comparison");
+        return false;
+    }
+    if (dec.action != AJI_HELD_REUSE)
+        return false;
+    if (!p->anchor_out) {  // can't happen: the engine reuses only an anchor
+        held_reset(vf);
+        return false;
+    }
+    MP_TRACE(vf, "held frame pts=%f reuses frame %" PRIu64 " (run %d)\n",
+             in->pts, dec.anchor_id, dec.run);
+    return true;
+}
+
+// in (refqueue position rel) was just upscaled into out: it becomes the
+// anchor. stage is its D3D11 staged copy (NULL on CUDA).
+static void held_set_anchor(struct mp_filter *vf, struct mp_image *in,
+                            int rel, struct mp_image *stage,
+                            struct mp_image *out, uint64_t ticket)
+{
+    struct priv *p = vf->priv;
+    // the engine dropped the last anchor when it decided to upscale
+    mp_image_unrefp(&p->anchor_out);
+    if (in->corrupt)
+        return;  // never an anchor
+    if (p->is_d3d11) {
+        mp_image_unrefp(&p->anchor_src);
+        p->anchor_src = mp_image_new_ref(stage);
+        MP_HANDLE_OOM(p->anchor_src);
+    } else {
+        // The engine dropped the previous anchor when it decided to upscale,
+        // and its comparisons are done, so the copy can be overwritten.
+        if (!p->anchor_src && !(p->anchor_src = alloc_src(vf))) {
+            held_fail(vf, "anchor copy");
+            return;
+        }
+        CUcontext dummy;
+        if (CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0) {
+            held_fail(vf, "anchor copy");
+            return;
+        }
+        // diff_stream already waits for in's decode (held_decide)
+        bool ok = true;
+        for (int n = 0; ok && n < p->layout.fmt.num_planes; n++) {
+            CUDA_MEMCPY2D cpy = {
+                .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+                .srcDevice     = (CUdeviceptr)(uintptr_t)in->planes[n],
+                .srcPitch      = in->stride[n],
+                .dstMemoryType = CU_MEMORYTYPE_DEVICE,
+                .dstDevice     = (CUdeviceptr)(uintptr_t)p->anchor_src->planes[n],
+                .dstPitch      = p->anchor_src->stride[n],
+                .WidthInBytes  = mp_image_plane_w(&p->layout, n) *
+                                 p->layout.fmt.bpp[n] / 8,
+                .Height        = mp_image_plane_h(&p->layout, n),
+            };
+            ok = CHECK_CU(p->cu->cuMemcpy2DAsync(&cpy, p->diff_stream)) >= 0;
+        }
+        ok = ok && CHECK_CU(p->cu->cuStreamSynchronize(p->diff_stream)) >= 0;
+        p->cu->cuCtxPopCurrent(&dummy);
+        if (!ok) {
+            held_fail(vf, "anchor copy");
+            return;
+        }
+    }
+    aji_held_frame a;
+    held_desc(p, &a, p->anchor_src, p->seq0 + rel, false);
+    if (p->api.held_set_anchor(p->held, &a) != AJI_OK) {
+        held_fail(vf, "setting the anchor");
+        return;
+    }
+    p->anchor_out = mp_image_new_ref(out);
+    MP_HANDLE_OOM(p->anchor_out);
+    p->anchor_ticket = ticket;
+}
+
 // Wait until every submitted frame's GPU work completed. The ring entries
 // stay queued for emission; tickets complete in order, so waiting the
 // newest covers all.
@@ -401,9 +717,13 @@ static void clear_ring(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
     drain_ring(vf);
-    for (int i = 0; i < p->ring_n; i++)
+    for (int i = 0; i < p->ring_n; i++) {
         mp_image_unrefp(&p->ring[i].out);
+        mp_image_unrefp(&p->ring[i].stage);
+    }
     p->ring_n = 0;
+    // the dropped frames come back undecided (lost sync) or not at all
+    held_reset(vf);
 }
 
 static void drain_backend(struct mp_filter *vf)
@@ -478,6 +798,7 @@ static void release_device_state(struct mp_filter *vf)
     p->rife_num = p->rife_den = 1;
     p->rife_acc = 1;
 
+    held_destroy(vf);
     if (p->aji)
         p->api.destroy(&p->aji);
 
@@ -507,8 +828,9 @@ static void release_device_state(struct mp_filter *vf)
             }
             if (p->own_stream)
                 p->cu->cuStreamDestroy(p->own_stream);
+            held_destroy_cuda(vf);
             p->cu->cuCtxPopCurrent(&dummy);
-        } else if (p->own_stream || p->decode_evt_ok) {
+        } else if (p->own_stream || p->decode_evt_ok || p->diff_stream) {
             MP_WARN(vf, "Could not make the old CUDA context current while "
                         "releasing AnimeJaNai device state\n");
         }
@@ -516,6 +838,8 @@ static void release_device_state(struct mp_filter *vf)
 
     for (int i = 0; i < MAX_DEPTH; i++)
         p->decode_evt[i] = NULL;
+    p->diff_stream = NULL;
+    p->held_evt = NULL;
 
     av_buffer_unref(&p->hw_pool);
     av_buffer_unref(&p->src_pool);
@@ -537,18 +861,163 @@ static void release_device_state(struct mp_filter *vf)
     p->seq0 = p->seq_next = 0;
 }
 
+static const char held_why_no_engine[] = "the inference library is too old";
+
+static bool write_text(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return false;
+    bool ok = fputs(text, f) >= 0;
+    return fclose(f) == 0 && ok;
+}
+
+// The chain's log, plus a held-frame line while an upscale chain is active
+// (the stats overlay parses it; same wording as aji_encode):
+// "held frames: reused 123 of 1000 (12.3%)", counted since the chain was
+// configured, or "held frames: not reused (<why>)". No line when the
+// inference library has no held-frame engine. Rewritten about once a second
+// while frames are reused, through a temporary file, so a reader never sees
+// it half written.
 static void write_stats(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
     if (!p->path.stats || !p->aji)
         return;
-    FILE *f = fopen(p->path.stats, "w");
-    if (!f) {
+    p->stats_time = mp_time_sec();
+    const char *log = p->api.current_log(p->aji);
+    char *text = talloc_strdup(NULL, log ? log : "");
+    if (p->held_on ||
+        (p->aji_active && p->held_why && p->held_why != held_why_no_engine)) {
+        size_t len = strlen(text);
+        if (len && text[len - 1] != '\n')
+            text = talloc_strdup_append(text, "\n");
+        if (p->held_on) {
+            aji_held_stats s = held_stats(p);
+            long long seen = s.seen - p->held_base.seen;
+            long long reused = s.reused - p->held_base.reused;
+            text = talloc_asprintf_append(text,
+                "held frames: reused %lld of %lld (%.1f%%)\n", reused, seen,
+                seen > 0 ? 100.0 * reused / seen : 0.0);
+        } else {
+            text = talloc_asprintf_append(text,
+                "held frames: not reused (%s)\n", p->held_why);
+        }
+    }
+    char *tmp = talloc_asprintf(text, "%s.tmp", p->path.stats);
+    bool ok = write_text(tmp, text) && rename(tmp, p->path.stats) == 0;
+    if (!ok) {
+        // e.g. the overlay has the file open right now: write it in place
+        remove(tmp);
+        ok = write_text(p->path.stats, text);
+    }
+    if (!ok && !p->stats_warned) {
         MP_WARN(vf, "Cannot write stats file %s\n", p->path.stats);
+        p->stats_warned = true;
+    }
+    talloc_free(text);
+}
+
+static void held_log_stats(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    aji_held_stats s = held_stats(p);
+    if (!s.seen)
+        return;
+    MP_VERBOSE(vf, "Held frames: %lld of %lld reused (%.1f%%), %lld "
+               "comparisons, %.3f ms each\n", (long long)s.reused,
+               (long long)s.seen, 100.0 * s.reused / s.seen,
+               (long long)s.comparisons,
+               s.comparisons ? s.compare_ns / 1e6 / s.comparisons : 0.0);
+}
+
+// Destroy the engine (before aji_destroy). The CUDA stream and event go in
+// held_destroy_cuda, with the context current.
+static void held_destroy(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    if (p->held_on)
+        write_stats(vf);  // the final count
+    held_reset(vf);
+    if (p->held) {
+        held_log_stats(vf);
+        p->api.held_destroy(&p->held);
+    }
+    p->held = NULL;
+    p->held_on = false;
+    p->held_why = NULL;
+}
+
+static void held_destroy_cuda(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    if (p->diff_stream) {
+        p->cu->cuStreamSynchronize(p->diff_stream);
+        p->cu->cuStreamDestroy(p->diff_stream);
+    }
+    if (p->held_evt)
+        p->cu->cuEventDestroy(p->held_evt);
+    p->diff_stream = NULL;
+    p->held_evt = NULL;
+}
+
+// Whether this chain reuses held frames; one line says so, or why not.
+// Called by configure_aji with an upscale chain active.
+static void held_setup(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    const char *why = NULL;
+    if (p->opts->reuse_held == 1)
+        why = "reuse-held=no";
+    else if (!p->api.held_create || !p->api.reuse_for_config)
+        why = held_why_no_engine;
+    else if (!p->api.reuse_for_config(p->path.conf))
+        why = "reuse_held_frames is off in animejanai.conf";
+    else if (p->rife_on)
+        why = "RIFE chain";
+    else if (p->temporal_r)
+        why = "temporal chain";
+    if (!why && !p->held) {
+        const aji_held_params hp = {
+            .struct_size = sizeof(hp),
+            .threshold = AJI_HELD_THRESHOLD_DEFAULT,
+            .fade_threshold = AJI_HELD_FADE_DEFAULT,
+            .max_run = AJI_HELD_MAX_RUN_DEFAULT,
+        };
+        p->held = p->api.held_create(p->aji, &hp);
+        if (!p->held) {
+            why = "the backend can't compare frames";
+        } else {
+            const char *trace = getenv("AJI_REUSE_TRACE");
+            if (trace && *trace && p->api.held_set_trace &&
+                p->api.held_set_trace(p->held, trace) != AJI_OK)
+                MP_WARN(vf, "Cannot write held-frame trace %s\n", trace);
+        }
+    }
+    if (!why && !p->is_d3d11 && !p->diff_stream) {
+        CUcontext dummy;
+        bool ok = CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0;
+        if (ok) {
+            ok = CHECK_CU(p->cu->cuStreamCreate(&p->diff_stream,
+                                                CU_STREAM_NON_BLOCKING)) >= 0 &&
+                 CHECK_CU(p->cu->cuEventCreate(&p->held_evt,
+                                               CU_EVENT_DISABLE_TIMING)) >= 0;
+            if (!ok)
+                held_destroy_cuda(vf);
+            p->cu->cuCtxPopCurrent(&dummy);
+        }
+        if (!ok)
+            why = "CUDA stream setup failed";
+    }
+    p->held_why = why;
+    if (why) {
+        MP_INFO(vf, "Held-frame reuse: off (%s)\n", why);
         return;
     }
-    fputs(p->api.current_log(p->aji), f);
-    fclose(f);
+    p->held_on = true;
+    p->held_base = held_stats(p);
+    MP_INFO(vf, "Held-frame reuse: on (unchanged frames reuse the last "
+            "upscale)\n");
 }
 
 // Pipeline depth for the current configuration. RIFE chains stay
@@ -565,9 +1034,13 @@ static void update_depth(struct mp_filter *vf)
     struct priv *p = vf->priv;
     int depth = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
     p->depth = (p->aji_active && !p->rife_on && !p->temporal_r) ? depth : 1;
+    // Held-frame reuse decides the newest submitted frame (rel depth - 1)
+    // with the two after it.
+    int future = p->temporal_r ? p->temporal_r : p->depth - 1;
+    if (p->held_on)
+        future = p->depth + 1;
     mp_refqueue_set_refs(p->queue, 0,
-                         MPMAX(p->temporal_r ? p->temporal_r : p->depth - 1,
-                               p->scene && p->rife_on ? 2 : 0));
+                         MPMAX(future, p->scene && p->rife_on ? 2 : 0));
 }
 
 // Versioned, path-free signal for the trusted libmpv host. Never forward raw
@@ -629,6 +1102,11 @@ static bool configure_aji(struct mp_filter *vf)
     p->scene_decision = -1;
     p->out_params = p->params;
     p->aji_active = false;
+    // A new chain (or none): forget the anchor; held_setup decides anew,
+    // and re-reads the conf, once the chain is known.
+    held_reset(vf);
+    p->held_on = false;
+    p->held_why = NULL;
     if (!p->aji) {
         configure_scene(vf, false);
         update_depth(vf);
@@ -773,12 +1251,15 @@ static bool configure_aji(struct mp_filter *vf)
                        p->params.w, p->params.h, ww, wh);
         }
     }
+    held_setup(vf);
     update_depth(vf);
     MP_VERBOSE(vf, "Configured slot %d: %dx%d -> %dx%d (depth %d)\n",
                 p->cur_slot, p->params.w, p->params.h, ow, oh, p->depth);
+    write_stats(vf);  // again, with the held-frame line
     stream_status(vf, "active");
     return true;
 }
+
 
 #if HAVE_D3D11
 // Like mp_update_av_hw_frames_pool for IMGFMT_D3D11, but the textures
@@ -1000,9 +1481,32 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
 
     mp_assert(p->ring_n < MAX_DEPTH);
 
+    // Held-frame reuse decides every refqueue frame of a plain chain, once
+    // and in order (see held_decide).
+    const bool held = p->held_on && rel >= 0;
+    struct mp_image *stage = NULL;  // D3D11 + reuse: in's staged copy
+    if (held && held_decide(vf, in, rel, &stage)) {
+        struct mp_image *out = mp_image_new_ref(p->anchor_out);
+        MP_HANDLE_OOM(out);
+        mp_image_copy_attributes(out, in);
+        out->params = p->out_params;
+        out->pts = in->pts;
+        mp_image_unrefp(&stage);
+        p->ring[p->ring_n].src = in;
+        p->ring[p->ring_n].out = out;
+        p->ring[p->ring_n].stage = NULL;
+        p->ring[p->ring_n].ticket = p->anchor_ticket;
+        p->ring_n++;
+        return true;
+    }
+
     struct mp_image *out = alloc_out(vf);
-    if (!out)
+    if (!out) {
+        mp_image_unrefp(&stage);
+        if (held)
+            held_reset(vf);  // the frame comes back to be decided again
         return false;
+    }
     mp_image_copy_attributes(out, in);
     out->params = p->out_params;
     out->pts = in->pts;
@@ -1029,18 +1533,23 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
             // ingest_window instead.
             fin.plane[0] = in->planes[0];
             fin.plane[1] = in->planes[1];
+        } else if (stage) {
+            // held-frame reuse staged it already (pooled, refcounted; the
+            // ring keeps it until the ticket was waited)
+            fin.plane[0] = stage->planes[0];
+            fin.plane[1] = stage->planes[1];
         } else {
             // Stage the decode slice into a shareable texture first: decoder
             // surfaces are neither shareable nor synchronized for other
             // devices, and the same-device copy orders against decode on the
             // immediate context (vf_amf.c precedent).
-            ID3D11Texture2D *stage = p->d3d_stage[p->d3d_stage_next];
+            ID3D11Texture2D *tex = p->d3d_stage[p->d3d_stage_next];
             p->d3d_stage_next = (p->d3d_stage_next + 1) % p->d3d_stage_count;
             ID3D11DeviceContext_CopySubresourceRegion(p->d3d_ctx,
-                (ID3D11Resource *)stage, 0, 0, 0, 0,
+                (ID3D11Resource *)tex, 0, 0, 0, 0,
                 (ID3D11Resource *)in->planes[0], (UINT)(intptr_t)in->planes[1],
                 NULL);
-            fin.plane[0] = stage;
+            fin.plane[0] = tex;
             fin.plane[1] = 0;
         }
         const aji_frame fout = {
@@ -1078,10 +1587,13 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
         };
         if (!order_after_decode(vf)) {
             talloc_free(out);
+            if (held)
+                held_reset(vf);
             return false;
         }
         stream = p->stream;
         if (p->temporal_r && rel >= 0) {
+
             ok = ingest_window(vf, rel) &&
                  p->api.infer_seq(p->aji, p->seq0 + rel, &fout,
                                   p->stream) == AJI_OK;
@@ -1097,11 +1609,19 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
         // references `out`; let it finish before the frame is freed
         p->api.wait(p->aji, p->api.flush(p->aji, stream));
         talloc_free(out);
+        mp_image_unrefp(&stage);
+        if (held)
+            held_reset(vf);
         return false;
     }
 
+    // An upscaled frame becomes the anchor (unless reuse just failed).
+    if (held && p->held_on)
+        held_set_anchor(vf, in, rel, stage, out, ticket);
+
     p->ring[p->ring_n].src = in;
     p->ring[p->ring_n].out = out;
+    p->ring[p->ring_n].stage = stage;
     p->ring[p->ring_n].ticket = ticket;
     p->ring_n++;
     return true;
@@ -1115,6 +1635,7 @@ static struct mp_image *pop_ring(struct mp_filter *vf)
 
     mp_assert(p->ring_n > 0);
     struct mp_image *out = p->ring[0].out;
+    struct mp_image *stage = p->ring[0].stage;
     uint64_t ticket = p->ring[0].ticket;
     p->ring_n--;
     memmove(&p->ring[0], &p->ring[1], p->ring_n * sizeof(p->ring[0]));
@@ -1122,8 +1643,9 @@ static struct mp_image *pop_ring(struct mp_filter *vf)
     if (p->api.wait(p->aji, ticket) != AJI_OK) {
         MP_ERR(vf, "inference wait failed: %s\n", p->api.last_error(p->aji));
         talloc_free(out);
-        return NULL;
+        out = NULL;
     }
+    mp_image_unrefp(&stage);  // its reads are done (or the device is lost)
     return out;
 }
 
@@ -1989,7 +2511,11 @@ static void vf_animejanai_process(struct mp_filter *vf)
     }
 
     p->seq0++;
+
     mp_refqueue_write_out_pin(p->queue, out);
+    if (p->held_on && mp_time_sec() - p->stats_time >= 1.0)
+
+        write_stats(vf);
 }
 
 static bool vf_animejanai_command(struct mp_filter *vf,
@@ -2044,17 +2570,20 @@ static void uninit(struct mp_filter *vf)
     ajn_scene_destroy(p->scene);
     p->scene = NULL;
     talloc_free(p->queue);
+    held_destroy(vf);
     if (p->aji)
         p->api.destroy(&p->aji);
     if (p->api.handle)
         aji_lib_close(p->api.handle);
-    if (p->own_stream && p->cu &&
+    if ((p->own_stream || p->diff_stream) && p->cu &&
         p->cu->cuCtxPushCurrent(p->cuda_ctx) == CUDA_SUCCESS) {
         CUcontext dummy;
         for (int i = 0; i < MAX_DEPTH; i++)
             if (p->decode_evt[i])
                 p->cu->cuEventDestroy(p->decode_evt[i]);
-        p->cu->cuStreamDestroy(p->own_stream);
+        if (p->own_stream)
+            p->cu->cuStreamDestroy(p->own_stream);
+        held_destroy_cuda(vf);
         p->cu->cuCtxPopCurrent(&dummy);
     }
 #if HAVE_D3D11
@@ -2116,6 +2645,7 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     f->failure_is_fatal = p->opts->stream_mode != 0;
     p->queue = mp_refqueue_alloc(f);
     p->cur_slot = p->pending_slot = p->opts->slot;
+    p->held_last_pts = MP_NOPTS_VALUE;
 
     // Expand mpv path shortcuts (~~/ etc.) so portable configs can point at
     // files relative to the config directory (suboptions are not expanded
@@ -2194,6 +2724,24 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         }
         p->api.last_error = aji_lib_sym(p->api.handle, "aji_last_error");
         p->api.destroy = aji_lib_sym(p->api.handle, "aji_destroy");
+        // Held-frame reuse (libaji 0.30): all or nothing, never required.
+        p->api.reuse_for_config =
+            aji_lib_sym(p->api.handle, "aji_reuse_held_frames_for_config");
+        p->api.held_create = aji_lib_sym(p->api.handle, "aji_held_create");
+        p->api.held_set_trace = aji_lib_sym(p->api.handle, "aji_held_set_trace");
+        p->api.held_decide = aji_lib_sym(p->api.handle, "aji_held_decide");
+        p->api.held_set_anchor =
+            aji_lib_sym(p->api.handle, "aji_held_set_anchor");
+        p->api.held_reset = aji_lib_sym(p->api.handle, "aji_held_reset");
+        p->api.held_get_stats = aji_lib_sym(p->api.handle, "aji_held_get_stats");
+        p->api.held_destroy = aji_lib_sym(p->api.handle, "aji_held_destroy");
+        if (!p->api.reuse_for_config || !p->api.held_create ||
+            !p->api.held_decide || !p->api.held_set_anchor ||
+            !p->api.held_reset || !p->api.held_get_stats ||
+            !p->api.held_destroy) {
+            p->api.reuse_for_config = NULL;
+            p->api.held_create = NULL;
+        }
         if (!p->api.create || !p->api.set_slot || !p->api.configure ||
             !p->api.infer || !p->api.flush || !p->api.done || !p->api.wait ||
             !p->api.rife_factor || !p->api.infer_rife ||
@@ -2260,6 +2808,8 @@ static const m_option_t vf_opts_fields[] = {
     {"output-444", OPT_BOOL(output_444)},
     {"queue-depth", OPT_INT(queue_depth), M_RANGE(1, MAX_DEPTH)},
     {"stream-mode", OPT_CHOICE(stream_mode, {"normal", 0}, {"required", 1}, {"prepare", 2}, {"check", 3})},
+    {"reuse-held", OPT_CHOICE(reuse_held, {"auto", 0}, {"no", 1})},
+
     {0}
 };
 
