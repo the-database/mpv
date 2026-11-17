@@ -198,6 +198,8 @@ struct aji_api {
     int (*pre_resize)(aji_ctx *c, int *work_w, int *work_h);  // optional
     int (*resize)(aji_ctx *c, const aji_frame *in, const aji_frame *out,
                   void *cu_stream);          // optional; pre-RIFE downscale
+    // optional: Vulkan frames' exact copy (held-frame anchors, RIFE alone)
+    int (*copy_frame)(aji_ctx *c, const aji_frame *in, const aji_frame *out);
     int (*infer_rife)(aji_ctx *c, const aji_frame *a, const aji_frame *b,
                       double t, const aji_frame *out, void *cu_stream);
     int (*rife_scene_supported)(aji_ctx *c);
@@ -311,6 +313,7 @@ struct priv {
     bool held_on;                  // reusing frames in the current chain
     const char *held_why;          // with a chain active and reuse off: why
     struct mp_image *anchor_out;   // the anchor's upscaled output
+    aji_vk_image anchor_vk;        // Vulkan: the anchor's image, as the engine holds it
     struct mp_image *anchor_src;   // the anchor's source copy: CUDA a frame
                                    // of src_pool, D3D11 its staged copy
     uint64_t anchor_ticket;        // the anchor's inference ticket
@@ -514,6 +517,53 @@ static void held_fail(struct mp_filter *vf, const char *what)
     p->held_why = "failed during playback";
 }
 
+#if HAVE_VULKAN
+// An AVVkFrame handed to libaji as an aji_vk_image (one multi-planar image),
+// locked from vk_take to vk_give; vk_give writes back the semaphore value,
+// layout, access and queue family libaji leaves (AVVkFrame's rule) when ok.
+struct vk_held {
+    AVVkFrame *f;
+    AVHWFramesContext *fc;
+    aji_vk_image d;
+};
+
+static bool vk_take(struct mp_filter *vf, struct mp_image *img, struct vk_held *h)
+{
+    h->f = (AVVkFrame *)img->planes[0];
+    h->fc = img->hwctx ? (void *)img->hwctx->data : NULL;
+    if (!h->f || !h->fc) {
+        MP_ERR(vf, "Vulkan frame without its frames context\n");
+        return false;
+    }
+    if (h->f->img[1]) {
+        MP_ERR(vf, "Vulkan frames with one image per plane are not supported\n");
+        return false;
+    }
+    AVVulkanFramesContext *hc = h->fc->hwctx;
+    if (hc->lock_frame)
+        hc->lock_frame(h->fc, h->f);
+    h->d = (aji_vk_image){
+        .image = h->f->img[0], .layout = h->f->layout[0], .queue_family = h->f->queue_family[0],
+        .access = h->f->access[0], .semaphore = h->f->sem[0], .value = h->f->sem_value[0],
+    };
+    return true;
+}
+
+static void vk_give(struct vk_held *h, bool ok)
+{
+    if (ok) {
+        h->f->layout[0] = h->d.layout;
+        h->f->access[0] = h->d.access;
+        h->f->queue_family[0] = h->d.queue_family;
+        h->f->sem_value[0] = h->d.value;
+    }
+    AVVulkanFramesContext *hc = h->fc->hwctx;
+    if (hc->unlock_frame)
+        hc->unlock_frame(h->fc, h->f);
+}
+
+#endif
+
 static void held_desc(struct priv *p, aji_held_frame *d, struct mp_image *img,
                       uint64_t id, bool damaged)
 {
@@ -594,6 +644,44 @@ static bool held_decide(struct mp_filter *vf, struct mp_image *in, int rel,
     const int nf = f[1] && f[2] ? 3 : 1;  // no look-ahead: forced upscale
     aji_held_frame d[3];
     void *stream = NULL;
+    aji_held_decision dec = {0};
+    int dret = AJI_ERR;
+    bool decided = false;
+#if HAVE_VULKAN
+    if (p->is_vk) {
+        // the frames (and the anchor's copy, which the engine compares them with) locked
+        // for the call, their image state as libaji leaves it written back after
+        struct vk_held h[3], ha;
+        int n = 0;
+        while (n < nf && vk_take(vf, f[n], &h[n]))
+            n++;
+        const bool anc = n == nf && p->anchor_src && vk_take(vf, p->anchor_src, &ha);
+        if (n == nf && (anc || !p->anchor_src)) {
+            if (anc)
+                p->anchor_vk = ha.d;
+            for (int i = 0; i < nf; i++) {
+                held_desc(p, &d[i], f[i], p->seq0 + rel + i, f[i]->corrupt);
+                d[i].frame.plane[0] = &h[i].d;
+                d[i].frame.plane[1] = d[i].frame.plane[2] = NULL;
+                for (int k = 0; k < 3; k++)
+                    d[i].frame.stride[k] = 0;
+            }
+            dret = p->api.held_decide(p->held, &d[0], nf == 3 ? &d[1] : NULL,
+                                      nf == 3 ? &d[2] : NULL, NULL, &dec);
+            decided = true;
+        }
+        if (anc) {
+            ha.d = p->anchor_vk;
+            vk_give(&ha, true);
+        }
+        while (n-- > 0)
+            vk_give(&h[n], true);
+        if (!decided) {
+            held_fail(vf, "locking a frame");
+            return false;
+        }
+    } else
+#endif
 #if HAVE_D3D11
     if (p->is_d3d11) {
         struct mp_image *s[3] = {0};
@@ -629,10 +717,10 @@ static bool held_decide(struct mp_filter *vf, struct mp_image *in, int rel,
         stream = p->diff_stream;
     }
 
-    aji_held_decision dec = {0};
-    if (p->api.held_decide(p->held, &d[0], nf == 3 ? &d[1] : NULL,
-                           nf == 3 ? &d[2] : NULL, stream, &dec) != AJI_OK ||
-        dec.error)
+    if (!decided)
+        dret = p->api.held_decide(p->held, &d[0], nf == 3 ? &d[1] : NULL,
+                                  nf == 3 ? &d[2] : NULL, stream, &dec);
+    if (dret != AJI_OK || dec.error)
     {
         MP_WARN(vf, "Held-frame comparison failed: %s\n",
                 p->api.last_error(p->aji));
@@ -661,7 +749,35 @@ static void held_set_anchor(struct mp_filter *vf, struct mp_image *in,
     mp_image_unrefp(&p->anchor_out);
     if (in->corrupt)
         return;  // never an anchor
-    if (p->is_d3d11) {
+    if (p->is_vk) {
+#if HAVE_VULKAN
+        // an exact copy in src_pool (the decoder's frame goes back to its pool)
+        if (!p->anchor_src && !(p->anchor_src = alloc_src(vf))) {
+            held_fail(vf, "anchor copy");
+            return;
+        }
+        struct vk_held hi, ha;
+        bool ok = false;
+        if (vk_take(vf, in, &hi)) {
+            if (vk_take(vf, p->anchor_src, &ha)) {
+                const aji_frame fi = {
+                    .width = p->params.w, .height = p->params.h, .format = p->aji_fmt,
+                    .plane = {&hi.d},
+                };
+                aji_frame fa = fi;
+                fa.plane[0] = &ha.d;
+                ok = p->api.copy_frame(p->aji, &fi, &fa) == AJI_OK;
+                p->anchor_vk = ha.d;
+                vk_give(&ha, true);
+            }
+            vk_give(&hi, true);
+        }
+        if (!ok) {
+            held_fail(vf, "anchor copy");
+            return;
+        }
+#endif
+    } else if (p->is_d3d11) {
         mp_image_unrefp(&p->anchor_src);
         p->anchor_src = mp_image_new_ref(stage);
         MP_HANDLE_OOM(p->anchor_src);
@@ -702,6 +818,13 @@ static void held_set_anchor(struct mp_filter *vf, struct mp_image *in,
     }
     aji_held_frame a;
     held_desc(p, &a, p->anchor_src, p->seq0 + rel, false);
+    if (p->is_vk) {
+        // the engine keeps this frame: plane[0] is the struct held_decide refreshes
+        a.frame.plane[0] = &p->anchor_vk;
+        a.frame.plane[1] = a.frame.plane[2] = NULL;
+        for (int k = 0; k < 3; k++)
+            a.frame.stride[k] = 0;
+    }
     if (p->api.held_set_anchor(p->held, &a) != AJI_OK) {
         held_fail(vf, "setting the anchor");
         return;
@@ -991,8 +1114,8 @@ static void held_setup(struct mp_filter *vf)
         why = "RIFE chain";
     else if (p->temporal_r)
         why = "temporal chain";
-    else if (p->is_vk)
-        why = "Vulkan frames (no frame comparisons on them yet)";
+    else if (p->is_vk && !p->api.copy_frame)
+        why = "Vulkan frames need a libaji with aji_copy_frame";
     if (!why && !p->held) {
         const aji_held_params hp = {
             .struct_size = sizeof(hp),
@@ -1010,7 +1133,7 @@ static void held_setup(struct mp_filter *vf)
                 MP_WARN(vf, "Cannot write held-frame trace %s\n", trace);
         }
     }
-    if (!why && !p->is_d3d11 && !p->diff_stream) {
+    if (!why && !p->is_d3d11 && !p->is_vk && !p->diff_stream) {
         CUcontext dummy;
         bool ok = CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0;
         if (ok) {
@@ -1198,10 +1321,9 @@ static bool configure_aji(struct mp_filter *vf)
         }
     }
     p->rife_acc = p->rife_den;
-    if (p->rife_on && p->is_vk && ret == 0) {
-        // RIFE alone interpolates copies of the decoder frames, which this
-        // filter makes with CUDA / D3D11 only
-        MP_WARN(vf, "RIFE without an upscale model is not on Vulkan frames yet; interpolation disabled\n");
+    if (p->rife_on && p->is_vk && ret == 0 && !p->api.copy_frame) {
+        // RIFE alone interpolates copies of the decoder frames: aji_copy_frame on Vulkan frames
+        MP_WARN(vf, "RIFE without an upscale model needs a libaji with aji_copy_frame on Vulkan frames; interpolation disabled\n");
         p->rife_on = false;
     }
 
@@ -1451,53 +1573,6 @@ static struct mp_image *alloc_out(struct mp_filter *vf)
 // Hand the frames at relative positions rel..rel+r to the engine's history
 // (each frame once, in order). Missing futures (end of stream) are simply
 // not ingested; the engine clamps the window.
-#if HAVE_VULKAN
-// An AVVkFrame handed to libaji as an aji_vk_image (one multi-planar image),
-// locked from vk_take to vk_give; vk_give writes back the semaphore value,
-// layout, access and queue family libaji leaves (AVVkFrame's rule) when ok.
-struct vk_held {
-    AVVkFrame *f;
-    AVHWFramesContext *fc;
-    aji_vk_image d;
-};
-
-static bool vk_take(struct mp_filter *vf, struct mp_image *img, struct vk_held *h)
-{
-    h->f = (AVVkFrame *)img->planes[0];
-    h->fc = img->hwctx ? (void *)img->hwctx->data : NULL;
-    if (!h->f || !h->fc) {
-        MP_ERR(vf, "Vulkan frame without its frames context\n");
-        return false;
-    }
-    if (h->f->img[1]) {
-        MP_ERR(vf, "Vulkan frames with one image per plane are not supported\n");
-        return false;
-    }
-    AVVulkanFramesContext *hc = h->fc->hwctx;
-    if (hc->lock_frame)
-        hc->lock_frame(h->fc, h->f);
-    h->d = (aji_vk_image){
-        .image = h->f->img[0], .layout = h->f->layout[0], .queue_family = h->f->queue_family[0],
-        .access = h->f->access[0], .semaphore = h->f->sem[0], .value = h->f->sem_value[0],
-    };
-    return true;
-}
-
-static void vk_give(struct vk_held *h, bool ok)
-{
-    if (ok) {
-        h->f->layout[0] = h->d.layout;
-        h->f->access[0] = h->d.access;
-        h->f->queue_family[0] = h->d.queue_family;
-        h->f->sem_value[0] = h->d.value;
-    }
-    AVVulkanFramesContext *hc = h->fc->hwctx;
-    if (hc->unlock_frame)
-        hc->unlock_frame(h->fc, h->f);
-}
-
-#endif
-
 static bool ingest_window(struct mp_filter *vf, int rel)
 {
     struct priv *p = vf->priv;
@@ -1961,6 +2036,32 @@ static struct mp_image *render(struct mp_filter *vf)
     out->params = p->out_params;
     out->pts = in->pts;
 
+#if HAVE_VULKAN
+    if (p->is_vk) {
+        // Passthrough: an exact copy into the output pool's frame
+        struct vk_held hi, ho;
+        bool ok = false;
+        if (vk_take(vf, in, &hi)) {
+            if (vk_take(vf, out, &ho)) {
+                const aji_frame fi = {
+                    .width = in->w, .height = in->h, .format = p->aji_fmt,
+                    .plane = {&hi.d},
+                };
+                aji_frame fo = fi;
+                fo.plane[0] = &ho.d;
+                ok = p->api.copy_frame(p->aji, &fi, &fo) == AJI_OK;
+                vk_give(&ho, true);
+            }
+            vk_give(&hi, true);
+        }
+        if (!ok) {
+            MP_ERR(vf, "frame copy failed: %s\n", p->api.last_error(p->aji));
+            talloc_free(out);
+            return NULL;
+        }
+        return out;
+    }
+#endif
 #if HAVE_D3D11
     if (p->is_d3d11) {
         // Passthrough: same-device copy into the output slice (implicitly
@@ -3038,6 +3139,7 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         // then run RIFE at the source resolution (no pre-resize).
         p->api.pre_resize = aji_lib_sym(p->api.handle, "aji_pre_resize");
         p->api.resize = aji_lib_sym(p->api.handle, "aji_resize");
+        p->api.copy_frame = aji_lib_sym(p->api.handle, "aji_copy_frame");
         p->api.infer_rife = aji_lib_sym(p->api.handle, "aji_infer_rife");
         p->api.rife_scene_supported = aji_lib_sym(p->api.handle, "aji_rife_scene_supported");
         p->api.rife_enhanced_scene = aji_lib_sym(p->api.handle, "aji_rife_enhanced_scene");
