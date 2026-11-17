@@ -1,8 +1,11 @@
 /*
  * vf_animejanai: GPU-resident AI upscaling filter (CUDA / D3D11)
  *
- * The filter keeps frames in GPU memory end to end: IMGFMT_CUDA or
- * IMGFMT_D3D11 in, own AVHWFramesContext output pool, same format out.
+ * The filter keeps frames in GPU memory end to end: IMGFMT_CUDA,
+ * IMGFMT_D3D11 or IMGFMT_VULKAN in, own AVHWFramesContext output pool, same
+ * format out. Vulkan frames (hwdec=vulkan) go to libaji's aji_create_vk on
+ * the decoder's own device: plain upscale chains only for now (no RIFE,
+ * temporal models or held-frame reuse on that path yet).
  * Inference runs in the libaji shim, loaded at runtime across a strict
  * C ABI (see aji.h) so no inference toolchain links into mpv; the shim
  * dispatches on the conf's backend key (TensorRT on CUDA frames,
@@ -68,6 +71,10 @@
 
 #if HAVE_D3D11
 #include <libavutil/hwcontext_d3d11va.h>
+#endif
+
+#if HAVE_VULKAN
+#include <libavutil/hwcontext_vulkan.h>
 #endif
 
 #include "common/common.h"
@@ -176,6 +183,8 @@ struct opts {
 struct aji_api {
     void *handle;
     aji_ctx *(*create)(const aji_create_params *params);
+    // optional: Vulkan frames on the caller's device (NULL on older shims)
+    aji_ctx *(*create_vk)(const aji_create_params *params, const aji_vk_device *device);
     int (*set_slot)(aji_ctx *c, int slot);
     int (*configure)(aji_ctx *c, int w, int h, double fps, int *out_w,
                      int *out_h);
@@ -244,6 +253,10 @@ struct priv {
     bool     decode_evt_ok;
 
     bool is_d3d11;
+    bool is_vk;                      // Vulkan frames on the decoder's device (aji_create_vk)
+#if HAVE_VULKAN
+    aji_vk_device vkdev;             // its handles; av_device_ref keeps them alive
+#endif
 #if HAVE_D3D11
     ID3D11Device *d3d_dev;          // borrowed; av_device_ref keeps it alive
     ID3D11DeviceContext *d3d_ctx;
@@ -383,7 +396,7 @@ static int check_cu(struct mp_filter *vf, CUresult err, const char *func)
 static bool order_after_decode(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
-    if (p->is_d3d11 || p->stream == p->decode_stream || !p->decode_evt_ok)
+    if (p->is_d3d11 || p->is_vk || p->stream == p->decode_stream || !p->decode_evt_ok)
         return true;                       // already ordered / nothing to do
     CUcontext dummy;
     if (CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0)
@@ -853,6 +866,7 @@ static void release_device_state(struct mp_filter *vf)
     p->decode_evt_next = 0;
     p->decode_evt_ok = false;
     p->is_d3d11 = false;
+    p->is_vk = false;
     p->aji_active = false;
     p->configured = false;
     p->rife_on = false;
@@ -977,6 +991,8 @@ static void held_setup(struct mp_filter *vf)
         why = "RIFE chain";
     else if (p->temporal_r)
         why = "temporal chain";
+    else if (p->is_vk)
+        why = "Vulkan frames (no frame comparisons on them yet)";
     if (!why && !p->held) {
         const aji_held_params hp = {
             .struct_size = sizeof(hp),
@@ -1052,7 +1068,7 @@ static void stream_status(struct mp_filter *vf, const char *state)
     if (!p->opts->stream_mode)
         return;
     MP_INFO(vf, "AJN_STREAM_V1 %s %s %d %d %d %d %d %d %.6f\n", state,
-            p->is_d3d11 ? "DirectML" : "TensorRT", p->cur_slot,
+            p->is_vk ? "Vulkan" : p->is_d3d11 ? "DirectML" : "TensorRT", p->cur_slot,
             p->params.w, p->params.h, p->out_params.w, p->out_params.h,
             p->rife_on ? 1 : 0, p->fps * (p->rife_on ? (double)p->rife_num / p->rife_den : 1));
 }
@@ -1196,7 +1212,7 @@ static bool configure_aji(struct mp_filter *vf)
     p->aji_active = true;
     p->out_fmt = p->aji_fmt;
     if ((p->opts->output_444 || aji_format_is_444(p->aji_fmt)) &&
-        !p->is_d3d11) {
+        !p->is_d3d11 && !p->is_vk) {
         // Preserve 4:4:4 sources in full 16-bit output, including MSB input.
         // The option forces full-resolution 4:4:4 even from a 4:2:0 source
         // (exceeds the reference pipeline, which always subsampled back to
@@ -1385,6 +1401,12 @@ static struct mp_image *alloc_out(struct mp_filter *vf)
 #else
         pool_ok = false;
 #endif
+    } else if (p->is_vk) {
+        pool_ok = mp_update_av_hw_frames_pool(&p->hw_pool, p->av_device_ref,
+                                              IMGFMT_VULKAN,
+                                              p->out_params.hw_subfmt,
+                                              p->out_params.w,
+                                              p->out_params.h, false);
     } else {
         pool_ok = mp_update_av_hw_frames_pool(&p->hw_pool, p->av_device_ref,
                                               IMGFMT_CUDA,
@@ -1470,6 +1492,138 @@ static bool ingest_window(struct mp_filter *vf, int rel)
     return true;
 }
 
+#if HAVE_VULKAN
+// One frame through aji_create_vk's context: both AVVkFrames locked and handed
+// over as aji_vk_image (one multi-planar image each), the semaphore value,
+// layout, access and queue family libaji leaves written back (AVVkFrame's rule).
+static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
+                         struct mp_image *out, int mat, int rng, int sit)
+{
+    struct priv *p = vf->priv;
+    AVVkFrame *vi = (AVVkFrame *)in->planes[0], *vo = (AVVkFrame *)out->planes[0];
+    AVHWFramesContext *fi = in->hwctx ? (void *)in->hwctx->data : NULL;
+    AVHWFramesContext *fo = out->hwctx ? (void *)out->hwctx->data : NULL;
+    if (!vi || !vo || !fi || !fo) {
+        MP_ERR(vf, "Vulkan frame without its frames context\n");
+        return false;
+    }
+    if (vi->img[1] || vo->img[1]) {
+        MP_ERR(vf, "Vulkan frames with one image per plane are not supported\n");
+        return false;
+    }
+    AVVulkanFramesContext *hi = fi->hwctx, *ho = fo->hwctx;
+    if (hi->lock_frame)
+        hi->lock_frame(fi, vi);
+    if (ho->lock_frame)
+        ho->lock_frame(fo, vo);
+    aji_vk_image ii = {
+        .image = vi->img[0], .layout = vi->layout[0], .queue_family = vi->queue_family[0],
+        .access = vi->access[0], .semaphore = vi->sem[0], .value = vi->sem_value[0],
+    };
+    aji_vk_image oi = {
+        .image = vo->img[0], .layout = vo->layout[0], .queue_family = vo->queue_family[0],
+        .access = vo->access[0], .semaphore = vo->sem[0], .value = vo->sem_value[0],
+    };
+    const aji_frame fin = {
+        .width = in->w, .height = in->h, .format = p->aji_fmt,
+        .matrix = mat, .range = rng, .siting = sit,
+        .plane = {&ii},
+    };
+    const aji_frame fout = {
+        .width = p->out_params.w, .height = p->out_params.h, .format = p->out_fmt,
+        .matrix = mat, .range = rng, .siting = sit,
+        .plane = {&oi},
+    };
+    const bool ok = p->api.infer(p->aji, &fin, &fout, NULL) == AJI_OK;
+    if (ok) {
+        vi->layout[0] = ii.layout;
+        vi->access[0] = ii.access;
+        vi->queue_family[0] = ii.queue_family;
+        vi->sem_value[0] = ii.value;
+        vo->layout[0] = oi.layout;
+        vo->access[0] = oi.access;
+        vo->queue_family[0] = oi.queue_family;
+        vo->sem_value[0] = oi.value;
+    }
+    if (ho->unlock_frame)
+        ho->unlock_frame(fo, vo);
+    if (hi->unlock_frame)
+        hi->unlock_frame(fi, vi);
+    return ok;
+}
+
+static void vk_lock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    AVHWDeviceContext *dc = opaque;
+    AVVulkanDeviceContext *vk = dc->hwctx;
+    if (vk->lock_queue)
+        vk->lock_queue(dc, family, index);
+}
+
+static void vk_unlock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    AVHWDeviceContext *dc = opaque;
+    AVVulkanDeviceContext *vk = dc->hwctx;
+    if (vk->unlock_queue)
+        vk->unlock_queue(dc, family, index);
+}
+
+// The decoder's Vulkan device as libaji takes it: a compute queue of its
+// families (FFmpeg's list) and its lock, what it was created with.
+static bool adopt_vulkan(struct mp_filter *vf, AVHWDeviceContext *dc)
+{
+    struct priv *p = vf->priv;
+    AVVulkanDeviceContext *vk = dc->hwctx;
+    int fam = -1;
+    for (int i = 0; i < vk->nb_qf && fam < 0; i++)
+        if (vk->qf[i].flags & VK_QUEUE_COMPUTE_BIT)
+            fam = vk->qf[i].idx;
+    if (fam < 0) {
+        MP_ERR(vf, "The Vulkan device has no compute queue\n");
+        return false;
+    }
+    PFN_vkGetDeviceQueue2 get_queue2 =
+        (PFN_vkGetDeviceQueue2)vk->get_proc_addr(vk->inst, "vkGetDeviceQueue2");
+    VkQueue queue = VK_NULL_HANDLE;
+    VkDeviceQueueInfo2 qi = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
+        .queueFamilyIndex = fam,
+        .queueIndex = 0,
+    };
+#if defined(VK_KHR_internally_synchronized_queues) && LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 32, 100)
+    // libplacebo creates its queues internally synchronized when lavu takes the
+    // flag (video/out/vulkan/context.c): those come back only with it
+    qi.flags = VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR;
+    if (get_queue2)
+        get_queue2(vk->act_dev, &qi, &queue);
+    qi.flags = 0;
+#endif
+    if (!queue && get_queue2)
+        get_queue2(vk->act_dev, &qi, &queue);
+    if (!queue) {
+        MP_ERR(vf, "Cannot get the Vulkan device's compute queue\n");
+        return false;
+    }
+    p->vkdev = (aji_vk_device){
+        .struct_size = sizeof(aji_vk_device),
+        .get_instance_proc_addr = (void *)vk->get_proc_addr,
+        .instance = vk->inst,
+        .physical_device = vk->phys_dev,
+        .device = vk->act_dev,
+        .queue = queue,
+        .queue_family = fam,
+        .queue_index = 0,
+        .lock_queue = vk_lock_queue,
+        .unlock_queue = vk_unlock_queue,
+        .lock_opaque = dc,
+        .enabled_extensions = vk->enabled_dev_extensions,
+        .num_enabled_extensions = vk->nb_enabled_dev_extensions,
+        .enabled_features = &vk->device_features,
+    };
+    return true;
+}
+#endif
+
 // Enqueue inference for `in` and append it to the in-flight ring without
 // waiting for the GPU. `in` stays alive (and the decoder surface pinned)
 // through the refqueue until emission waits the entry's ticket. rel is
@@ -1517,6 +1671,11 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
     bool ok;
     void *stream = NULL;
 
+#if HAVE_VULKAN
+    if (p->is_vk) {
+        ok = infer_vulkan(vf, in, out, mat, rng, sit);
+    } else
+#endif
 #if HAVE_D3D11
     if (p->is_d3d11) {
         // Input geometry comes from the frame: the decoder size on the normal
@@ -2132,8 +2291,19 @@ static void vf_animejanai_process(struct mp_filter *vf)
             p->d3d_ctx = d3dctx->device_context;
             p->stream = NULL;
 #endif
+#if HAVE_VULKAN
+        } else if (avhwctx->type == AV_HWDEVICE_TYPE_VULKAN) {
+            if (!adopt_vulkan(vf, avhwctx)) {
+                mp_filter_internal_mark_failed(vf);
+                return;
+            }
+            p->is_vk = true;
+            p->av_device_ref = av_buffer_ref(fctx->device_ref);
+            MP_HANDLE_OOM(p->av_device_ref);
+            p->stream = NULL;
+#endif
         } else {
-            MP_ERR(vf, "Input frames are neither CUDA nor D3D11 frames%s\n",
+            MP_ERR(vf, "Input frames are neither CUDA, D3D11 nor Vulkan frames%s\n",
                    avhwctx->type == AV_HWDEVICE_TYPE_CUDA
                        ? " (CUDA driver unavailable)" : "");
             mp_filter_internal_mark_failed(vf);
@@ -2165,7 +2335,17 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 .log = aji_log_bridge,
                 .log_opaque = vf,
             };
+#if HAVE_VULKAN
+            if (p->is_vk && !p->api.create_vk) {
+                MP_ERR(vf, "This inference shim takes no Vulkan frames (aji_create_vk): "
+                       "use hwdec=d3d11va / nvdec, or update it\n");
+                mp_filter_internal_mark_failed(vf);
+                return;
+            }
+            p->aji = p->is_vk ? p->api.create_vk(&cp, &p->vkdev) : p->api.create(&cp);
+#else
             p->aji = p->api.create(&cp);
+#endif
             if (!p->aji) {
                 MP_ERR(vf, "Failed to create inference context\n");
                 mp_filter_internal_mark_failed(vf);
@@ -2194,7 +2374,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
             }
             // 4:4:4 planar ingest is TensorRT/CUDA only (no planar 16-bit
             // 4:4:4 DXGI format); on D3D11 it arrives as x2bgr10 RGB instead.
-            if (p->is_d3d11 && aji_format_is_444(p->aji_fmt)) {
+            if ((p->is_d3d11 || p->is_vk) && aji_format_is_444(p->aji_fmt)) {
                 MP_ERR(vf, "planar 4:4:4 input requires the TensorRT/CUDA backend\n");
                 mp_filter_internal_mark_failed(vf);
                 return;
@@ -2685,6 +2865,7 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
             goto fail;
         }
         p->api.create = aji_lib_sym(p->api.handle, "aji_create");
+        p->api.create_vk = aji_lib_sym(p->api.handle, "aji_create_vk");
         p->api.set_slot = aji_lib_sym(p->api.handle, "aji_set_slot");
         p->api.configure = aji_lib_sym(p->api.handle, "aji_configure");
         p->api.infer = aji_lib_sym(p->api.handle, "aji_infer");
@@ -2775,6 +2956,10 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     // n7.1) has neither the formats nor a decoder that produces them
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P10MSB));
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P12MSB));
+#endif
+#if HAVE_VULKAN
+    mp_refqueue_add_in_format(p->queue, IMGFMT_VULKAN, pixfmt2imgfmt(AV_PIX_FMT_NV12));
+    mp_refqueue_add_in_format(p->queue, IMGFMT_VULKAN, pixfmt2imgfmt(AV_PIX_FMT_P010));
 #endif
 #if HAVE_D3D11
     mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_NV12));
