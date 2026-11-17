@@ -655,9 +655,9 @@ static bool held_decide(struct mp_filter *vf, struct mp_image *in, int rel,
         int n = 0;
         while (n < nf && vk_take(vf, f[n], &h[n]))
             n++;
-        const bool anc = n == nf && p->anchor_src && vk_take(vf, p->anchor_src, &ha);
-        if (n == nf && (anc || !p->anchor_src)) {
-            if (anc)
+        const bool have_anchor = n == nf && p->anchor_src && vk_take(vf, p->anchor_src, &ha);
+        if (n == nf && (have_anchor || !p->anchor_src)) {
+            if (have_anchor)
                 p->anchor_vk = ha.d;
             for (int i = 0; i < nf; i++) {
                 held_desc(p, &d[i], f[i], p->seq0 + rel + i, f[i]->corrupt);
@@ -670,7 +670,7 @@ static bool held_decide(struct mp_filter *vf, struct mp_image *in, int rel,
                                       nf == 3 ? &d[2] : NULL, NULL, &dec);
             decided = true;
         }
-        if (anc) {
+        if (have_anchor) {
             ha.d = p->anchor_vk;
             vk_give(&ha, true);
         }
@@ -2043,13 +2043,13 @@ static struct mp_image *render(struct mp_filter *vf)
         bool ok = false;
         if (vk_take(vf, in, &hi)) {
             if (vk_take(vf, out, &ho)) {
-                const aji_frame fi = {
+                const aji_frame fsrc = {
                     .width = in->w, .height = in->h, .format = p->aji_fmt,
                     .plane = {&hi.d},
                 };
-                aji_frame fo = fi;
-                fo.plane[0] = &ho.d;
-                ok = p->api.copy_frame(p->aji, &fi, &fo) == AJI_OK;
+                aji_frame fdst = fsrc;
+                fdst.plane[0] = &ho.d;
+                ok = p->api.copy_frame(p->aji, &fsrc, &fdst) == AJI_OK;
                 vk_give(&ho, true);
             }
             vk_give(&hi, true);
