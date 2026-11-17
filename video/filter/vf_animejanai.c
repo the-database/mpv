@@ -2234,6 +2234,29 @@ static struct mp_image *downscale_src(struct mp_filter *vf,
         ret = p->api.resize(p->aji, &fin, &fout, NULL);
     } else
 #endif
+#if HAVE_VULKAN
+    if (p->is_vk) {
+        struct vk_held hs, hw;
+        ret = AJI_ERR;
+        if (vk_take(vf, src, &hs)) {
+            if (vk_take(vf, work, &hw)) {
+                const aji_frame fin = {
+                    .width = p->params.w, .height = p->params.h, .format = p->aji_fmt,
+                    .matrix = mat, .range = rng, .siting = sit,
+                    .plane = {&hs.d},
+                };
+                const aji_frame fout = {
+                    .width = p->work_w, .height = p->work_h, .format = p->aji_fmt,
+                    .matrix = mat, .range = rng, .siting = sit,
+                    .plane = {&hw.d},
+                };
+                ret = p->api.resize(p->aji, &fin, &fout, NULL);
+                vk_give(&hw, true);
+            }
+            vk_give(&hs, true);
+        }
+    } else
+#endif
     {
         if (!order_after_decode(vf)) {
             talloc_free(work);
