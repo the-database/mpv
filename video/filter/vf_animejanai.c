@@ -1082,6 +1082,11 @@ static void configure_scene(struct mp_filter *vf, bool rife_active)
     if (p->scene && !p->scene_builtin) return;
     bool enabled = p->aji && rife_active && p->api.rife_enhanced_scene &&
                    p->api.rife_enhanced_scene(p->aji);
+    if (enabled && p->is_vk) {
+        // its detector reads CUDA / D3D11 frames; libaji's own detection runs
+        MP_WARN(vf, "Experimental RIFE scene detection is not on Vulkan frames; using the built-in one\n");
+        enabled = false;
+    }
     if (!enabled) {
         if (p->scene_builtin) {
             ajn_scene_destroy(p->scene); p->scene = NULL;
@@ -1193,6 +1198,12 @@ static bool configure_aji(struct mp_filter *vf)
         }
     }
     p->rife_acc = p->rife_den;
+    if (p->rife_on && p->is_vk && ret == 0) {
+        // RIFE alone interpolates copies of the decoder frames, which this
+        // filter makes with CUDA / D3D11 only
+        MP_WARN(vf, "RIFE without an upscale model is not on Vulkan frames yet; interpolation disabled\n");
+        p->rife_on = false;
+    }
 
     configure_scene(vf, p->rife_on);
 
@@ -1493,63 +1504,109 @@ static bool ingest_window(struct mp_filter *vf, int rel)
 }
 
 #if HAVE_VULKAN
-// One frame through aji_create_vk's context: both AVVkFrames locked and handed
-// over as aji_vk_image (one multi-planar image each), the semaphore value,
-// layout, access and queue family libaji leaves written back (AVVkFrame's rule).
+// An AVVkFrame handed to libaji as an aji_vk_image (one multi-planar image),
+// locked from vk_take to vk_give; vk_give writes back the semaphore value,
+// layout, access and queue family libaji leaves (AVVkFrame's rule) when ok.
+struct vk_held {
+    AVVkFrame *f;
+    AVHWFramesContext *fc;
+    aji_vk_image d;
+};
+
+static bool vk_take(struct mp_filter *vf, struct mp_image *img, struct vk_held *h)
+{
+    h->f = (AVVkFrame *)img->planes[0];
+    h->fc = img->hwctx ? (void *)img->hwctx->data : NULL;
+    if (!h->f || !h->fc) {
+        MP_ERR(vf, "Vulkan frame without its frames context\n");
+        return false;
+    }
+    if (h->f->img[1]) {
+        MP_ERR(vf, "Vulkan frames with one image per plane are not supported\n");
+        return false;
+    }
+    AVVulkanFramesContext *hc = h->fc->hwctx;
+    if (hc->lock_frame)
+        hc->lock_frame(h->fc, h->f);
+    h->d = (aji_vk_image){
+        .image = h->f->img[0], .layout = h->f->layout[0], .queue_family = h->f->queue_family[0],
+        .access = h->f->access[0], .semaphore = h->f->sem[0], .value = h->f->sem_value[0],
+    };
+    return true;
+}
+
+static void vk_give(struct vk_held *h, bool ok)
+{
+    if (ok) {
+        h->f->layout[0] = h->d.layout;
+        h->f->access[0] = h->d.access;
+        h->f->queue_family[0] = h->d.queue_family;
+        h->f->sem_value[0] = h->d.value;
+    }
+    AVVulkanFramesContext *hc = h->fc->hwctx;
+    if (hc->unlock_frame)
+        hc->unlock_frame(h->fc, h->f);
+}
+
+// One frame through aji_create_vk's context.
 static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
                          struct mp_image *out, int mat, int rng, int sit)
 {
     struct priv *p = vf->priv;
-    AVVkFrame *vi = (AVVkFrame *)in->planes[0], *vo = (AVVkFrame *)out->planes[0];
-    AVHWFramesContext *fci = in->hwctx ? (void *)in->hwctx->data : NULL;
-    AVHWFramesContext *fco = out->hwctx ? (void *)out->hwctx->data : NULL;
-    if (!vi || !vo || !fci || !fco) {
-        MP_ERR(vf, "Vulkan frame without its frames context\n");
+    struct vk_held hi, ho;
+    if (!vk_take(vf, in, &hi))
+        return false;
+    if (!vk_take(vf, out, &ho)) {
+        vk_give(&hi, false);
         return false;
     }
-    if (vi->img[1] || vo->img[1]) {
-        MP_ERR(vf, "Vulkan frames with one image per plane are not supported\n");
-        return false;
-    }
-    AVVulkanFramesContext *hi = fci->hwctx, *ho = fco->hwctx;
-    if (hi->lock_frame)
-        hi->lock_frame(fci, vi);
-    if (ho->lock_frame)
-        ho->lock_frame(fco, vo);
-    aji_vk_image ii = {
-        .image = vi->img[0], .layout = vi->layout[0], .queue_family = vi->queue_family[0],
-        .access = vi->access[0], .semaphore = vi->sem[0], .value = vi->sem_value[0],
-    };
-    aji_vk_image oi = {
-        .image = vo->img[0], .layout = vo->layout[0], .queue_family = vo->queue_family[0],
-        .access = vo->access[0], .semaphore = vo->sem[0], .value = vo->sem_value[0],
-    };
     const aji_frame fin = {
         .width = in->w, .height = in->h, .format = p->aji_fmt,
         .matrix = mat, .range = rng, .siting = sit,
-        .plane = {&ii},
+        .plane = {&hi.d},
     };
     const aji_frame fout = {
         .width = p->out_params.w, .height = p->out_params.h, .format = p->out_fmt,
         .matrix = mat, .range = rng, .siting = sit,
-        .plane = {&oi},
+        .plane = {&ho.d},
     };
     const bool ok = p->api.infer(p->aji, &fin, &fout, NULL) == AJI_OK;
-    if (ok) {
-        vi->layout[0] = ii.layout;
-        vi->access[0] = ii.access;
-        vi->queue_family[0] = ii.queue_family;
-        vi->sem_value[0] = ii.value;
-        vo->layout[0] = oi.layout;
-        vo->access[0] = oi.access;
-        vo->queue_family[0] = oi.queue_family;
-        vo->sem_value[0] = oi.value;
-    }
-    if (ho->unlock_frame)
-        ho->unlock_frame(fco, vo);
-    if (hi->unlock_frame)
-        hi->unlock_frame(fci, vi);
+    vk_give(&ho, ok);
+    vk_give(&hi, ok);
     return ok;
+}
+
+// RIFE between a and b into out (w x h, format fmt), synchronous like the
+// other backends': AJI_OK, AJI_SCENE or an error.
+static int rife_vulkan(struct mp_filter *vf, struct mp_image *a, struct mp_image *b,
+                       struct mp_image *out, double t, int w, int h, int fmt,
+                       int mat, int rng, int sit)
+{
+    struct priv *p = vf->priv;
+    struct vk_held held[3];
+    struct mp_image *imgs[3] = {a, b, out};
+    int n = 0;
+    for (; n < 3; n++)
+        if (!vk_take(vf, imgs[n], &held[n]))
+            break;
+    int ret = AJI_ERR;
+    if (n == 3) {
+        aji_frame f[3];
+        for (int i = 0; i < 3; i++)
+            f[i] = (aji_frame){
+                .width = w, .height = h, .format = fmt,
+                .matrix = mat, .range = rng, .siting = sit,
+                .plane = {&held[i].d},
+            };
+        ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
+            ? p->api.infer_rife_with_scene(p->aji, &f[0], &f[1], t, &f[2], NULL, p->scene_decision)
+            : p->api.infer_rife(p->aji, &f[0], &f[1], t, &f[2], NULL);
+    }
+    // libaji updates an image's state only for a submit it made (the scene
+    // check reads a and b, then may return before touching out): always take it
+    while (n-- > 0)
+        vk_give(&held[n], true);
+    return ret;
 }
 
 // FFmpeg's queue lock, deprecated for VK_KHR_internally_synchronized_queues
@@ -1963,7 +2020,14 @@ static struct mp_image *render_interp(struct mp_filter *vf,
         talloc_free(out);
         return NULL;
     }
-    int ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
+    int ret;
+#if HAVE_VULKAN
+    if (p->is_vk)
+        ret = rife_vulkan(vf, a, b, out, t, p->out_params.w, p->out_params.h, p->out_fmt, mat, rng,
+                          AJI_SITING_LEFT);
+    else
+#endif
+    ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
         ? p->api.infer_rife_with_scene(p->aji, &fa, &fb, t, &fout, p->stream, p->scene_decision)
         : p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
@@ -1975,7 +2039,7 @@ static struct mp_image *render_interp(struct mp_filter *vf,
         talloc_free(out);
         return NULL;
     }
-    bool ok = p->is_d3d11;  // the DirectML shim completes synchronously
+    bool ok = p->is_d3d11 || p->is_vk;  // DirectML and Vulkan frames complete synchronously
     if (!ok && CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0) {
         ok = CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
         CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
@@ -2001,7 +2065,8 @@ static struct mp_image *alloc_src(struct mp_filter *vf)
 #endif
     } else {
         pool_ok = mp_update_av_hw_frames_pool(&p->src_pool, p->av_device_ref,
-                                              IMGFMT_CUDA, p->params.hw_subfmt,
+                                              p->is_vk ? IMGFMT_VULKAN : IMGFMT_CUDA,
+                                              p->params.hw_subfmt,
                                               p->params.w, p->params.h, false);
     }
     if (!pool_ok) {
@@ -2040,7 +2105,8 @@ static struct mp_image *alloc_work(struct mp_filter *vf)
 #endif
     } else {
         pool_ok = mp_update_av_hw_frames_pool(&p->work_pool, p->av_device_ref,
-                                              IMGFMT_CUDA, p->params.hw_subfmt,
+                                              p->is_vk ? IMGFMT_VULKAN : IMGFMT_CUDA,
+                                              p->params.hw_subfmt,
                                               p->work_w, p->work_h, false);
     }
     if (!pool_ok) {
@@ -2193,7 +2259,13 @@ static struct mp_image *interp_source(struct mp_filter *vf,
         fout.stride[i] = out->stride[i];
     }
 
-    int ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
+    int ret;
+#if HAVE_VULKAN
+    if (p->is_vk)
+        ret = rife_vulkan(vf, a, b, out, t, p->work_w, p->work_h, p->aji_fmt, mat, rng, sit);
+    else
+#endif
+    ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
         ? p->api.infer_rife_with_scene(p->aji, &fa, &fb, t, &fout, p->stream, p->scene_decision)
         : p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
@@ -2205,7 +2277,7 @@ static struct mp_image *interp_source(struct mp_filter *vf,
         talloc_free(out);
         return NULL;
     }
-    bool ok = p->is_d3d11;   // the DirectML shim completes synchronously
+    bool ok = p->is_d3d11 || p->is_vk;   // DirectML and Vulkan frames complete synchronously
     if (!ok && CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0) {
         ok = CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
         CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
