@@ -1501,9 +1501,9 @@ static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
 {
     struct priv *p = vf->priv;
     AVVkFrame *vi = (AVVkFrame *)in->planes[0], *vo = (AVVkFrame *)out->planes[0];
-    AVHWFramesContext *fi = in->hwctx ? (void *)in->hwctx->data : NULL;
-    AVHWFramesContext *fo = out->hwctx ? (void *)out->hwctx->data : NULL;
-    if (!vi || !vo || !fi || !fo) {
+    AVHWFramesContext *fci = in->hwctx ? (void *)in->hwctx->data : NULL;
+    AVHWFramesContext *fco = out->hwctx ? (void *)out->hwctx->data : NULL;
+    if (!vi || !vo || !fci || !fco) {
         MP_ERR(vf, "Vulkan frame without its frames context\n");
         return false;
     }
@@ -1511,11 +1511,11 @@ static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
         MP_ERR(vf, "Vulkan frames with one image per plane are not supported\n");
         return false;
     }
-    AVVulkanFramesContext *hi = fi->hwctx, *ho = fo->hwctx;
+    AVVulkanFramesContext *hi = fci->hwctx, *ho = fco->hwctx;
     if (hi->lock_frame)
-        hi->lock_frame(fi, vi);
+        hi->lock_frame(fci, vi);
     if (ho->lock_frame)
-        ho->lock_frame(fo, vo);
+        ho->lock_frame(fco, vo);
     aji_vk_image ii = {
         .image = vi->img[0], .layout = vi->layout[0], .queue_family = vi->queue_family[0],
         .access = vi->access[0], .semaphore = vi->sem[0], .value = vi->sem_value[0],
@@ -1546,12 +1546,20 @@ static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
         vo->sem_value[0] = oi.value;
     }
     if (ho->unlock_frame)
-        ho->unlock_frame(fo, vo);
+        ho->unlock_frame(fco, vo);
     if (hi->unlock_frame)
-        hi->unlock_frame(fi, vi);
+        hi->unlock_frame(fci, vi);
     return ok;
 }
 
+// FFmpeg's queue lock, deprecated for VK_KHR_internally_synchronized_queues
+// but still what serializes submits on devices without it. Gone with the API
+// (the queues then synchronize themselves): nothing to hold.
+#if !defined(FF_API_VULKAN_SYNC_QUEUES) || FF_API_VULKAN_SYNC_QUEUES
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 static void vk_lock_queue(void *opaque, uint32_t family, uint32_t index)
 {
     AVHWDeviceContext *dc = opaque;
@@ -1567,6 +1575,20 @@ static void vk_unlock_queue(void *opaque, uint32_t family, uint32_t index)
     if (vk->unlock_queue)
         vk->unlock_queue(dc, family, index);
 }
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
+#else
+static void vk_lock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    (void)opaque, (void)family, (void)index;
+}
+
+static void vk_unlock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    (void)opaque, (void)family, (void)index;
+}
+#endif
 
 // The decoder's Vulkan device as libaji takes it: a compute queue of its
 // families (FFmpeg's list) and its lock, what it was created with.
