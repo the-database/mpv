@@ -1,8 +1,11 @@
 /*
  * vf_animejanai: GPU-resident AI upscaling filter (CUDA / D3D11)
  *
- * The filter keeps frames in GPU memory end to end: IMGFMT_CUDA or
- * IMGFMT_D3D11 in, own AVHWFramesContext output pool, same format out.
+ * The filter keeps frames in GPU memory end to end: IMGFMT_CUDA,
+ * IMGFMT_D3D11 or IMGFMT_VULKAN in, own AVHWFramesContext output pool, same
+ * format out. Vulkan frames (hwdec=vulkan) go to libaji's aji_create_vk on
+ * the decoder's own device: plain upscale chains only for now (no RIFE,
+ * temporal models or held-frame reuse on that path yet).
  * Inference runs in the libaji shim, loaded at runtime across a strict
  * C ABI (see aji.h) so no inference toolchain links into mpv; the shim
  * dispatches on the conf's backend key (TensorRT on CUDA frames,
@@ -68,6 +71,10 @@
 
 #if HAVE_D3D11
 #include <libavutil/hwcontext_d3d11va.h>
+#endif
+
+#if HAVE_VULKAN
+#include <libavutil/hwcontext_vulkan.h>
 #endif
 
 #include "common/common.h"
@@ -176,6 +183,8 @@ struct opts {
 struct aji_api {
     void *handle;
     aji_ctx *(*create)(const aji_create_params *params);
+    // optional: Vulkan frames on the caller's device (NULL on older shims)
+    aji_ctx *(*create_vk)(const aji_create_params *params, const aji_vk_device *device);
     int (*set_slot)(aji_ctx *c, int slot);
     int (*configure)(aji_ctx *c, int w, int h, double fps, int *out_w,
                      int *out_h);
@@ -189,6 +198,8 @@ struct aji_api {
     int (*pre_resize)(aji_ctx *c, int *work_w, int *work_h);  // optional
     int (*resize)(aji_ctx *c, const aji_frame *in, const aji_frame *out,
                   void *cu_stream);          // optional; pre-RIFE downscale
+    // optional: Vulkan frames' exact copy (held-frame anchors, RIFE alone)
+    int (*copy_frame)(aji_ctx *c, const aji_frame *in, const aji_frame *out);
     int (*infer_rife)(aji_ctx *c, const aji_frame *a, const aji_frame *b,
                       double t, const aji_frame *out, void *cu_stream);
     int (*rife_scene_supported)(aji_ctx *c);
@@ -244,6 +255,10 @@ struct priv {
     bool     decode_evt_ok;
 
     bool is_d3d11;
+    bool is_vk;                      // Vulkan frames on the decoder's device (aji_create_vk)
+#if HAVE_VULKAN
+    aji_vk_device vkdev;             // its handles; av_device_ref keeps them alive
+#endif
 #if HAVE_D3D11
     ID3D11Device *d3d_dev;          // borrowed; av_device_ref keeps it alive
     ID3D11DeviceContext *d3d_ctx;
@@ -298,6 +313,7 @@ struct priv {
     bool held_on;                  // reusing frames in the current chain
     const char *held_why;          // with a chain active and reuse off: why
     struct mp_image *anchor_out;   // the anchor's upscaled output
+    aji_vk_image anchor_vk;        // Vulkan: the anchor's image, as the engine holds it
     struct mp_image *anchor_src;   // the anchor's source copy: CUDA a frame
                                    // of src_pool, D3D11 its staged copy
     uint64_t anchor_ticket;        // the anchor's inference ticket
@@ -383,7 +399,7 @@ static int check_cu(struct mp_filter *vf, CUresult err, const char *func)
 static bool order_after_decode(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
-    if (p->is_d3d11 || p->stream == p->decode_stream || !p->decode_evt_ok)
+    if (p->is_d3d11 || p->is_vk || p->stream == p->decode_stream || !p->decode_evt_ok)
         return true;                       // already ordered / nothing to do
     CUcontext dummy;
     if (CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0)
@@ -501,6 +517,53 @@ static void held_fail(struct mp_filter *vf, const char *what)
     p->held_why = "failed during playback";
 }
 
+#if HAVE_VULKAN
+// An AVVkFrame handed to libaji as an aji_vk_image (one multi-planar image),
+// locked from vk_take to vk_give; vk_give writes back the semaphore value,
+// layout, access and queue family libaji leaves (AVVkFrame's rule) when ok.
+struct vk_held {
+    AVVkFrame *f;
+    AVHWFramesContext *fc;
+    aji_vk_image d;
+};
+
+static bool vk_take(struct mp_filter *vf, struct mp_image *img, struct vk_held *h)
+{
+    h->f = (AVVkFrame *)img->planes[0];
+    h->fc = img->hwctx ? (void *)img->hwctx->data : NULL;
+    if (!h->f || !h->fc) {
+        MP_ERR(vf, "Vulkan frame without its frames context\n");
+        return false;
+    }
+    if (h->f->img[1]) {
+        MP_ERR(vf, "Vulkan frames with one image per plane are not supported\n");
+        return false;
+    }
+    AVVulkanFramesContext *hc = h->fc->hwctx;
+    if (hc->lock_frame)
+        hc->lock_frame(h->fc, h->f);
+    h->d = (aji_vk_image){
+        .image = h->f->img[0], .layout = h->f->layout[0], .queue_family = h->f->queue_family[0],
+        .access = h->f->access[0], .semaphore = h->f->sem[0], .value = h->f->sem_value[0],
+    };
+    return true;
+}
+
+static void vk_give(struct vk_held *h, bool ok)
+{
+    if (ok) {
+        h->f->layout[0] = h->d.layout;
+        h->f->access[0] = h->d.access;
+        h->f->queue_family[0] = h->d.queue_family;
+        h->f->sem_value[0] = h->d.value;
+    }
+    AVVulkanFramesContext *hc = h->fc->hwctx;
+    if (hc->unlock_frame)
+        hc->unlock_frame(h->fc, h->f);
+}
+
+#endif
+
 static void held_desc(struct priv *p, aji_held_frame *d, struct mp_image *img,
                       uint64_t id, bool damaged)
 {
@@ -581,6 +644,44 @@ static bool held_decide(struct mp_filter *vf, struct mp_image *in, int rel,
     const int nf = f[1] && f[2] ? 3 : 1;  // no look-ahead: forced upscale
     aji_held_frame d[3];
     void *stream = NULL;
+    aji_held_decision dec = {0};
+    int dret = AJI_ERR;
+    bool decided = false;
+#if HAVE_VULKAN
+    if (p->is_vk) {
+        // the frames (and the anchor's copy, which the engine compares them with) locked
+        // for the call, their image state as libaji leaves it written back after
+        struct vk_held h[3], ha;
+        int n = 0;
+        while (n < nf && vk_take(vf, f[n], &h[n]))
+            n++;
+        const bool have_anchor = n == nf && p->anchor_src && vk_take(vf, p->anchor_src, &ha);
+        if (n == nf && (have_anchor || !p->anchor_src)) {
+            if (have_anchor)
+                p->anchor_vk = ha.d;
+            for (int i = 0; i < nf; i++) {
+                held_desc(p, &d[i], f[i], p->seq0 + rel + i, f[i]->corrupt);
+                d[i].frame.plane[0] = &h[i].d;
+                d[i].frame.plane[1] = d[i].frame.plane[2] = NULL;
+                for (int k = 0; k < 3; k++)
+                    d[i].frame.stride[k] = 0;
+            }
+            dret = p->api.held_decide(p->held, &d[0], nf == 3 ? &d[1] : NULL,
+                                      nf == 3 ? &d[2] : NULL, NULL, &dec);
+            decided = true;
+        }
+        if (have_anchor) {
+            ha.d = p->anchor_vk;
+            vk_give(&ha, true);
+        }
+        while (n-- > 0)
+            vk_give(&h[n], true);
+        if (!decided) {
+            held_fail(vf, "locking a frame");
+            return false;
+        }
+    } else
+#endif
 #if HAVE_D3D11
     if (p->is_d3d11) {
         struct mp_image *s[3] = {0};
@@ -616,10 +717,10 @@ static bool held_decide(struct mp_filter *vf, struct mp_image *in, int rel,
         stream = p->diff_stream;
     }
 
-    aji_held_decision dec = {0};
-    if (p->api.held_decide(p->held, &d[0], nf == 3 ? &d[1] : NULL,
-                           nf == 3 ? &d[2] : NULL, stream, &dec) != AJI_OK ||
-        dec.error)
+    if (!decided)
+        dret = p->api.held_decide(p->held, &d[0], nf == 3 ? &d[1] : NULL,
+                                  nf == 3 ? &d[2] : NULL, stream, &dec);
+    if (dret != AJI_OK || dec.error)
     {
         MP_WARN(vf, "Held-frame comparison failed: %s\n",
                 p->api.last_error(p->aji));
@@ -648,7 +749,35 @@ static void held_set_anchor(struct mp_filter *vf, struct mp_image *in,
     mp_image_unrefp(&p->anchor_out);
     if (in->corrupt)
         return;  // never an anchor
-    if (p->is_d3d11) {
+    if (p->is_vk) {
+#if HAVE_VULKAN
+        // an exact copy in src_pool (the decoder's frame goes back to its pool)
+        if (!p->anchor_src && !(p->anchor_src = alloc_src(vf))) {
+            held_fail(vf, "anchor copy");
+            return;
+        }
+        struct vk_held hi, ha;
+        bool ok = false;
+        if (vk_take(vf, in, &hi)) {
+            if (vk_take(vf, p->anchor_src, &ha)) {
+                const aji_frame fi = {
+                    .width = p->params.w, .height = p->params.h, .format = p->aji_fmt,
+                    .plane = {&hi.d},
+                };
+                aji_frame fa = fi;
+                fa.plane[0] = &ha.d;
+                ok = p->api.copy_frame(p->aji, &fi, &fa) == AJI_OK;
+                p->anchor_vk = ha.d;
+                vk_give(&ha, true);
+            }
+            vk_give(&hi, true);
+        }
+        if (!ok) {
+            held_fail(vf, "anchor copy");
+            return;
+        }
+#endif
+    } else if (p->is_d3d11) {
         mp_image_unrefp(&p->anchor_src);
         p->anchor_src = mp_image_new_ref(stage);
         MP_HANDLE_OOM(p->anchor_src);
@@ -689,6 +818,13 @@ static void held_set_anchor(struct mp_filter *vf, struct mp_image *in,
     }
     aji_held_frame a;
     held_desc(p, &a, p->anchor_src, p->seq0 + rel, false);
+    if (p->is_vk) {
+        // the engine keeps this frame: plane[0] is the struct held_decide refreshes
+        a.frame.plane[0] = &p->anchor_vk;
+        a.frame.plane[1] = a.frame.plane[2] = NULL;
+        for (int k = 0; k < 3; k++)
+            a.frame.stride[k] = 0;
+    }
     if (p->api.held_set_anchor(p->held, &a) != AJI_OK) {
         held_fail(vf, "setting the anchor");
         return;
@@ -853,6 +989,7 @@ static void release_device_state(struct mp_filter *vf)
     p->decode_evt_next = 0;
     p->decode_evt_ok = false;
     p->is_d3d11 = false;
+    p->is_vk = false;
     p->aji_active = false;
     p->configured = false;
     p->rife_on = false;
@@ -977,6 +1114,8 @@ static void held_setup(struct mp_filter *vf)
         why = "RIFE chain";
     else if (p->temporal_r)
         why = "temporal chain";
+    else if (p->is_vk && !p->api.copy_frame)
+        why = "Vulkan frames need a libaji with aji_copy_frame";
     if (!why && !p->held) {
         const aji_held_params hp = {
             .struct_size = sizeof(hp),
@@ -994,7 +1133,7 @@ static void held_setup(struct mp_filter *vf)
                 MP_WARN(vf, "Cannot write held-frame trace %s\n", trace);
         }
     }
-    if (!why && !p->is_d3d11 && !p->diff_stream) {
+    if (!why && !p->is_d3d11 && !p->is_vk && !p->diff_stream) {
         CUcontext dummy;
         bool ok = CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0;
         if (ok) {
@@ -1052,7 +1191,7 @@ static void stream_status(struct mp_filter *vf, const char *state)
     if (!p->opts->stream_mode)
         return;
     MP_INFO(vf, "AJN_STREAM_V1 %s %s %d %d %d %d %d %d %.6f\n", state,
-            p->is_d3d11 ? "DirectML" : "TensorRT", p->cur_slot,
+            p->is_vk ? "Vulkan" : p->is_d3d11 ? "DirectML" : "TensorRT", p->cur_slot,
             p->params.w, p->params.h, p->out_params.w, p->out_params.h,
             p->rife_on ? 1 : 0, p->fps * (p->rife_on ? (double)p->rife_num / p->rife_den : 1));
 }
@@ -1066,6 +1205,11 @@ static void configure_scene(struct mp_filter *vf, bool rife_active)
     if (p->scene && !p->scene_builtin) return;
     bool enabled = p->aji && rife_active && p->api.rife_enhanced_scene &&
                    p->api.rife_enhanced_scene(p->aji);
+    if (enabled && p->is_vk) {
+        // its detector reads CUDA / D3D11 frames; libaji's own detection runs
+        MP_WARN(vf, "Experimental RIFE scene detection is not on Vulkan frames; using the built-in one\n");
+        enabled = false;
+    }
     if (!enabled) {
         if (p->scene_builtin) {
             ajn_scene_destroy(p->scene); p->scene = NULL;
@@ -1177,6 +1321,11 @@ static bool configure_aji(struct mp_filter *vf)
         }
     }
     p->rife_acc = p->rife_den;
+    if (p->rife_on && p->is_vk && ret == 0 && !p->api.copy_frame) {
+        // RIFE alone interpolates copies of the decoder frames: aji_copy_frame on Vulkan frames
+        MP_WARN(vf, "RIFE without an upscale model needs a libaji with aji_copy_frame on Vulkan frames; interpolation disabled\n");
+        p->rife_on = false;
+    }
 
     configure_scene(vf, p->rife_on);
 
@@ -1196,7 +1345,7 @@ static bool configure_aji(struct mp_filter *vf)
     p->aji_active = true;
     p->out_fmt = p->aji_fmt;
     if ((p->opts->output_444 || aji_format_is_444(p->aji_fmt)) &&
-        !p->is_d3d11) {
+        !p->is_d3d11 && !p->is_vk) {
         // Preserve 4:4:4 sources in full 16-bit output, including MSB input.
         // The option forces full-resolution 4:4:4 even from a 4:2:0 source
         // (exceeds the reference pipeline, which always subsampled back to
@@ -1385,6 +1534,12 @@ static struct mp_image *alloc_out(struct mp_filter *vf)
 #else
         pool_ok = false;
 #endif
+    } else if (p->is_vk) {
+        pool_ok = mp_update_av_hw_frames_pool(&p->hw_pool, p->av_device_ref,
+                                              IMGFMT_VULKAN,
+                                              p->out_params.hw_subfmt,
+                                              p->out_params.w,
+                                              p->out_params.h, false);
     } else {
         pool_ok = mp_update_av_hw_frames_pool(&p->hw_pool, p->av_device_ref,
                                               IMGFMT_CUDA,
@@ -1463,12 +1618,202 @@ static bool ingest_window(struct mp_filter *vf, int rel)
             staged++;
         }
 #endif
+#if HAVE_VULKAN
+        if (p->is_vk) {
+            // the decoder's AVVkFrame, read in libaji's submit (its semaphore orders it)
+            struct vk_held h;
+            if (!vk_take(vf, f, &h))
+                return false;
+            fin.plane[0] = &h.d;
+            fin.plane[1] = NULL;
+            const int ret = p->api.ingest(p->aji, &fin, seq, NULL);
+            vk_give(&h, true);
+            if (ret != AJI_OK)
+                return false;
+            p->seq_next = seq + 1;
+            continue;
+        }
+#endif
         if (p->api.ingest(p->aji, &fin, seq, stream) != AJI_OK)
             return false;
         p->seq_next = seq + 1;
     }
     return true;
 }
+
+#if HAVE_VULKAN
+// One frame through aji_create_vk's context.
+static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
+                         struct mp_image *out, int mat, int rng, int sit)
+{
+    struct priv *p = vf->priv;
+    struct vk_held hi, ho;
+    if (!vk_take(vf, in, &hi))
+        return false;
+    if (!vk_take(vf, out, &ho)) {
+        vk_give(&hi, false);
+        return false;
+    }
+    const aji_frame fin = {
+        .width = in->w, .height = in->h, .format = p->aji_fmt,
+        .matrix = mat, .range = rng, .siting = sit,
+        .plane = {&hi.d},
+    };
+    const aji_frame fout = {
+        .width = p->out_params.w, .height = p->out_params.h, .format = p->out_fmt,
+        .matrix = mat, .range = rng, .siting = sit,
+        .plane = {&ho.d},
+    };
+    const bool ok = p->api.infer(p->aji, &fin, &fout, NULL) == AJI_OK;
+    vk_give(&ho, ok);
+    vk_give(&hi, ok);
+    return ok;
+}
+
+// A temporal chain's frame `seq` (ingested) into out.
+static bool infer_seq_vulkan(struct mp_filter *vf, uint64_t seq, struct mp_image *out,
+                             int mat, int rng, int sit)
+{
+    struct priv *p = vf->priv;
+    struct vk_held ho;
+    if (!vk_take(vf, out, &ho))
+        return false;
+    const aji_frame fout = {
+        .width = p->out_params.w, .height = p->out_params.h, .format = p->out_fmt,
+        .matrix = mat, .range = rng, .siting = sit,
+        .plane = {&ho.d},
+    };
+    const bool ok = p->api.infer_seq(p->aji, seq, &fout, NULL) == AJI_OK;
+    vk_give(&ho, true);
+    return ok;
+}
+
+// RIFE between a and b into out (w x h, format fmt), synchronous like the
+// other backends': AJI_OK, AJI_SCENE or an error.
+static int rife_vulkan(struct mp_filter *vf, struct mp_image *a, struct mp_image *b,
+                       struct mp_image *out, double t, int w, int h, int fmt,
+                       int mat, int rng, int sit)
+{
+    struct priv *p = vf->priv;
+    struct vk_held held[3];
+    struct mp_image *imgs[3] = {a, b, out};
+    int n = 0;
+    for (; n < 3; n++)
+        if (!vk_take(vf, imgs[n], &held[n]))
+            break;
+    int ret = AJI_ERR;
+    if (n == 3) {
+        aji_frame f[3];
+        for (int i = 0; i < 3; i++)
+            f[i] = (aji_frame){
+                .width = w, .height = h, .format = fmt,
+                .matrix = mat, .range = rng, .siting = sit,
+                .plane = {&held[i].d},
+            };
+        ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
+            ? p->api.infer_rife_with_scene(p->aji, &f[0], &f[1], t, &f[2], NULL, p->scene_decision)
+            : p->api.infer_rife(p->aji, &f[0], &f[1], t, &f[2], NULL);
+    }
+    // libaji updates an image's state only for a submit it made (the scene
+    // check reads a and b, then may return before touching out): always take it
+    while (n-- > 0)
+        vk_give(&held[n], true);
+    return ret;
+}
+
+// FFmpeg's queue lock, deprecated for VK_KHR_internally_synchronized_queues
+// but still what serializes submits on devices without it. Gone with the API
+// (the queues then synchronize themselves): nothing to hold.
+#if !defined(FF_API_VULKAN_SYNC_QUEUES) || FF_API_VULKAN_SYNC_QUEUES
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+static void vk_lock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    AVHWDeviceContext *dc = opaque;
+    AVVulkanDeviceContext *vk = dc->hwctx;
+    if (vk->lock_queue)
+        vk->lock_queue(dc, family, index);
+}
+
+static void vk_unlock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    AVHWDeviceContext *dc = opaque;
+    AVVulkanDeviceContext *vk = dc->hwctx;
+    if (vk->unlock_queue)
+        vk->unlock_queue(dc, family, index);
+}
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
+#else
+static void vk_lock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    (void)opaque, (void)family, (void)index;
+}
+
+static void vk_unlock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    (void)opaque, (void)family, (void)index;
+}
+#endif
+
+// The decoder's Vulkan device as libaji takes it: a compute queue of its
+// families (FFmpeg's list) and its lock, what it was created with.
+static bool adopt_vulkan(struct mp_filter *vf, AVHWDeviceContext *dc)
+{
+    struct priv *p = vf->priv;
+    AVVulkanDeviceContext *vk = dc->hwctx;
+    int fam = -1;
+    for (int i = 0; i < vk->nb_qf && fam < 0; i++)
+        if (vk->qf[i].flags & VK_QUEUE_COMPUTE_BIT)
+            fam = vk->qf[i].idx;
+    if (fam < 0) {
+        MP_ERR(vf, "The Vulkan device has no compute queue\n");
+        return false;
+    }
+    PFN_vkGetDeviceQueue2 get_queue2 =
+        (PFN_vkGetDeviceQueue2)vk->get_proc_addr(vk->inst, "vkGetDeviceQueue2");
+    VkQueue queue = VK_NULL_HANDLE;
+    VkDeviceQueueInfo2 qi = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
+        .queueFamilyIndex = fam,
+        .queueIndex = 0,
+    };
+#if defined(VK_KHR_internally_synchronized_queues) && LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 32, 100)
+    // libplacebo creates its queues internally synchronized when lavu takes the
+    // flag (video/out/vulkan/context.c): those come back only with it
+    qi.flags = VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR;
+    if (get_queue2)
+        get_queue2(vk->act_dev, &qi, &queue);
+    qi.flags = 0;
+#endif
+    if (!queue && get_queue2)
+        get_queue2(vk->act_dev, &qi, &queue);
+    if (!queue) {
+        MP_ERR(vf, "Cannot get the Vulkan device's compute queue\n");
+        return false;
+    }
+    p->vkdev = (aji_vk_device){
+        .struct_size = sizeof(aji_vk_device),
+        .get_instance_proc_addr = (void *)vk->get_proc_addr,
+        .instance = vk->inst,
+        .physical_device = vk->phys_dev,
+        .device = vk->act_dev,
+        .queue = queue,
+        .queue_family = fam,
+        .queue_index = 0,
+        .lock_queue = vk_lock_queue,
+        .unlock_queue = vk_unlock_queue,
+        .lock_opaque = dc,
+        .enabled_extensions = vk->enabled_dev_extensions,
+        .num_enabled_extensions = vk->nb_enabled_dev_extensions,
+        .enabled_features = &vk->device_features,
+    };
+    return true;
+}
+#endif
 
 // Enqueue inference for `in` and append it to the in-flight ring without
 // waiting for the GPU. `in` stays alive (and the decoder surface pinned)
@@ -1517,6 +1862,14 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
     bool ok;
     void *stream = NULL;
 
+#if HAVE_VULKAN
+    if (p->is_vk) {
+        if (p->temporal_r && rel >= 0)
+            ok = ingest_window(vf, rel) && infer_seq_vulkan(vf, p->seq0 + rel, out, mat, rng, sit);
+        else
+            ok = infer_vulkan(vf, in, out, mat, rng, sit);
+    } else
+#endif
 #if HAVE_D3D11
     if (p->is_d3d11) {
         // Input geometry comes from the frame: the decoder size on the normal
@@ -1683,6 +2036,32 @@ static struct mp_image *render(struct mp_filter *vf)
     out->params = p->out_params;
     out->pts = in->pts;
 
+#if HAVE_VULKAN
+    if (p->is_vk) {
+        // Passthrough: an exact copy into the output pool's frame
+        struct vk_held hi, ho;
+        bool ok = false;
+        if (vk_take(vf, in, &hi)) {
+            if (vk_take(vf, out, &ho)) {
+                const aji_frame fsrc = {
+                    .width = in->w, .height = in->h, .format = p->aji_fmt,
+                    .plane = {&hi.d},
+                };
+                aji_frame fdst = fsrc;
+                fdst.plane[0] = &ho.d;
+                ok = p->api.copy_frame(p->aji, &fsrc, &fdst) == AJI_OK;
+                vk_give(&ho, true);
+            }
+            vk_give(&hi, true);
+        }
+        if (!ok) {
+            MP_ERR(vf, "frame copy failed: %s\n", p->api.last_error(p->aji));
+            talloc_free(out);
+            return NULL;
+        }
+        return out;
+    }
+#endif
 #if HAVE_D3D11
     if (p->is_d3d11) {
         // Passthrough: same-device copy into the output slice (implicitly
@@ -1782,7 +2161,14 @@ static struct mp_image *render_interp(struct mp_filter *vf,
         talloc_free(out);
         return NULL;
     }
-    int ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
+    int ret;
+#if HAVE_VULKAN
+    if (p->is_vk)
+        ret = rife_vulkan(vf, a, b, out, t, p->out_params.w, p->out_params.h, p->out_fmt, mat, rng,
+                          AJI_SITING_LEFT);
+    else
+#endif
+    ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
         ? p->api.infer_rife_with_scene(p->aji, &fa, &fb, t, &fout, p->stream, p->scene_decision)
         : p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
@@ -1794,7 +2180,7 @@ static struct mp_image *render_interp(struct mp_filter *vf,
         talloc_free(out);
         return NULL;
     }
-    bool ok = p->is_d3d11;  // the DirectML shim completes synchronously
+    bool ok = p->is_d3d11 || p->is_vk;  // DirectML and Vulkan frames complete synchronously
     if (!ok && CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0) {
         ok = CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
         CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
@@ -1820,7 +2206,8 @@ static struct mp_image *alloc_src(struct mp_filter *vf)
 #endif
     } else {
         pool_ok = mp_update_av_hw_frames_pool(&p->src_pool, p->av_device_ref,
-                                              IMGFMT_CUDA, p->params.hw_subfmt,
+                                              p->is_vk ? IMGFMT_VULKAN : IMGFMT_CUDA,
+                                              p->params.hw_subfmt,
                                               p->params.w, p->params.h, false);
     }
     if (!pool_ok) {
@@ -1859,7 +2246,8 @@ static struct mp_image *alloc_work(struct mp_filter *vf)
 #endif
     } else {
         pool_ok = mp_update_av_hw_frames_pool(&p->work_pool, p->av_device_ref,
-                                              IMGFMT_CUDA, p->params.hw_subfmt,
+                                              p->is_vk ? IMGFMT_VULKAN : IMGFMT_CUDA,
+                                              p->params.hw_subfmt,
                                               p->work_w, p->work_h, false);
     }
     if (!pool_ok) {
@@ -1947,6 +2335,29 @@ static struct mp_image *downscale_src(struct mp_filter *vf,
         ret = p->api.resize(p->aji, &fin, &fout, NULL);
     } else
 #endif
+#if HAVE_VULKAN
+    if (p->is_vk) {
+        struct vk_held hs, hw;
+        ret = AJI_ERR;
+        if (vk_take(vf, src, &hs)) {
+            if (vk_take(vf, work, &hw)) {
+                const aji_frame fin = {
+                    .width = p->params.w, .height = p->params.h, .format = p->aji_fmt,
+                    .matrix = mat, .range = rng, .siting = sit,
+                    .plane = {&hs.d},
+                };
+                const aji_frame fout = {
+                    .width = p->work_w, .height = p->work_h, .format = p->aji_fmt,
+                    .matrix = mat, .range = rng, .siting = sit,
+                    .plane = {&hw.d},
+                };
+                ret = p->api.resize(p->aji, &fin, &fout, NULL);
+                vk_give(&hw, true);
+            }
+            vk_give(&hs, true);
+        }
+    } else
+#endif
     {
         if (!order_after_decode(vf)) {
             talloc_free(work);
@@ -2012,7 +2423,13 @@ static struct mp_image *interp_source(struct mp_filter *vf,
         fout.stride[i] = out->stride[i];
     }
 
-    int ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
+    int ret;
+#if HAVE_VULKAN
+    if (p->is_vk)
+        ret = rife_vulkan(vf, a, b, out, t, p->work_w, p->work_h, p->aji_fmt, mat, rng, sit);
+    else
+#endif
+    ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
         ? p->api.infer_rife_with_scene(p->aji, &fa, &fb, t, &fout, p->stream, p->scene_decision)
         : p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
@@ -2024,7 +2441,7 @@ static struct mp_image *interp_source(struct mp_filter *vf,
         talloc_free(out);
         return NULL;
     }
-    bool ok = p->is_d3d11;   // the DirectML shim completes synchronously
+    bool ok = p->is_d3d11 || p->is_vk;   // DirectML and Vulkan frames complete synchronously
     if (!ok && CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0) {
         ok = CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
         CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
@@ -2132,8 +2549,19 @@ static void vf_animejanai_process(struct mp_filter *vf)
             p->d3d_ctx = d3dctx->device_context;
             p->stream = NULL;
 #endif
+#if HAVE_VULKAN
+        } else if (avhwctx->type == AV_HWDEVICE_TYPE_VULKAN) {
+            if (!adopt_vulkan(vf, avhwctx)) {
+                mp_filter_internal_mark_failed(vf);
+                return;
+            }
+            p->is_vk = true;
+            p->av_device_ref = av_buffer_ref(fctx->device_ref);
+            MP_HANDLE_OOM(p->av_device_ref);
+            p->stream = NULL;
+#endif
         } else {
-            MP_ERR(vf, "Input frames are neither CUDA nor D3D11 frames%s\n",
+            MP_ERR(vf, "Input frames are neither CUDA, D3D11 nor Vulkan frames%s\n",
                    avhwctx->type == AV_HWDEVICE_TYPE_CUDA
                        ? " (CUDA driver unavailable)" : "");
             mp_filter_internal_mark_failed(vf);
@@ -2165,7 +2593,17 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 .log = aji_log_bridge,
                 .log_opaque = vf,
             };
+#if HAVE_VULKAN
+            if (p->is_vk && !p->api.create_vk) {
+                MP_ERR(vf, "This inference shim takes no Vulkan frames (aji_create_vk): "
+                       "use hwdec=d3d11va / nvdec, or update it\n");
+                mp_filter_internal_mark_failed(vf);
+                return;
+            }
+            p->aji = p->is_vk ? p->api.create_vk(&cp, &p->vkdev) : p->api.create(&cp);
+#else
             p->aji = p->api.create(&cp);
+#endif
             if (!p->aji) {
                 MP_ERR(vf, "Failed to create inference context\n");
                 mp_filter_internal_mark_failed(vf);
@@ -2194,7 +2632,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
             }
             // 4:4:4 planar ingest is TensorRT/CUDA only (no planar 16-bit
             // 4:4:4 DXGI format); on D3D11 it arrives as x2bgr10 RGB instead.
-            if (p->is_d3d11 && aji_format_is_444(p->aji_fmt)) {
+            if ((p->is_d3d11 || p->is_vk) && aji_format_is_444(p->aji_fmt)) {
                 MP_ERR(vf, "planar 4:4:4 input requires the TensorRT/CUDA backend\n");
                 mp_filter_internal_mark_failed(vf);
                 return;
@@ -2685,6 +3123,7 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
             goto fail;
         }
         p->api.create = aji_lib_sym(p->api.handle, "aji_create");
+        p->api.create_vk = aji_lib_sym(p->api.handle, "aji_create_vk");
         p->api.set_slot = aji_lib_sym(p->api.handle, "aji_set_slot");
         p->api.configure = aji_lib_sym(p->api.handle, "aji_configure");
         p->api.infer = aji_lib_sym(p->api.handle, "aji_infer");
@@ -2700,6 +3139,7 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         // then run RIFE at the source resolution (no pre-resize).
         p->api.pre_resize = aji_lib_sym(p->api.handle, "aji_pre_resize");
         p->api.resize = aji_lib_sym(p->api.handle, "aji_resize");
+        p->api.copy_frame = aji_lib_sym(p->api.handle, "aji_copy_frame");
         p->api.infer_rife = aji_lib_sym(p->api.handle, "aji_infer_rife");
         p->api.rife_scene_supported = aji_lib_sym(p->api.handle, "aji_rife_scene_supported");
         p->api.rife_enhanced_scene = aji_lib_sym(p->api.handle, "aji_rife_enhanced_scene");
@@ -2775,6 +3215,10 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     // n7.1) has neither the formats nor a decoder that produces them
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P10MSB));
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P12MSB));
+#endif
+#if HAVE_VULKAN
+    mp_refqueue_add_in_format(p->queue, IMGFMT_VULKAN, pixfmt2imgfmt(AV_PIX_FMT_NV12));
+    mp_refqueue_add_in_format(p->queue, IMGFMT_VULKAN, pixfmt2imgfmt(AV_PIX_FMT_P010));
 #endif
 #if HAVE_D3D11
     mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_NV12));
