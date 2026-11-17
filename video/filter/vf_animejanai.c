@@ -1451,58 +1451,6 @@ static struct mp_image *alloc_out(struct mp_filter *vf)
 // Hand the frames at relative positions rel..rel+r to the engine's history
 // (each frame once, in order). Missing futures (end of stream) are simply
 // not ingested; the engine clamps the window.
-static bool ingest_window(struct mp_filter *vf, int rel)
-{
-    struct priv *p = vf->priv;
-    const int mat = map_matrix(&p->params);
-    const int rng = map_range(&p->params);
-    const int sit = map_siting(&p->params);
-#if HAVE_D3D11
-    int staged = 0;
-#endif
-    for (int k = rel; k <= rel + p->temporal_r; k++) {
-        const uint64_t seq = p->seq0 + k;
-        if (seq < p->seq_next)
-            continue;
-        struct mp_image *f = mp_refqueue_get(p->queue, k);
-        if (!f)
-            break;
-        aji_frame fin = {
-            .width = f->w, .height = f->h, .format = p->aji_fmt,
-            .matrix = mat, .range = rng, .siting = sit,
-            .plane = {f->planes[0], f->planes[1], f->planes[2]},
-            .stride = {f->stride[0], f->stride[1], f->stride[2]},
-        };
-        void *stream = p->stream;
-#if HAVE_D3D11
-        if (p->is_d3d11) {
-            // Decoder surfaces aren't shareable: stage each frame like
-            // submit_frame does. Earlier frames' stages are retired by the
-            // previous emission's ticket wait; a stage reused within this
-            // call (start of stream: up to r+1 ingests) must first finish
-            // its previous ingest's D3D12 read.
-            if (staged && staged % p->d3d_stage_count == 0 &&
-                p->api.wait(p->aji, p->api.flush(p->aji, NULL)) != AJI_OK)
-                return false;
-            ID3D11Texture2D *stage = p->d3d_stage[p->d3d_stage_next];
-            p->d3d_stage_next = (p->d3d_stage_next + 1) % p->d3d_stage_count;
-            ID3D11DeviceContext_CopySubresourceRegion(p->d3d_ctx,
-                (ID3D11Resource *)stage, 0, 0, 0, 0,
-                (ID3D11Resource *)f->planes[0], (UINT)(intptr_t)f->planes[1],
-                NULL);
-            fin.plane[0] = stage;
-            fin.plane[1] = 0;
-            stream = NULL;
-            staged++;
-        }
-#endif
-        if (p->api.ingest(p->aji, &fin, seq, stream) != AJI_OK)
-            return false;
-        p->seq_next = seq + 1;
-    }
-    return true;
-}
-
 #if HAVE_VULKAN
 // An AVVkFrame handed to libaji as an aji_vk_image (one multi-planar image),
 // locked from vk_take to vk_give; vk_give writes back the semaphore value,
@@ -1548,6 +1496,77 @@ static void vk_give(struct vk_held *h, bool ok)
         hc->unlock_frame(h->fc, h->f);
 }
 
+#endif
+
+static bool ingest_window(struct mp_filter *vf, int rel)
+{
+    struct priv *p = vf->priv;
+    const int mat = map_matrix(&p->params);
+    const int rng = map_range(&p->params);
+    const int sit = map_siting(&p->params);
+#if HAVE_D3D11
+    int staged = 0;
+#endif
+    for (int k = rel; k <= rel + p->temporal_r; k++) {
+        const uint64_t seq = p->seq0 + k;
+        if (seq < p->seq_next)
+            continue;
+        struct mp_image *f = mp_refqueue_get(p->queue, k);
+        if (!f)
+            break;
+        aji_frame fin = {
+            .width = f->w, .height = f->h, .format = p->aji_fmt,
+            .matrix = mat, .range = rng, .siting = sit,
+            .plane = {f->planes[0], f->planes[1], f->planes[2]},
+            .stride = {f->stride[0], f->stride[1], f->stride[2]},
+        };
+        void *stream = p->stream;
+#if HAVE_D3D11
+        if (p->is_d3d11) {
+            // Decoder surfaces aren't shareable: stage each frame like
+            // submit_frame does. Earlier frames' stages are retired by the
+            // previous emission's ticket wait; a stage reused within this
+            // call (start of stream: up to r+1 ingests) must first finish
+            // its previous ingest's D3D12 read.
+            if (staged && staged % p->d3d_stage_count == 0 &&
+                p->api.wait(p->aji, p->api.flush(p->aji, NULL)) != AJI_OK)
+                return false;
+            ID3D11Texture2D *stage = p->d3d_stage[p->d3d_stage_next];
+            p->d3d_stage_next = (p->d3d_stage_next + 1) % p->d3d_stage_count;
+            ID3D11DeviceContext_CopySubresourceRegion(p->d3d_ctx,
+                (ID3D11Resource *)stage, 0, 0, 0, 0,
+                (ID3D11Resource *)f->planes[0], (UINT)(intptr_t)f->planes[1],
+                NULL);
+            fin.plane[0] = stage;
+            fin.plane[1] = 0;
+            stream = NULL;
+            staged++;
+        }
+#endif
+#if HAVE_VULKAN
+        if (p->is_vk) {
+            // the decoder's AVVkFrame, read in libaji's submit (its semaphore orders it)
+            struct vk_held h;
+            if (!vk_take(vf, f, &h))
+                return false;
+            fin.plane[0] = &h.d;
+            fin.plane[1] = NULL;
+            const int ret = p->api.ingest(p->aji, &fin, seq, NULL);
+            vk_give(&h, true);
+            if (ret != AJI_OK)
+                return false;
+            p->seq_next = seq + 1;
+            continue;
+        }
+#endif
+        if (p->api.ingest(p->aji, &fin, seq, stream) != AJI_OK)
+            return false;
+        p->seq_next = seq + 1;
+    }
+    return true;
+}
+
+#if HAVE_VULKAN
 // One frame through aji_create_vk's context.
 static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
                          struct mp_image *out, int mat, int rng, int sit)
@@ -1573,6 +1592,24 @@ static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
     const bool ok = p->api.infer(p->aji, &fin, &fout, NULL) == AJI_OK;
     vk_give(&ho, ok);
     vk_give(&hi, ok);
+    return ok;
+}
+
+// A temporal chain's frame `seq` (ingested) into out.
+static bool infer_seq_vulkan(struct mp_filter *vf, uint64_t seq, struct mp_image *out,
+                             int mat, int rng, int sit)
+{
+    struct priv *p = vf->priv;
+    struct vk_held ho;
+    if (!vk_take(vf, out, &ho))
+        return false;
+    const aji_frame fout = {
+        .width = p->out_params.w, .height = p->out_params.h, .format = p->out_fmt,
+        .matrix = mat, .range = rng, .siting = sit,
+        .plane = {&ho.d},
+    };
+    const bool ok = p->api.infer_seq(p->aji, seq, &fout, NULL) == AJI_OK;
+    vk_give(&ho, true);
     return ok;
 }
 
@@ -1752,7 +1789,10 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in, int rel)
 
 #if HAVE_VULKAN
     if (p->is_vk) {
-        ok = infer_vulkan(vf, in, out, mat, rng, sit);
+        if (p->temporal_r && rel >= 0)
+            ok = ingest_window(vf, rel) && infer_seq_vulkan(vf, p->seq0 + rel, out, mat, rng, sit);
+        else
+            ok = infer_vulkan(vf, in, out, mat, rng, sit);
     } else
 #endif
 #if HAVE_D3D11
