@@ -1647,6 +1647,18 @@ static bool ingest_window(struct mp_filter *vf, int rel)
     return true;
 }
 
+// aji_infer_rife with the endpoints' ids and the scene decision, through the newest entry point the
+// library has.
+static int call_rife(struct priv *p, const aji_frame *a, int64_t a_id, const aji_frame *b, int64_t b_id,
+                     double t, const aji_frame *out, void *stream)
+{
+    if (p->api.infer_rife_ids)
+        return p->api.infer_rife_ids(p->aji, a, a_id, b, b_id, t, out, stream, p->scene_decision);
+    return p->scene_decision != -1 && p->api.infer_rife_with_scene
+        ? p->api.infer_rife_with_scene(p->aji, a, b, t, out, stream, p->scene_decision)
+        : p->api.infer_rife(p->aji, a, b, t, out, stream);
+}
+
 #if HAVE_VULKAN
 // One frame through aji_create_vk's context.
 static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
@@ -1692,18 +1704,6 @@ static bool infer_seq_vulkan(struct mp_filter *vf, uint64_t seq, struct mp_image
     const bool ok = p->api.infer_seq(p->aji, seq, &fout, NULL) == AJI_OK;
     vk_give(&ho, true);
     return ok;
-}
-
-// aji_infer_rife with the endpoints' ids and the scene decision, through the newest entry point the
-// library has.
-static int call_rife(struct priv *p, const aji_frame *a, int64_t a_id, const aji_frame *b, int64_t b_id,
-                     double t, const aji_frame *out, void *stream)
-{
-    if (p->api.infer_rife_ids)
-        return p->api.infer_rife_ids(p->aji, a, a_id, b, b_id, t, out, stream, p->scene_decision);
-    return p->scene_decision != -1 && p->api.infer_rife_with_scene
-        ? p->api.infer_rife_with_scene(p->aji, a, b, t, out, stream, p->scene_decision)
-        : p->api.infer_rife(p->aji, a, b, t, out, stream);
 }
 
 // RIFE between a and b into out (w x h, format fmt), synchronous like the
