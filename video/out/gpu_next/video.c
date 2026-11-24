@@ -2351,7 +2351,7 @@ static void pregrow_swap_in(struct mppl_video *p)
 
 #else // !HAVE_ASS_COMPOSITE_DEFERRED (stock libass): no pools, no worker
 static void pregrow_uninit(struct mppl_video *p) { (void) p; }
-static void pregrow_swap_in(struct mppl_video *p) { (void) vo; }
+static void pregrow_swap_in(struct mppl_video *p) { (void) p; }
 #endif
 
 #if HAVE_ASS_COMPOSITE_DEFERRED
