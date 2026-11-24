@@ -464,6 +464,20 @@ AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
                               const aji_frame *b, double t,
                               const aji_frame *out, void *cu_stream, int scene);
 
+/* aji_infer_rife_with_scene with the frames' identities: a_id, b_id are the
+ * caller's numbers for the source frames (an index or pts; -1: unknown).
+ * Equal ids promise equal frame contents within this context until the next
+ * aji_configure, which lets the backend keep a frame's work for the next
+ * call: in a 2x stream each pair's b is the next pair's a, and a higher
+ * factor calls the same pair for several t. Never pass the id of a frame
+ * whose contents changed (after a seek, reuse ids only for the same frames).
+ * Additive: aji_rife_ids_supported() reports a backend that uses the ids;
+ * where it returns 0 this call still works (as aji_infer_rife_with_scene). */
+AJI_EXPORT int aji_rife_ids_supported(aji_ctx *c);
+AJI_EXPORT int aji_infer_rife_ids(aji_ctx *c, const aji_frame *a, int64_t a_id,
+                              const aji_frame *b, int64_t b_id, double t,
+                              const aji_frame *out, void *cu_stream, int scene);
+
 /* Temporal (multi-frame) models. A chain model whose input takes T = 2r+1
  * frames (oldest first, the frame to upscale in the middle) is a temporal
  * step: it needs the neighboring source frames, so a chain containing one
@@ -535,15 +549,23 @@ typedef struct aji_vk_device {
  * context. A 4:2:0 frame is one multi-planar image (NV12:
  * VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, P010: G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
  * or G16_B16R16_2PLANE_420_UNORM), created with TRANSFER_SRC (input) or
- * TRANSFER_DST (output) usage and EXCLUSIVE sharing, as FFmpeg's Vulkan frames
- * are. Synchronisation is FFmpeg's AVVkFrame rule: libaji's work waits for
+ * TRANSFER_DST (output) usage, CONCURRENT or EXCLUSIVE sharing (FFmpeg's
+ * Vulkan frames are CONCURRENT when it uses more than one queue family).
+ * Synchronisation is FFmpeg's AVVkFrame rule: libaji's work waits for
  * semaphore to reach value, signals value + 1 and writes value + 1 here, with
  * the layout, access and queue family it leaves the image in; the caller
- * copies them back into its AVVkFrame. */
+ * copies them back into its AVVkFrame.
+ * Queue family ownership: queue_family is VK_QUEUE_FAMILY_IGNORED for a
+ * CONCURRENT image (or an EXCLUSIVE one used only on aji_vk_device's
+ * queue_family); libaji then transfers nothing and leaves it IGNORED. An
+ * EXCLUSIVE image owned by another family carries that family here and must
+ * have been released by the caller to aji_vk_device's queue_family; libaji
+ * acquires it when it reads the image (an output's contents are replaced, so
+ * none is needed) and writes back its own family as the owner. */
 typedef struct aji_vk_image {
     void *image;                     /* VkImage */
     int32_t layout;                  /* VkImageLayout: in, then as left */
-    uint32_t queue_family;           /* owner (VK_QUEUE_FAMILY_IGNORED: none yet); as left */
+    uint32_t queue_family;           /* owner (VK_QUEUE_FAMILY_IGNORED: none); as left */
     uint64_t access;                 /* VkAccessFlags2 of the last access; as left */
     void *semaphore;                 /* VkSemaphore, timeline */
     uint64_t value;                  /* ready at value; then value + 1 */

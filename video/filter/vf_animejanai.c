@@ -206,6 +206,9 @@ struct aji_api {
     int (*rife_enhanced_scene)(aji_ctx *c); // optional configure-time query
     int (*infer_rife_with_scene)(aji_ctx *c, const aji_frame *a, const aji_frame *b,
                       double t, const aji_frame *out, void *cu_stream, int scene);
+    // optional: the frames' ids, so libaji keeps a frame's work for the next pair
+    int (*infer_rife_ids)(aji_ctx *c, const aji_frame *a, int64_t a_id, const aji_frame *b,
+                          int64_t b_id, double t, const aji_frame *out, void *cu_stream, int scene);
     int (*poll)(aji_ctx *c);
     int (*temporal_radius)(aji_ctx *c);
     int (*ingest)(aji_ctx *c, const aji_frame *in, uint64_t seq,
@@ -348,6 +351,9 @@ struct priv {
     int rife_acc;               // next grid point's offset into the
                                 // current pair, in 1/num units (0, num]
     struct mp_image *rife_prev; // last upscaled frame (left endpoint)
+    // aji_infer_rife_ids: each new RIFE endpoint takes the next number and keeps it (rife_prev's in
+    // rife_prev_id), so libaji can tell a pair's a is the last pair's b; numbers are never reused
+    int64_t rife_next_id, rife_prev_id;
     struct mp_image *outq[8];
     int outq_n, outq_pos;
     // Temporal (multi-frame) chains: the engine keeps the frame history and
@@ -1641,6 +1647,18 @@ static bool ingest_window(struct mp_filter *vf, int rel)
     return true;
 }
 
+// aji_infer_rife with the endpoints' ids and the scene decision, through the newest entry point the
+// library has.
+static int call_rife(struct priv *p, const aji_frame *a, int64_t a_id, const aji_frame *b, int64_t b_id,
+                     double t, const aji_frame *out, void *stream)
+{
+    if (p->api.infer_rife_ids)
+        return p->api.infer_rife_ids(p->aji, a, a_id, b, b_id, t, out, stream, p->scene_decision);
+    return p->scene_decision != -1 && p->api.infer_rife_with_scene
+        ? p->api.infer_rife_with_scene(p->aji, a, b, t, out, stream, p->scene_decision)
+        : p->api.infer_rife(p->aji, a, b, t, out, stream);
+}
+
 #if HAVE_VULKAN
 // One frame through aji_create_vk's context.
 static bool infer_vulkan(struct mp_filter *vf, struct mp_image *in,
@@ -1690,8 +1708,8 @@ static bool infer_seq_vulkan(struct mp_filter *vf, uint64_t seq, struct mp_image
 
 // RIFE between a and b into out (w x h, format fmt), synchronous like the
 // other backends': AJI_OK, AJI_SCENE or an error.
-static int rife_vulkan(struct mp_filter *vf, struct mp_image *a, struct mp_image *b,
-                       struct mp_image *out, double t, int w, int h, int fmt,
+static int rife_vulkan(struct mp_filter *vf, struct mp_image *a, int64_t a_id, struct mp_image *b,
+                       int64_t b_id, struct mp_image *out, double t, int w, int h, int fmt,
                        int mat, int rng, int sit)
 {
     struct priv *p = vf->priv;
@@ -1710,9 +1728,7 @@ static int rife_vulkan(struct mp_filter *vf, struct mp_image *a, struct mp_image
                 .matrix = mat, .range = rng, .siting = sit,
                 .plane = {&held[i].d},
             };
-        ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
-            ? p->api.infer_rife_with_scene(p->aji, &f[0], &f[1], t, &f[2], NULL, p->scene_decision)
-            : p->api.infer_rife(p->aji, &f[0], &f[1], t, &f[2], NULL);
+        ret = call_rife(p, &f[0], a_id, &f[1], b_id, t, &f[2], NULL);
     }
     // libaji updates an image's state only for a submit it made (the scene
     // check reads a and b, then may return before touching out): always take it
@@ -2127,8 +2143,8 @@ static int scene_pair(struct mp_filter *vf, struct mp_image *a, struct mp_image 
 // pipeline substitutes the left frame), or NULL on error. pts is left for
 // the caller to set.
 static struct mp_image *render_interp(struct mp_filter *vf,
-                                      struct mp_image *a, struct mp_image *b,
-                                      double t)
+                                      struct mp_image *a, int64_t a_id, struct mp_image *b,
+                                      int64_t b_id, double t)
 {
     struct priv *p = vf->priv;
     CUcontext dummy;
@@ -2164,13 +2180,11 @@ static struct mp_image *render_interp(struct mp_filter *vf,
     int ret;
 #if HAVE_VULKAN
     if (p->is_vk)
-        ret = rife_vulkan(vf, a, b, out, t, p->out_params.w, p->out_params.h, p->out_fmt, mat, rng,
+        ret = rife_vulkan(vf, a, a_id, b, b_id, out, t, p->out_params.w, p->out_params.h, p->out_fmt, mat, rng,
                           AJI_SITING_LEFT);
     else
 #endif
-    ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
-        ? p->api.infer_rife_with_scene(p->aji, &fa, &fb, t, &fout, p->stream, p->scene_decision)
-        : p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
+    ret = call_rife(p, &fa, a_id, &fb, b_id, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
         talloc_free(out);
         return mp_image_new_ref(a);
@@ -2392,8 +2406,8 @@ static struct mp_image *downscale_src(struct mp_filter *vf,
 // the work res equals the source res. Returns a new ref of `a` on a scene
 // change, NULL on error. pts is left for the caller.
 static struct mp_image *interp_source(struct mp_filter *vf,
-                                      struct mp_image *a, struct mp_image *b,
-                                      double t)
+                                      struct mp_image *a, int64_t a_id, struct mp_image *b,
+                                      int64_t b_id, double t)
 {
     struct priv *p = vf->priv;
     CUcontext dummy;
@@ -2426,12 +2440,10 @@ static struct mp_image *interp_source(struct mp_filter *vf,
     int ret;
 #if HAVE_VULKAN
     if (p->is_vk)
-        ret = rife_vulkan(vf, a, b, out, t, p->work_w, p->work_h, p->aji_fmt, mat, rng, sit);
+        ret = rife_vulkan(vf, a, a_id, b, b_id, out, t, p->work_w, p->work_h, p->aji_fmt, mat, rng, sit);
     else
 #endif
-    ret = p->scene_decision != -1 && p->api.infer_rife_with_scene
-        ? p->api.infer_rife_with_scene(p->aji, &fa, &fb, t, &fout, p->stream, p->scene_decision)
-        : p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
+    ret = call_rife(p, &fa, a_id, &fb, b_id, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
         talloc_free(out);
         return mp_image_new_ref(a);
@@ -2783,6 +2795,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
             mp_filter_internal_mark_failed(vf);
             return;
         }
+        const int64_t cur_id = p->rife_next_id++;  // every new endpoint: a number of its own
         struct mp_image *list[8];
         int n = 0;
         bool failed = false;
@@ -2798,7 +2811,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 } else {
                     double t = (double)p->rife_acc / p->rife_num;
                     struct mp_image *tmp =
-                        interp_source(vf, p->rife_prev, cur_src, t);
+                        interp_source(vf, p->rife_prev, p->rife_prev_id, cur_src, cur_id, t);
                     frame = tmp ? upscale_image(vf, tmp) : NULL;
                     mp_image_unrefp(&tmp);
                     pts = p->rife_prev->pts +
@@ -2841,6 +2854,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
         }
         mp_image_unrefp(&p->rife_prev);
         p->rife_prev = cur_src;  // previous *source* endpoint (owns the ref)
+        p->rife_prev_id = cur_id;
         for (int i = 1; i < n; i++)
             p->outq[p->outq_n++] = list[i];
         p->outq_pos = 0;
@@ -2878,6 +2892,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
     }
 
     if (out && p->rife_on) {
+        const int64_t out_id = p->rife_next_id++;  // every new endpoint: a number of its own
         if (out->nominal_fps > 0)
             out->nominal_fps = out->nominal_fps * p->rife_num / p->rife_den;
         struct mp_image *first = out;
@@ -2902,7 +2917,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 } else {
                     double t = (double)p->rife_acc / p->rife_num;
                     struct mp_image *ip =
-                        render_interp(vf, p->rife_prev, out, t);
+                        render_interp(vf, p->rife_prev, p->rife_prev_id, out, out_id, t);
                     if (!ip) {
                         failed = true;  // degrade to fewer frames
                         break;
@@ -2941,6 +2956,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
         }
         mp_image_unrefp(&p->rife_prev);
         p->rife_prev = mp_image_new_ref(out);
+        p->rife_prev_id = out_id;
         if (!emitted_cur)
             mp_image_unrefp(&out);  // endpoint only; rife_prev keeps it
         p->seq0++;
@@ -3144,6 +3160,7 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         p->api.rife_scene_supported = aji_lib_sym(p->api.handle, "aji_rife_scene_supported");
         p->api.rife_enhanced_scene = aji_lib_sym(p->api.handle, "aji_rife_enhanced_scene");
         p->api.infer_rife_with_scene = aji_lib_sym(p->api.handle, "aji_infer_rife_with_scene");
+        p->api.infer_rife_ids = aji_lib_sym(p->api.handle, "aji_infer_rife_ids");
         p->api.poll = aji_lib_sym(p->api.handle, "aji_poll");
         p->api.temporal_radius =
             aji_lib_sym(p->api.handle, "aji_temporal_radius");
