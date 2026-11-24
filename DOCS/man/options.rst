@@ -2036,7 +2036,7 @@ Video
     This can speed up video upload, and may help with large resolutions or
     slow hardware. This works only with the following VOs:
 
-        - ``gpu``: requires at least OpenGL 4.4 or Vulkan.
+        - ``gpu-next``, ``gpu``: requires at least OpenGL 4.4 or Vulkan.
         - ``libmpv``: The libmpv render API has optional support.
 
     The ``auto`` option will try to guess whether DR can improve performance
@@ -5851,6 +5851,20 @@ Terminal
 
     Default: ``[-+-]``.
 
+``--term-show-tracks=<all|selected|none>``
+    Control which tracks are printed on the terminal (default: all).
+
+    :all:       print all available tracks
+    :selected:  print only selected tracks
+    :none:      do not print any tracks
+
+``--term-show-editions=<all|selected|none>``
+    Control which editions are printed on the terminal (default: all).
+
+    :all:       print all available editions
+    :selected:  print only the active edition
+    :none:      do not print any edition listings
+
 ``--term-playing-msg=<string>``
     Print out a string after starting playback. The string is expanded for
     properties, e.g. ``--term-playing-msg='file: ${filename}'`` will print the string
@@ -7461,6 +7475,16 @@ them.
 
     macOS and cocoa-cb only.
 
+``--cocoa-cb-renderer=<renderer>``
+    This sets the renderer used by libmpv when using cocoa-cb.
+
+    ``<renderer>`` can be one of the following:
+
+    :gpu:       The renderer of the gpu video output.
+    :gpu-next:  The renderer of the gpu-next video output (default).
+
+    macOS and cocoa-cb only.
+
 ``--macos-title-bar-appearance=<appearance>``
     Sets the appearance of the title bar (default: auto). Not all combinations
     of appearances and ``--macos-title-bar-material`` materials make sense or
@@ -8660,8 +8684,12 @@ Video Sync
                         mode, because the player doesn't have to assume anything
                         about how the display behaves. The disadvantage is that
                         it can lead to occasional frame drops or repeats. If
-                        audio is disabled, this uses the system clock. This is
-                        the default mode.
+                        audio is disabled, this uses the system clock. With
+                        presentation feedback, a frame is presented half a
+                        vsync before the vsync nearest its time on a display
+                        with a fixed refresh rate, and at its exact time on a
+                        display that refreshes when a frame is presented (VRR).
+                        This is the default mode.
     :display-resample:  Resample audio to match the video. This mode will also
                         try to adjust audio speed to compensate for other drift.
                         (This means it will play the audio at a different speed
@@ -9071,7 +9099,7 @@ Miscellaneous
 
     Registers mpv as a media player on Windows. This includes adding registry
     entries to associate mpv with media files and protocols, as well as enabling
-    autoplay handlers for Blu-ray, DVD, and CD-Audio.
+    autoplay handlers for Blu-ray, DVD, DVD-Audio, and CD-Audio.
 
     Note that the registration is done in-place, so the current mpv.exe path will
     be used. If you move mpv after registering it, you can re-run this command to
@@ -9084,7 +9112,8 @@ Miscellaneous
 
     The list of the file extensions to register, can be controlled with the
     ``--video-exts``, ``--audio-exts``, ``--image-exts``, ``--playlist-exts``
-    and ``--archive-exts`` options.
+    and ``--archive-exts`` options. Disc images (``.iso``) and the ``.ifo``
+    and ``.bdmv`` files of DVD and Blu-ray folders are registered as well.
 
     By default, mpv will be registered for the current user. To register it for
     all users, run mpv as an administrator with this option. However, this is
